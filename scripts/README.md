@@ -24,6 +24,7 @@ uv run python scripts/ingest.py --backfill-summaries      # fill missing summari
 uv run python scripts/ingest.py --rebuild-concepts        # refresh concept index (free)
 uv run python scripts/ingest.py --rebuild-search-index    # rebuild semantic index (free)
 uv run python scripts/ingest.py --search "query" --top-k 5  # semantic search the vault
+uv run python scripts/ask.py "question"                      # chat with the vault (RAG)
 ```
 
 ## Semantic search
@@ -60,6 +61,34 @@ provider uses the OpenAI SDK with a custom `base_url`, so anything
 that speaks the OpenAI Chat Completions API works: Ollama (≥0.5 for
 structured outputs), LM Studio, llama.cpp's server, vLLM. Same Pydantic
 schema across all four providers, so behaviour is consistent.
+
+## Chat with your vault
+
+Two paths, both offline-capable when paired with the `local` provider:
+
+**Terminal (`scripts/ask.py`)** — single-shot, no plugins required:
+
+```bash
+uv run python scripts/ask.py "what does my vault say about X?"
+uv run python scripts/ask.py --top-k 12 --provider local --model gemma4:31b "..."
+```
+
+Pipeline: question → embed query against the existing `metadata/embeddings.npy`
+index → top-k chunks → LLM via the configured provider → citation-backed
+answer in the terminal. Nothing new is written to disk.
+
+**Obsidian (Copilot for Obsidian, or Smart Connections)** — chat panel
+inside Obsidian:
+
+1. Settings → Community plugins → Browse → install *Copilot* by Logan Yang.
+2. Settings → Copilot → set the chat model to your provider. For
+   offline use: provider Ollama, base URL `http://localhost:11434`,
+   model `gemma4:31b` (or whatever you've pulled).
+3. Open the Copilot panel, switch to "Vault QA" mode, ask.
+
+The plugin builds its own retrieval index, separate from ours. Wasted
+disk (~50–100 MB) but otherwise harmless. Smart Connections by Brian
+Petro is a strong alternative with the same Ollama support.
 
 ## Autonomous curation (concept notes)
 

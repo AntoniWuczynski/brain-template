@@ -101,6 +101,16 @@ uv run python scripts/ingest.py --search "what happens when a packet is dropped"
 
 Returns the most semantically similar passages across every processed source, with citation paths. The first call after a fresh clone downloads a ~100 MB embedding model to `~/.cache/huggingface/`.
 
+### Chat with the vault
+
+```bash
+uv run python scripts/ask.py "What does my vault say about TCP congestion control?"
+```
+
+Retrieves the top-k semantic matches and feeds them to whichever LLM provider is configured, returning a concise answer with bracketed citations. Works with any provider — hosted (Anthropic, OpenAI, Gemini) or local (Ollama, LM Studio, llama.cpp via `BRAIN_LOCAL_URL`). The retrieval index is reused across calls; nothing new is written to disk.
+
+For an in-Obsidian chat panel instead of the terminal, install **Copilot for Obsidian** (or **Smart Connections**) from the community plugins, set the chat model to your configured provider (or to Ollama on `http://localhost:11434` for offline use), and use the plugin's "vault chat" mode. The plugin will build its own retrieval index parallel to the one in `metadata/embeddings.npy`; that's wasted disk but otherwise harmless.
+
 ### Browse in Obsidian
 
 Open the repo root as an Obsidian vault. `knowledge/index/Home.md` is your entry point. Every concept under `knowledge/concepts/` is a pre-built index of every source that touches that concept. Click into any source's index note and the full extracted content (figures and all) appears inline via transclusion.
@@ -117,6 +127,7 @@ Open the repo root as an Obsidian vault. `knowledge/index/Home.md` is your entry
 | `--rebuild-concepts` | Regenerate concept notes from current metadata (free, no LLM) |
 | `--rebuild-search-index` | Re-encode every chunk and overwrite the search index |
 | `--search "query" --top-k N` | Semantic search the vault |
+| `ask.py "question"` (separate script) | Retrieval-augmented chat: top-k chunks + LLM → citation-backed answer |
 
 ## Configuration
 

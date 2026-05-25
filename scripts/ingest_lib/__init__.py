@@ -3,6 +3,7 @@
 Public surface used by ``scripts/ingest.py`` and by future MCP handlers.
 Internals live in submodules; this file only re-exports.
 """
+from .chat import AnswerResult, ask
 from .concepts import ConceptStats, rebuild_concepts
 from .config import VaultPaths, default_paths
 from .extractors import ExtractionResult, dispatch_extractor, registered_extensions
@@ -12,6 +13,7 @@ from .pipeline import IngestPlan, IngestStats, backfill_summaries, plan_ingest, 
 from .semantic import SearchHit, build_index as build_search_index, search as semantic_search
 
 __all__ = [
+    "AnswerResult",
     "ConceptStats",
     "ExtractionResult",
     "IndexRecord",
@@ -20,6 +22,7 @@ __all__ = [
     "SearchHit",
     "VaultPaths",
     "append_record",
+    "ask",
     "backfill_summaries",
     "build_search_index",
     "default_paths",
