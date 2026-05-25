@@ -15,8 +15,9 @@
 #   - knowledge/index/Note Template.md
 #
 # Files sourced from _template/ on main (overlay specific to the public branch):
-#   - README.md, LICENSE, TODO.md, WORK_LOG.md
-#   - knowledge/index/Home.md   (from _template/Home.md)
+#   - README.md, LICENSE, TODO.md, WORK_LOG.md, CONTRIBUTING.md
+#   - knowledge/index/Home.md            (from _template/Home.md)
+#   - .github/PULL_REQUEST_TEMPLATE.md   (from _template/PULL_REQUEST_TEMPLATE.md)
 #
 # Files NEVER copied (your private content):
 #   - inbox/**, archive/**, logs/**, metadata/**
@@ -112,12 +113,14 @@ done
 # Overlay: public-facing files that live under _template/ on main and
 # get copied into their target locations on the template branch.
 echo "applying _template overlay..."
-mkdir -p "$WORKTREE/knowledge/index"
-cp "_template/README.md"   "$WORKTREE/README.md"
-cp "_template/LICENSE"     "$WORKTREE/LICENSE"
-cp "_template/TODO.md"     "$WORKTREE/TODO.md"
-cp "_template/WORK_LOG.md" "$WORKTREE/WORK_LOG.md"
-cp "_template/Home.md"     "$WORKTREE/knowledge/index/Home.md"
+mkdir -p "$WORKTREE/knowledge/index" "$WORKTREE/.github"
+cp "_template/README.md"                "$WORKTREE/README.md"
+cp "_template/LICENSE"                  "$WORKTREE/LICENSE"
+cp "_template/TODO.md"                  "$WORKTREE/TODO.md"
+cp "_template/WORK_LOG.md"              "$WORKTREE/WORK_LOG.md"
+cp "_template/CONTRIBUTING.md"          "$WORKTREE/CONTRIBUTING.md"
+cp "_template/Home.md"                  "$WORKTREE/knowledge/index/Home.md"
+cp "_template/PULL_REQUEST_TEMPLATE.md" "$WORKTREE/.github/PULL_REQUEST_TEMPLATE.md"
 
 # Ensure the empty directories the framework expects exist, with .gitkeep
 # files so git tracks them.
