@@ -47,8 +47,9 @@ for the rules there.
   not a published library.
 - Don't reach for ML to "summarise" failed extractions. Mark them and
   surface them to the user.
-- Don't invent an MCP implementation. The design lives in
-  `mcp/README.md`; coding it is a deliberate, separate task.
+- Don't drift the MCP server from its contract. The server IS
+  implemented in `mcp_server/`; treat `mcp/README.md` as its contract
+  and keep code and contract in sync.
 
 ## Claude memory and patterns
 

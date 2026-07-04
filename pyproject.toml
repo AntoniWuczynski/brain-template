@@ -21,7 +21,19 @@ dependencies = [
     "python-dotenv>=1.0",    # auto-load .env at the repo root
     "sentence-transformers>=3.0",  # local embeddings for --search
     "numpy>=1.26",           # vector store (already a transitive of torch)
-    "tomli>=2.0; python_version < '3.11'",
+    # Pin transformers to the version MinerU 2.7.6 needs. Without this,
+    # `uv sync` / `uv run` resolves transformers 5.x (via sentence-
+    # transformers, which only caps <6.0), and MinerU's UniMerNet then
+    # fails to import `find_pruneable_heads_and_indices` (removed in TF
+    # 4.57) so every PDF silently falls back to pypdf as `partial`.
+    # sentence-transformers 5.x tolerates 4.53.3, so this is conflict-free.
+    "transformers>=4.53.3,<4.54",
+    # MCP server (mcp_server/). All three are stable, no pre-release
+    # caveats — unlike MinerU. Cheap to install (~10 MB total) and
+    # required for `python -m mcp_server` plus its smoke test.
+    "mcp>=1.27",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 # MinerU (the full PDF extraction stack — PaddleOCR PP-Structure +
@@ -31,14 +43,17 @@ dependencies = [
 # environments don't want.
 #
 # Install it separately into the same .venv when you want full
-# extraction:
+# extraction (pin 2.7.6 — unpinned resolves to the broken mineru 3.4.0;
+# see scripts/README.md and CLAUDE.md):
 #
-#     uv pip install --prerelease=allow "mineru[pipeline]"
+#     uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six
 #
 # Note the ``[pipeline]`` extra — without it, torch isn't pulled in and
 # the CLI fails fast with ``ModuleNotFoundError: No module named 'torch'``.
 # ``uv sync`` will prune mineru on every run because it isn't in the
-# lockfile, so repeat the command above after each sync.
+# lockfile, so repeat the command above after each sync. (transformers is
+# now pinned in [project] dependencies above, so you no longer have to
+# re-pin it after every sync — only mineru + six.)
 #
 # Models auto-download from Hugging Face on first use; no config file
 # required. When MinerU isn't installed, the ingestion script falls
@@ -51,6 +66,11 @@ managed = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
 
 [tool.hatch.build.targets.wheel]
 # This project is not meant to be packaged; declare a synthetic

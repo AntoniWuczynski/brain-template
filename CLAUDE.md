@@ -25,6 +25,10 @@ See [`README.md`](README.md) for the full layer breakdown.
 - **Metadata** — `metadata/index.jsonl` is the source of truth for "what
   has been processed". Always read it before assuming a file is or isn't
   in the system.
+- **Entity memory** — typed `relations:` frontmatter (closed vocab,
+  supersede-never-delete; see `AGENTS.md`), the `knowledge/assistant/`
+  memory lifecycle, and the `scripts/sweep.py` / `scripts/consolidate.py`
+  maintenance CLIs.
 - **Agent rules** — `AGENTS.md`. Don't drift from them.
 
 You should **not** spend time on:
@@ -45,9 +49,14 @@ You should **not** spend time on:
   Use `uv add <pkg>` for new deps, `uv sync` to reproduce the env.
   **Caveat**: `uv sync` prunes any package not in the lockfile, including
   `mineru` and its torch transitives. After every `uv sync`, re-run
-  `uv pip install --prerelease=allow "mineru[pipeline]"` to restore PDF
-  full-extraction. Without it, PDFs silently fall back to pypdf and land
-  as `partial`.
+  `uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six`
+  to restore PDF full-extraction. (`transformers==4.53.3` is now pinned in
+  `pyproject.toml`, so `uv sync` keeps it — you no longer have to re-pin
+  transformers after every sync, only reinstall mineru + six.) Pin 2.7.6 —
+  the unpinned install now resolves to mineru 3.4.0, which is broken (needs
+  `transformers>=4.57.3` but imports `find_pruneable_heads_and_indices`,
+  removed in 4.57), so every PDF silently falls back to pypdf and lands as
+  `partial`. See `scripts/README.md` for the full explanation.
 - **LLM provider for summarizer**: four backends behind one router in
   `scripts/ingest_lib/summarize.py` — `anthropic` (default,
   `claude-haiku-4-5`), `openai` (`gpt-5-mini`), `gemini`

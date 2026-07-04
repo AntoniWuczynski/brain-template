@@ -38,8 +38,9 @@ def configure_run_logger(logs_dir: Path, *, dry_run: bool) -> tuple[logging.Logg
     return logger, log_path
 
 
-def _utc_converter(*_args: object) -> object:  # type: ignore[override]
-    # logging passes a timestamp; ignore and return UTC struct_time.
+def _utc_converter(timestamp: float | None = None) -> object:  # type: ignore[override]
+    # Honor the record's creation timestamp (not the formatting moment), so a
+    # buffered/delayed flush stamps event-time rather than flush-time.
     import time
 
-    return time.gmtime()
+    return time.gmtime(timestamp)

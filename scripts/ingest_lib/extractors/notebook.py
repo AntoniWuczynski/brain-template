@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ExtractionResult
+from .base import ExtractionResult, fence
 
 
 def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
@@ -18,7 +18,10 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
         )
 
     try:
-        nb = nbformat.read(str(src), as_version=nbformat.NO_CONVERT)
+        # as_version=4 upgrades legacy v3 notebooks in memory (v3 exposes
+        # `worksheets`, not `cells`, so NO_CONVERT would AttributeError on a
+        # perfectly convertible file). Genuinely corrupt files still raise.
+        nb = nbformat.read(str(src), as_version=4)
     except Exception as exc:  # noqa: BLE001
         return ExtractionResult(
             status="manual_review",
@@ -34,12 +37,12 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
             parts.append(cell.source.strip())
         elif cell.cell_type == "code":
             lang = nb.metadata.get("kernelspec", {}).get("language", "python")
-            parts.append(f"```{lang}\n{cell.source}\n```")
+            parts.append(fence(cell.source, lang))
             outs = cell.get("outputs", [])
             if outs:
                 skipped_outputs += len(outs)
         elif cell.cell_type == "raw":
-            parts.append(f"```\n{cell.source}\n```")
+            parts.append(fence(cell.source))
         else:
             parts.append(f"_(unknown cell type: `{cell.cell_type}` at index {i})_")
         parts.append("")

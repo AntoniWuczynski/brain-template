@@ -14,6 +14,7 @@ The fallback exists so the system still functions on a fresh clone
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,24 +24,43 @@ from .base import ExtractionResult
 
 
 _MINERU_TIMEOUT_S = 30 * 60   # generous: full extraction can be slow on CPU
-_MINERU_LANG = "en"           # university material is English; override via env
 _MINERU_BACKEND = "pipeline"  # most general; works with --lang for OCR
 _MINERU_METHOD = "auto"       # let MinerU pick text vs OCR
 
 
+def _mineru_lang() -> str:
+    """OCR language for MinerU. Defaults to English (the vault's material);
+    override with BRAIN_MINERU_LANG for other-language scans. Resolved at
+    call time, not import, so the env var actually takes effect."""
+    return os.environ.get("BRAIN_MINERU_LANG", "en")
+
+
 def extract(src: Path, assets_dir: Path) -> ExtractionResult:
+    # Handwritten / scanned material: route to the vision-LLM extractor.
+    # MinerU's OCR is printed-text only and its formula model fabricates
+    # LaTeX on handwriting, so set BRAIN_PDF_EXTRACTOR=vlm for such modules.
+    if (os.environ.get("BRAIN_PDF_EXTRACTOR") or "").lower() == "vlm":
+        from . import vlm as _vlm_mod
+        return _vlm_mod.extract(src, assets_dir)
     if _mineru_on_path():
         result = _extract_with_mineru(src, assets_dir)
         if result.status != "manual_review":
             return result
         # MinerU failed: fall back to pypdf and note the failure.
         fallback = _extract_with_pypdf(src)
+        # When the fallback ALSO fails, keep both errors — otherwise the
+        # pypdf failure reason (the actual reason nothing was produced) is
+        # lost and the failure is undiagnosable from the log / index.jsonl.
+        if fallback.status == "manual_review":
+            error = f"mineru: {result.error}; pypdf: {fallback.error}"
+        else:
+            error = result.error
         return ExtractionResult(
             status=fallback.status if fallback.status == "manual_review" else "partial",
             extractor="pdf-pypdf-fallback",
             markdown=fallback.markdown,
             assets=[],
-            error=result.error,
+            error=error,
             notes=fallback.notes
             + [f"MinerU failed; fell back to pypdf. mineru-error: {result.error}"],
         )
@@ -66,14 +86,22 @@ def _extract_with_mineru(src: Path, assets_dir: Path) -> ExtractionResult:
     Older versions used ``<backend>`` instead of ``auto``. We're tolerant.
     """
     tmp_root = Path(tempfile.mkdtemp(prefix="mineru-out-"))
+    lang = _mineru_lang()
     cmd = [
         "mineru",
         "-p", str(src),
         "-o", str(tmp_root),
-        "-l", _MINERU_LANG,
+        "-l", lang,
         "-b", _MINERU_BACKEND,
         "-m", _MINERU_METHOD,
     ]
+    # The UniMerNet formula model hallucinates dense fake LaTeX on
+    # handwriting; BRAIN_MINERU_FORMULA=false disables it (keeps text +
+    # figures). Default keeps formula parsing on for printed math.
+    formula_on = (os.environ.get("BRAIN_MINERU_FORMULA") or "true").lower() \
+        not in ("0", "false", "no", "off")
+    if not formula_on:
+        cmd += ["-f", "false"]
     env = os.environ.copy()
     env.setdefault("MINERU_DEVICE_MODE", _default_device())
     env.setdefault("MINERU_MODEL_SOURCE", env.get("MINERU_MODEL_SOURCE", "huggingface"))
@@ -135,15 +163,39 @@ def _extract_with_mineru(src: Path, assets_dir: Path) -> ExtractionResult:
                 target = assets_dir / asset.name
                 shutil.copy2(asset, target)
                 copied.append(target)
-            # Rewrite the relative ``images/<file>`` paths to point at our
-            # canonical assets dir so the processed Markdown links resolve
-            # from ``archive/processed/<rel>.md``.
+            # Rewrite ``images/<file>`` ONLY inside Markdown image links, not
+            # by a blind string replace: prose or a URL containing the
+            # substring "images/" (e.g. https://x/images/logo.png) would
+            # otherwise be silently corrupted.
             assets_rel = assets_dir.name + "/"
-            md_text = md_text.replace("images/", assets_rel)
+            md_text = re.sub(
+                r"(!\[[^\]]*\]\()images/",
+                lambda m: m.group(1) + assets_rel,
+                md_text,
+            )
 
-        notes = [f"backend={_MINERU_BACKEND} lang={_MINERU_LANG} method={_MINERU_METHOD}"]
+        notes = [f"backend={_MINERU_BACKEND} lang={lang} method={_MINERU_METHOD}"]
         if copied:
             notes.append(f"extracted {len(copied)} image asset(s)")
+
+        # A MinerU run that exits 0 but emits empty markdown (image-only /
+        # pathological PDF) must not be recorded as fully 'processed' — the
+        # idempotency skip would then make the empty note permanent.
+        if not md_text.strip():
+            if copied:
+                return ExtractionResult(
+                    status="partial",
+                    extractor="pdf-mineru",
+                    markdown=md_text,
+                    assets=copied,
+                    notes=notes + ["mineru produced empty markdown (figures only)"],
+                )
+            return ExtractionResult(
+                status="manual_review",
+                extractor="pdf-mineru",
+                markdown="",
+                error="mineru produced empty markdown",
+            )
 
         return ExtractionResult(
             status="processed",
@@ -159,9 +211,14 @@ def _extract_with_mineru(src: Path, assets_dir: Path) -> ExtractionResult:
 def _locate_mineru_outputs(tmp_root: Path, stem: str) -> tuple[Path | None, Path | None]:
     """Find the .md and images/ produced by MinerU under tmp_root."""
     candidate_md = None
-    for p in tmp_root.rglob(f"{stem}.md"):
-        candidate_md = p
-        break
+    # Match by exact name, not rglob(f"{stem}.md"): a stem with glob
+    # metacharacters (report[2024].pdf -> [2024] is a character class) would
+    # match nothing and silently fall through to the any-*.md branch.
+    target_name = f"{stem}.md"
+    for p in tmp_root.rglob("*.md"):
+        if p.name == target_name:
+            candidate_md = p
+            break
     if candidate_md is None:
         # Fallback: any markdown file at all.
         for p in tmp_root.rglob("*.md"):
@@ -219,9 +276,38 @@ def _extract_with_pypdf(src: Path) -> ExtractionResult:
             error=f"pypdf unexpected error: {exc!r}",
         )
 
+    # Encrypted PDFs raise FileNotDecryptedError on page-tree access (not at
+    # construction). Try an empty-password decrypt; if that fails, surface a
+    # clear, greppable 'encrypted' failure instead of a generic crash.
+    if getattr(reader, "is_encrypted", False):
+        try:
+            if not reader.decrypt(""):
+                return ExtractionResult(
+                    status="manual_review",
+                    extractor="pdf-pypdf",
+                    markdown="",
+                    error="pypdf: PDF is encrypted (password required)",
+                )
+        except Exception as exc:  # noqa: BLE001
+            return ExtractionResult(
+                status="manual_review",
+                extractor="pdf-pypdf",
+                markdown="",
+                error=f"pypdf: PDF is encrypted and could not be decrypted: {exc!r}",
+            )
+
     pages: list[str] = []
     page_errors = 0
-    for i, page in enumerate(reader.pages, start=1):
+    try:
+        page_iter = list(reader.pages)
+    except Exception as exc:  # noqa: BLE001 — page-tree access can still fail
+        return ExtractionResult(
+            status="manual_review",
+            extractor="pdf-pypdf",
+            markdown="",
+            error=f"pypdf: could not read pages: {exc!r}",
+        )
+    for i, page in enumerate(page_iter, start=1):
         try:
             txt = page.extract_text() or ""
         except Exception:  # noqa: BLE001 — per-page errors shouldn't kill the doc

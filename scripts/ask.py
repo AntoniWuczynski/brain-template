@@ -49,6 +49,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How many vault chunks to retrieve as context (default: 8).",
     )
     p.add_argument(
+        "--mode",
+        choices=["dense", "lexical", "hybrid"],
+        default="hybrid",
+        help="Retrieval mode (default: hybrid — embeddings + BM25).",
+    )
+    p.add_argument(
         "--provider",
         choices=["anthropic", "openai", "gemini", "local"],
         default=None,
@@ -76,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         paths,
         args.question,
         top_k=args.top_k,
+        mode=args.mode,
         provider_override=args.provider,
         model_override=args.model,
     )

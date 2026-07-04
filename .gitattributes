@@ -1,8 +1,15 @@
-# Ensure Markdown stays text on every platform
+# Ensure text formats stay LF on every platform. Shell scripts and the
+# committed JSONL state matter most: CRLF breaks `#!/usr/bin/env bash`
+# shebangs, and eol churn on append-mostly index.jsonl / uv.lock is noise.
 *.md text eol=lf
 *.py text eol=lf
 *.json text eol=lf
+*.jsonl text eol=lf
 *.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+uv.lock text eol=lf
 
 # Treat raw archive content as binary so git doesn't try to diff
 archive/raw/** binary

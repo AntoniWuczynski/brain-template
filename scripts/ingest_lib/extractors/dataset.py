@@ -8,7 +8,6 @@ from pathlib import Path
 from .base import ExtractionResult
 
 _PREVIEW_ROWS = 5
-_MAX_INFER_BYTES = 1 << 20  # 1 MiB sample for type inference
 
 
 def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
@@ -69,6 +68,16 @@ def _extract_dsv(src: Path, *, delimiter: str) -> ExtractionResult:
             markdown="",
             error=f"read failed: {exc}",
         )
+    except csv.Error as exc:
+        # e.g. a single field exceeding csv.field_size_limit (128 KiB) —
+        # common in scraped/LLM datasets. Surface it as a clean review
+        # rather than letting it escape as an 'extractor crashed'.
+        return ExtractionResult(
+            status="manual_review",
+            extractor="dataset-dsv",
+            markdown="",
+            error=f"csv parse failed: {exc}",
+        )
 
     md = [
         f"**Rows (excluding header):** {row_count}",
@@ -79,12 +88,12 @@ def _extract_dsv(src: Path, *, delimiter: str) -> ExtractionResult:
         "| # | column |",
         "| --- | --- |",
     ]
-    md.extend(f"| {i+1} | `{c}` |" for i, c in enumerate(header))
+    md.extend(f"| {i+1} | `{_clip_code(c)}` |" for i, c in enumerate(header))
     if preview:
         md.append("")
         md.append("## Preview (first 5 rows)")
         md.append("")
-        md.append("| " + " | ".join(header) + " |")
+        md.append("| " + " | ".join(_clip(c) for c in header) + " |")
         md.append("| " + " | ".join(["---"] * len(header)) + " |")
         for row in preview:
             row = row + [""] * (len(header) - len(row))
@@ -99,6 +108,7 @@ def _extract_dsv(src: Path, *, delimiter: str) -> ExtractionResult:
 def _extract_jsonl(src: Path) -> ExtractionResult:
     keys: dict[str, int] = {}
     row_count = 0
+    skipped = 0
     sample: list[dict[str, object]] = []
     try:
         with src.open("r", encoding="utf-8", errors="replace") as fh:
@@ -109,6 +119,7 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
+                    skipped += 1
                     continue
                 row_count += 1
                 if isinstance(obj, dict):
@@ -134,7 +145,7 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
         "| --- | --- |",
     ]
     for k in sorted(keys):
-        md.append(f"| `{k}` | {keys[k]} |")
+        md.append(f"| `{_clip_code(k)}` | {keys[k]} |")
     if sample:
         md.append("")
         md.append("## Preview (first 5 records)")
@@ -143,13 +154,29 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
             md.append("```json")
             md.append(json.dumps(obj, ensure_ascii=False, sort_keys=True)[:500])
             md.append("```")
+    # Honesty: unparseable lines are dropped from the schema. Say so, and
+    # mark the note partial rather than silently claiming full extraction.
+    notes: list[str] = []
+    status = "processed"
+    if skipped:
+        notes.append(f"skipped {skipped} unparseable JSON line(s)")
+        status = "partial"
     return ExtractionResult(
-        status="processed",
+        status=status,
         extractor="dataset-jsonl",
         markdown="\n".join(md) + "\n",
+        notes=notes,
     )
 
 
 def _clip(s: str, n: int = 80) -> str:
     s = s.replace("|", "\\|").replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _clip_code(s: str, n: int = 80) -> str:
+    """Clip a value destined for a Markdown ``code`` span in a table cell:
+    strip backticks (which would break the span) and pipes/newlines (which
+    would break the table)."""
+    s = s.replace("`", "").replace("|", "\\|").replace("\n", " ")
     return s if len(s) <= n else s[: n - 1] + "…"

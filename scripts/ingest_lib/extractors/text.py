@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ExtractionResult
+from .base import ExtractionResult, fence
 
 
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MiB safety cap; oversize files marked partial
@@ -22,8 +22,12 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
 
     truncated = size > _MAX_BYTES
     try:
-        with src.open("r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read(_MAX_BYTES)
+        # Read BYTES then decode, so the cap is a true byte cap: a text-mode
+        # read(_MAX_BYTES) reads that many CHARACTERS, disagreeing with the
+        # byte-based ``truncated`` flag on any multibyte file.
+        with src.open("rb") as fh:
+            data = fh.read(_MAX_BYTES)
+        text = data.decode("utf-8", errors="replace")
     except OSError as exc:
         return ExtractionResult(
             status="manual_review",
@@ -33,7 +37,8 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
         )
 
     suffix = src.suffix.lstrip(".").lower() or "text"
-    fenced = f"```{suffix}\n{text}\n```\n"
+    # Dynamic fence: source files (esp. .md/.rst) routinely contain ``` runs.
+    fenced = fence(text, suffix) + "\n"
 
     notes = []
     if truncated:

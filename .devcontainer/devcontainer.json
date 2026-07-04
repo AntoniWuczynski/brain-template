@@ -7,9 +7,9 @@
   },
   "mounts": [
     "source=brain-uv-cache,target=/home/vscode/.cache/uv,type=volume",
-    "source=brain-mineru-models,target=/home/vscode/.cache/magic-pdf,type=volume"
+    "source=brain-mineru-models,target=/home/vscode/.cache/huggingface,type=volume"
   ],
-  "postCreateCommand": "uv sync --frozen || uv sync",
+  "postCreateCommand": "uv sync --frozen || { echo 'WARNING: uv.lock is stale vs pyproject.toml; re-resolving (this rewrites uv.lock — run `uv lock` and commit it deliberately)'; uv sync; }",
   "remoteUser": "vscode",
   "customizations": {
     "vscode": {
