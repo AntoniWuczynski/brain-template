@@ -16,7 +16,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from pathlib import Path
 
 # Make ``ingest_lib`` importable when running this file directly
@@ -35,7 +35,7 @@ def _configure_sweep_logger(logs_dir: Path) -> tuple[logging.Logger, Path]:
     ``ingest_lib.logging_setup.configure_run_logger``, which hard-codes
     the ``ingest-`` filename prefix — hence this minimal ``sweep-`` twin."""
     logs_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     log_path = logs_dir / f"sweep-{ts}.log"
 
     logger = logging.getLogger(f"brain.sweep.{ts}")
@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    as_of: date = args.as_of or datetime.now(tz=timezone.utc).date()
+    as_of: date = args.as_of or datetime.now(tz=UTC).date()
 
     paths = default_paths()
     paths.ensure()

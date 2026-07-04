@@ -139,7 +139,7 @@ class _ConcurrencyGuard:
         self._sem = threading.BoundedSemaphore(n)
         self._label = label
 
-    def __enter__(self) -> "_ConcurrencyGuard":
+    def __enter__(self) -> _ConcurrencyGuard:
         if not self._sem.acquire(blocking=False):
             raise ToolError(f"server busy ({self._label}); retry shortly")
         return self

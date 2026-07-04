@@ -6,7 +6,8 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Literal
+from collections.abc import Iterator
 
 Status = Literal["processed", "partial", "manual_review", "skipped"]
 

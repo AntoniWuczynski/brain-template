@@ -38,7 +38,14 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING
+from collections.abc import Callable, Iterator
+
+if TYPE_CHECKING:
+    # numpy is imported lazily inside functions (torch-free CLIs shouldn't pay
+    # the import cost); this makes the "np.ndarray" annotations resolvable for
+    # ruff and mypy without importing it at module load.
+    import numpy as np
 
 from .config import VaultPaths
 from .knowledge import KNOWLEDGE_EXTRACTOR, _record_for_note, knowledge_records
@@ -174,7 +181,7 @@ _CACHE_LOCK = _threading.Lock()
 _EMBEDDER_CACHE: tuple[object, str] | None = None
 # key is (vectors_mtime, meta_mtime) so a search can't cache a vectors
 # file from one rebuild against a meta file from another.
-_INDEX_CACHE: tuple[tuple[float, float], "object", list[dict]] | None = None
+_INDEX_CACHE: tuple[tuple[float, float], object, list[dict]] | None = None
 
 
 @contextmanager
@@ -459,7 +466,7 @@ def upsert_notes(
     note_rel_paths: list[str],
     *,
     logger: logging.Logger,
-    encode: Callable[[list[str]], "np.ndarray"] | None = None,
+    encode: Callable[[list[str]], np.ndarray] | None = None,
 ) -> int:
     """Patch the index rows for a few knowledge notes without a full
     rebuild. Returns the number of chunks newly written (0 when every
@@ -749,6 +756,10 @@ def search(
 
     # --- fuse ---------------------------------------------------------------
     if mode == "dense":
+        # dense mode always populated dense_scores above (it only stays None
+        # when the model load failed, which already returned) — assert so the
+        # indexing below is well-typed rather than "Any | None".
+        assert dense_scores is not None
         return [_hit_from_row(meta, i, float(dense_scores[i])) for i in dense_rank[:top_k]]
     if mode == "lexical":
         return [_hit_from_row(meta, i, float(lex_scores.get(i, 0.0))) for i in lex_rank[:top_k]]

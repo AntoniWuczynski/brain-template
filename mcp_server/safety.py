@@ -14,9 +14,7 @@ to a user-visible MCP error. Stack traces never reach the agent.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Final
 
 from .config import (
     CONCEPT_WRITE_PREFIX,

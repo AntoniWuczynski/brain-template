@@ -43,8 +43,12 @@ for the rules there.
 
 ## Things Claude should not do here
 
-- Don't write generic CI / lint / package boilerplate. This vault is
-  not a published library.
+- Keep CI lean, don't gold-plate it. The framework here syncs to the
+  **public** `brain-template` repo, which needs testing, so a single
+  `.github/workflows/ci.yml` (pytest + ruff + mypy on one Ubuntu / Python
+  3.12 runner, skipping `mcp(...)` vault-note commits) is expected and must
+  stay green. What to avoid is the over-built kind: version/OS matrices,
+  coverage gates, packaging/wheels.
 - Don't reach for ML to "summarise" failed extractions. Mark them and
   surface them to the user.
 - Don't drift the MCP server from its contract. The server IS

@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from collections.abc import Sequence
 
 from pydantic import BaseModel, Field
 
@@ -312,7 +312,7 @@ def rebuild_descriptions(
     generated = 0
     skipped_no_context = 0
     failed = 0
-    for (slug, want), ctx in zip(todo, contexts):
+    for (slug, want), ctx in zip(todo, contexts, strict=True):
         name = displays.get(slug, slug)
         # Empty retrieval for this concept's OWN sources -> honestly skip.
         if not any(c and c.strip() for c in ctx):

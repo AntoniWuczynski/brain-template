@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 # Make the ingest_lib package importable. Same shim the CLI scripts use.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -58,7 +58,7 @@ def _safe_agent(agent: str) -> str:
 # Whitespace-tolerant matcher for a top-level ``<key>:`` line. ``author :``
 # (space before the colon) is still a YAML key, so an exact ``author:``
 # match would let a client smuggle a duplicate spoofed key past the strip.
-def _key_line_re(key: str) -> "re.Pattern[str]":
+def _key_line_re(key: str) -> re.Pattern[str]:
     return re.compile(rf"^\s*{re.escape(key)}\s*:")
 
 
@@ -197,7 +197,7 @@ def frontmatter_signature(content: str) -> tuple:
     return (topics, relation_sig)
 
 
-def _topic_list(frontmatter: dict[str, Any]) -> list[object]:
+def _topic_list(frontmatter: dict[str, object]) -> list[object]:
     """Tolerant read of ``topics:`` — a bare string counts as one topic,
     anything that isn't a string/list counts as none (mirrors how the
     knowledge scanner shrugs at malformed frontmatter)."""

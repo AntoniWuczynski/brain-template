@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Final
 
 import yaml
 
@@ -179,7 +179,7 @@ def _coerce_str(raw: object) -> str:
     return str(raw).strip()
 
 
-def parse_relations(frontmatter: dict[str, Any]) -> tuple[list[Relation], list[str]]:
+def parse_relations(frontmatter: dict[str, object]) -> tuple[list[Relation], list[str]]:
     """Read ``relations:`` from a note's frontmatter, tolerantly.
 
     Returns ``(relations, problems)``. Malformed entries (non-list value,
@@ -296,14 +296,14 @@ def _relation_entry(relation: Relation) -> dict[str, str]:
     return entry
 
 
-def _entry_matches(entry: dict[str, Any], relation: Relation) -> bool:
+def _entry_matches(entry: dict[str, object], relation: Relation) -> bool:
     return (
         _coerce_str(entry.get("rel")) == relation.rel
         and normalize_target(_coerce_str(entry.get("target"))) == relation.target
     )
 
 
-def _serialise(frontmatter: dict[str, Any], body: str) -> str:
+def _serialise(frontmatter: dict[str, object], body: str) -> str:
     dumped = yaml.safe_dump(
         frontmatter, sort_keys=False, allow_unicode=True, default_flow_style=False
     )
@@ -330,7 +330,7 @@ def upsert_relation_in_text(text: str, relation: Relation) -> tuple[str, str]:
 
     raw = frontmatter.get("relations")
     if isinstance(raw, list):
-        entries: list[Any] = raw
+        entries: list[object] = raw
     elif raw in (None, "", []):
         entries = []
     else:

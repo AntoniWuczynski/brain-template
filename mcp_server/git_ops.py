@@ -62,7 +62,7 @@ def commit_paths(
     *,
     paths: list[Path],
     message: str,
-) -> "CommitOutcome":
+) -> CommitOutcome:
     """Stage the given paths and commit — no push.
 
     The whole add/status/commit/rev-parse sequence holds ``_GIT_LOCK``
@@ -105,7 +105,7 @@ def commit_and_push(
     remote: str,
     branch: str,
     push: bool = True,
-) -> "CommitOutcome":
+) -> CommitOutcome:
     """Stage the given paths, commit, optionally push (synchronously).
 
     Returns a CommitOutcome describing exactly what happened so the caller

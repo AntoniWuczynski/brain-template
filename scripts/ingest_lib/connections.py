@@ -29,8 +29,9 @@ import logging
 import os
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass
-from typing import Literal, Sequence
+from dataclasses import dataclass, field
+from typing import Literal
+from collections.abc import Mapping, Sequence
 
 from .concepts import slugify
 from .config import VaultPaths
@@ -132,7 +133,7 @@ def cooccurrence_edges(records: list[IndexRecord]) -> list[Edge]:
 
 
 def semantic_edges(
-    concept_vectors: dict[str, Sequence[float]],
+    concept_vectors: Mapping[str, Sequence[float]],
     *,
     top_k: int = _SEMANTIC_TOP_K,
     min_cosine: float = _SEMANTIC_MIN_COSINE,
@@ -154,7 +155,7 @@ def semantic_edges(
         for sj in slugs:
             if sj == si:
                 continue
-            dot = sum(x * y for x, y in zip(vi, concept_vectors[sj]))
+            dot = sum(x * y for x, y in zip(vi, concept_vectors[sj], strict=True))
             if dot >= min_cosine:
                 sims.append((dot, sj))
         sims.sort(key=lambda t: (-t[0], t[1]))
@@ -196,6 +197,15 @@ def typed_edges(entities: dict[str, EntityInfo]) -> list[Edge]:
     return edges
 
 
+@dataclass
+class _MergedSlot:
+    """Accumulated signal strengths for one undirected concept pair."""
+
+    cooccurrence: float = 0.0
+    semantic: float = 0.0
+    kinds: set[str] = field(default_factory=set)
+
+
 def build_related_map(
     edges: list[Edge],
     displays: dict[str, str],
@@ -207,28 +217,27 @@ def build_related_map(
     Ranking: concepts linked by *both* signals rank above single-signal ones,
     then by combined strength, then alphabetically (stable, deterministic).
     """
-    merged: dict[tuple[str, str], dict[str, object]] = {}
+    merged: dict[tuple[str, str], _MergedSlot] = {}
     for e in edges:
         # Only the undirected concept kinds merge here. Typed entity edges
         # live in the same file but are directional and not a concept
         # similarity — skip them (and any future kind) instead of letting
-        # slot[e.kind] raise KeyError.
+        # the accumulation below misattribute a typed weight.
         if e.kind not in (_KIND_COOCCURRENCE, _KIND_SEMANTIC):
             continue
         key = _ordered(e.a, e.b)
-        slot = merged.setdefault(
-            key, {"cooccurrence": 0.0, "semantic": 0.0, "kinds": set()}
-        )
-        slot[e.kind] = float(slot[e.kind]) + e.weight  # type: ignore[arg-type]
-        kinds = slot["kinds"]
-        assert isinstance(kinds, set)
-        kinds.add(e.kind)
+        slot = merged.setdefault(key, _MergedSlot())
+        if e.kind == _KIND_COOCCURRENCE:
+            slot.cooccurrence += e.weight
+        else:
+            slot.semantic += e.weight
+        slot.kinds.add(e.kind)
 
     neighbours: dict[str, list[Related]] = defaultdict(list)
     for (a, b), slot in merged.items():
-        co = float(slot["cooccurrence"])
-        sem = float(slot["semantic"])
-        kinds = tuple(sorted(slot["kinds"]))  # type: ignore[arg-type]
+        co = slot.cooccurrence
+        sem = slot.semantic
+        kinds = tuple(sorted(slot.kinds))
         neighbours[a].append(
             Related(slug=b, display=displays.get(b, b), kinds=kinds,
                     cooccurrence=co, semantic=sem)
@@ -316,7 +325,7 @@ def concept_vectors_from_embeddings(
     # Raw centroid per concept. Row indices are sorted so the float32
     # summation order is fixed run-to-run — set iteration order is not
     # stable across processes and would otherwise break determinism.
-    raw: dict[str, "np.ndarray"] = {}
+    raw: dict[str, np.ndarray] = {}
     for slug, sources in concept_sources.items():
         idx = sorted(i for src in sources for i in rows_by_source.get(src, []))
         if not idx:

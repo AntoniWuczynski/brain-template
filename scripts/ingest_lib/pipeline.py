@@ -13,9 +13,9 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
-from typing import Iterator, Sequence
+from collections.abc import Iterator, Sequence
 
 from .concepts import rebuild_concepts
 from .config import VaultPaths
@@ -440,7 +440,7 @@ def _title_from_relpath(rel: str) -> str:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def backfill_summaries(
@@ -477,6 +477,10 @@ def backfill_summaries(
     logger.info("backfill plan: %d record(s) need summaries", len(candidates))
 
     for rec in candidates:
+        if rec.processed_path is None:
+            # Filtered out of `candidates` already; re-check narrows the type
+            # (str | None -> str) so the path join below is well-typed.
+            continue
         processed_full = paths.root / rec.processed_path
         if not processed_full.is_file():
             logger.warning("processed file missing for %s — skipping", rec.relative_path)

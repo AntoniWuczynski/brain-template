@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import time
+from datetime import datetime, UTC
 from pathlib import Path
 
 
 def configure_run_logger(logs_dir: Path, *, dry_run: bool) -> tuple[logging.Logger, Path]:
     logs_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     suffix = "-dryrun" if dry_run else ""
     log_path = logs_dir / f"ingest-{ts}{suffix}.log"
 
@@ -38,9 +39,7 @@ def configure_run_logger(logs_dir: Path, *, dry_run: bool) -> tuple[logging.Logg
     return logger, log_path
 
 
-def _utc_converter(timestamp: float | None = None) -> object:  # type: ignore[override]
+def _utc_converter(timestamp: float | None = None) -> time.struct_time:
     # Honor the record's creation timestamp (not the formatting moment), so a
     # buffered/delayed flush stamps event-time rather than flush-time.
-    import time
-
     return time.gmtime(timestamp)

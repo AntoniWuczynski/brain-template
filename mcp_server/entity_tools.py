@@ -18,8 +18,9 @@ write path in the server behaves identically.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
+from typing import cast
 
 from pydantic import BaseModel, Field
 
@@ -296,8 +297,14 @@ def tool_entity_upsert_relation(
             warning=None if outcome.committed else outcome.detail,
         )
 
-    return _tools._audited_write(
-        runtime, tool="entity_upsert_relation", path=entity_path, fn=_do
+    # `_do` always returns EntityWriteResult; `_audited_write` erases the
+    # subtype to its declared WriteResult, so narrow back to the concrete
+    # class the signature promises.
+    return cast(
+        EntityWriteResult,
+        _tools._audited_write(
+            runtime, tool="entity_upsert_relation", path=entity_path, fn=_do
+        ),
     )
 
 
@@ -342,7 +349,7 @@ def tool_entity_append_fact(
             # same bytes); this is an append-only tool whose output is
             # never regenerated, so recording today's date IS the fact's
             # data, the same way a human would date a logbook line.
-            when = datetime.now(timezone.utc).date().isoformat()
+            when = datetime.now(UTC).date().isoformat()
 
         resolved, rel_path = _resolve_existing_entity(cfg, entity_path)
         node = node_id_for_note(rel_path)
@@ -541,7 +548,7 @@ def tool_meeting_create(
                 )
 
         # --- compute every new text -----------------------------------------
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         meeting_text = _meeting_note_text(
             title=clean_title, date=date, attendee_ids=attendee_ids,
             project_id=project_id, body=body, now_iso=now_iso,

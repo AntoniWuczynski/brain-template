@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from .base import ExtractionResult
 
@@ -29,8 +30,11 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
 
     try:
         from pptx.enum.shapes import MSO_SHAPE_TYPE  # type: ignore[import-not-found]
+        # python-pptx ships no type hints, so MSO_SHAPE_TYPE is an untyped
+        # enum class; keep a separate name so we don't reassign the import.
+        _mso: type | None = MSO_SHAPE_TYPE
     except ImportError:
-        MSO_SHAPE_TYPE = None  # older python-pptx; group recursion degrades
+        _mso = None  # older python-pptx; group recursion degrades
 
     parts: list[str] = []
     counts = {"pictures": 0, "charts": 0}
@@ -38,7 +42,7 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
         title = _slide_title(slide) or f"Slide {i}"
         parts.append(f"## {i}. {title}")
         body_lines: list[str] = []
-        _collect_shapes(slide.shapes, body_lines, counts, MSO_SHAPE_TYPE)
+        _collect_shapes(slide.shapes, body_lines, counts, _mso)
         if body_lines:
             parts.append("\n".join(body_lines))
         # Use has_notes_slide, not `slide.notes_slide` truthiness: accessing
@@ -53,7 +57,7 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     # Pictures and charts carry no extractable text, so a deck with them is
     # only partially captured. Be honest and downgrade.
     notes: list[str] = []
-    status = "processed"
+    status: Literal["processed", "partial", "manual_review"] = "processed"
     dropped = counts["pictures"] + counts["charts"]
     if dropped:
         bits = []

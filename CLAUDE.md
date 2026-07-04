@@ -33,11 +33,20 @@ See [`README.md`](README.md) for the full layer breakdown.
 
 You should **not** spend time on:
 
-- Generic software boilerplate (CI matrices, complicated test infra,
-  multi-platform packaging). This is a personal knowledge vault, not a
-  product.
 - Generating "summary" content for documents that failed to extract.
   Mark them `manual_review` and stop.
+- Over-built CI: version/OS matrices, coverage gates, packaging/wheels,
+  multi-platform anything. See the CI note below for what IS wanted.
+
+**CI is wanted — but lean.** This private repo is the *source* of the
+framework that syncs to the **public** `brain-template` repo (via
+`scripts/push_to_upstream.sh`), and a public repo needs testing. There is a
+single workflow, `.github/workflows/ci.yml` (synced to the template), that
+runs pytest + ruff + mypy on **one** runner (Ubuntu, Python 3.12) for pushes
+and PRs that touch code. Keep it that way: no matrices, no packaging. It is
+gated to skip the constant `mcp(...)` vault-note commits (they change no code
+and must not burn Actions minutes). ruff + mypy must stay green — treat a red
+run as a real failure, not noise.
 
 ---
 
