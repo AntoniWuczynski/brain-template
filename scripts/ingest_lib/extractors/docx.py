@@ -30,35 +30,70 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
 
     parts: list[str] = []
     body = doc.element.body
-    for child in body.iterchildren():
-        tag = child.tag
-        if tag == qn("w:p"):
-            # Paragraph: collect runs.
-            text = "".join(t.text or "" for t in child.iter(qn("w:t")))
-            if text.strip():
-                parts.append(text)
-            else:
-                parts.append("")
-        elif tag == qn("w:tbl"):
-            parts.append(_table_to_markdown(child))
+    _walk_block_children(body, qn, parts)
     markdown = "\n\n".join(p for p in parts if p is not None) + "\n"
 
+    # Embedded images/drawings and OLE objects carry no extractable text, so
+    # a doc that has them is only PARTIALLY captured. Say so honestly and
+    # downgrade rather than claiming full extraction (the idempotency skip
+    # would otherwise make the silent loss permanent).
+    n_drawings = sum(1 for _ in body.iter(qn("w:drawing")))
+    n_pict = sum(1 for _ in body.iter(qn("w:pict")))
+    n_obj = sum(1 for _ in body.iter(qn("w:object")))
+    n_visual = n_drawings + n_pict + n_obj
+    notes: list[str] = []
+    status = "processed"
+    if n_visual:
+        notes.append(
+            f"{n_visual} embedded image(s)/drawing(s)/object(s) not extracted "
+            "(text captured; visual content is not)"
+        )
+        status = "partial"
+
     return ExtractionResult(
-        status="processed",
+        status=status,
         extractor="docx",
         markdown=markdown,
+        notes=notes,
     )
+
+
+def _walk_block_children(container, qn, parts: list[str]) -> None:
+    """Append Markdown for a container's block children in document order.
+
+    Descends into ``w:sdt`` content controls (TOCs, structured-document
+    tags), whose body would otherwise be dropped — they are siblings of
+    ``w:p``/``w:tbl``, not inside them. Paragraph text uses a recursive
+    ``w:t`` scan, so text-box (``w:txbxContent``) prose is captured too."""
+    for child in container.iterchildren():
+        tag = child.tag
+        if tag == qn("w:p"):
+            text = "".join(t.text or "" for t in child.iter(qn("w:t")))
+            parts.append(text if text.strip() else "")
+        elif tag == qn("w:tbl"):
+            parts.append(_table_to_markdown(child))
+        elif tag == qn("w:sdt"):
+            content = child.find(qn("w:sdtContent"))
+            if content is not None:
+                _walk_block_children(content, qn, parts)
+
+
+def _cell_text(cell, qn) -> str:
+    """Cell text, escaped for a Markdown table cell: a literal '|' would add
+    a phantom column, a newline would break the row."""
+    text = "".join(t.text or "" for t in cell.iter(qn("w:t"))).strip()
+    return text.replace("|", "\\|").replace("\n", " ")
 
 
 def _table_to_markdown(tbl_elem) -> str:
     from docx.oxml.ns import qn  # type: ignore[import-not-found]
 
     rows: list[list[str]] = []
-    for row in tbl_elem.iter(qn("w:tr")):
-        cells = [
-            "".join(t.text or "" for t in cell.iter(qn("w:t"))).strip()
-            for cell in row.iter(qn("w:tc"))
-        ]
+    # DIRECT children only (findall, not iter): a nested table's rows/cells
+    # would otherwise be pulled into the outer table twice and inflate the
+    # column count.
+    for row in tbl_elem.findall(qn("w:tr")):
+        cells = [_cell_text(cell, qn) for cell in row.findall(qn("w:tc"))]
         rows.append(cells)
     if not rows:
         return ""

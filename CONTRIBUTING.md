@@ -43,13 +43,19 @@ If your change touches the summarizer or chat: also run `uv run python scripts/a
 
 By contributing you agree your changes are released under the MIT license.
 
-## A note for whoever's running this fork
+## A note for whoever's running this fork privately
 
-This template is generated from a private upstream repo via `scripts/sync_template.sh` (one-way: private → public). When you merge a PR here, the change exists only on the public side until you backport it:
+If you maintain a private fork of this template that contains your own content, the model is: this template repo is canonical; your private fork is a downstream consumer that pulls framework updates from here. When upstream gets a merged PR, run:
 
 ```bash
-# from inside your private brain repo
-git fetch public
-git cherry-pick <merge-commit-sha>
-# then on next ingest cycle, ./scripts/sync_template.sh will see no diff
+./scripts/pull_from_upstream.sh
 ```
+
+inside your private fork to absorb it. When you make framework changes in your private fork that should be shared, run:
+
+```bash
+./scripts/push_to_upstream.sh
+git push upstream template:main
+```
+
+to project them up.

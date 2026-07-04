@@ -15,8 +15,11 @@ RUN apt-get update \
         libgl1 libglib2.0-0 libgomp1 poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
-# Install uv to /usr/local/bin. Pinning the install URL is intentional;
-# the script auto-detects the latest stable release.
+# Install uv to /usr/local/bin. This installs whatever the LATEST uv release
+# is at build time (the install script is not version-pinned), so container
+# builds are not perfectly reproducible across uv releases. Pin the URL to a
+# specific version (e.g. https://astral.sh/uv/0.7.13/install.sh) if you need
+# byte-reproducible dependency-management behavior.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 USER vscode

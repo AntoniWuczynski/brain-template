@@ -39,8 +39,9 @@ class VaultPaths:
             p.mkdir(parents=True, exist_ok=True)
 
 
-def default_paths() -> VaultPaths:
-    root = _repo_root()
+def paths_for_root(root: Path) -> VaultPaths:
+    """Build VaultPaths for an explicit vault root."""
+    root = Path(root).expanduser().resolve()
     return VaultPaths(
         root=root,
         inbox=root / "inbox",
@@ -53,3 +54,7 @@ def default_paths() -> VaultPaths:
         metadata_index_jsonl=root / "metadata" / "index.jsonl",
         logs=root / "logs",
     )
+
+
+def default_paths() -> VaultPaths:
+    return paths_for_root(_repo_root())

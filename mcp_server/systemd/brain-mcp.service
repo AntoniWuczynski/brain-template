@@ -1,0 +1,64 @@
+[Unit]
+Description=brain MCP server
+Documentation=https://github.com/AntoniWuczynski/brain-template/blob/main/mcp/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brain
+Group=brain
+WorkingDirectory=/srv/brain
+EnvironmentFile=/etc/brain-mcp/env
+
+# Run the venv interpreter directly (built by `uv sync` -> /srv/brain/.venv).
+# Avoids depending on uv's location and on /home, which ProtectHome blocks.
+ExecStart=/srv/brain/.venv/bin/python -m mcp_server
+
+# Keep model/cache downloads under the writable vault. The brain user's home
+# is /srv/brain (see DEPLOY.md), but pin these explicitly so a stray HOME or
+# ProtectSystem=strict can't push the sentence-transformers weight download
+# somewhere read-only and break vault_search on first use.
+Environment=HF_HOME=/srv/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=/srv/brain/.cache
+
+Restart=on-failure
+RestartSec=5
+
+# --- hardening: deny everything we don't need ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The vault root and the env file are the only writable / readable paths
+# we need outside the venv. systemd lets us whitelist them explicitly.
+ReadWritePaths=/srv/brain
+ReadOnlyPaths=/etc/brain-mcp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# NOTE: no MemoryDenyWriteExecute — torch / sentence-transformers map
+# executable pages (JIT, BLAS) and the search tool would silently break.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+# Network — only outbound to GitHub for push and Cloudflare for tunnel.
+# (No fine-grained outbound restriction here; rely on the user's firewall
+# if they want it.)
+PrivateUsers=true
+
+[Install]
+WantedBy=multi-user.target

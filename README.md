@@ -13,7 +13,7 @@ When you drop a file in `inbox/`, the pipeline:
 3. Writes a Markdown artefact to `archive/processed/`, with extracted images saved alongside.
 4. Generates an Obsidian-friendly index note at `knowledge/index/`, transcluding the processed content.
 5. Calls an LLM (optional) to produce a faithful summary, key points, and canonical topic tags.
-6. Auto-builds concept notes at `knowledge/concepts/` — one per topic, listing every source that mentions it. This is the cross-source linking layer.
+6. Auto-builds concept notes at `knowledge/concepts/` — one per topic, listing every source *and every hand-written `knowledge/` note* that mentions it. This is the cross-source linking layer.
 7. Updates a semantic search index (local embeddings, no API cost) so you can query the whole vault by meaning, not just by tag.
 
 The result is a vault that grows by drop-and-run, organises itself, and stays queryable from the terminal, from Obsidian, and from any agent you point at it.
@@ -30,6 +30,8 @@ brain/
 ├── knowledge/
 │   ├── index/           ← one Obsidian note per source, with summary + topics
 │   ├── concepts/        ← auto-generated cross-source topic notes
+│   ├── meetings/        ← one note per meeting, by year
+│   ├── assistant/       ← assistant memory: inbox/ archive/ digests/ PROFILE.md
 │   ├── projects/        notes/        research/
 │   └── people/  organisations/ university/   ← hand-written notes go here
 ├── metadata/
@@ -39,7 +41,9 @@ brain/
 ├── scripts/
 │   ├── ingest.py        ← the CLI
 │   └── ingest_lib/      ← extractors, summarizer, concept builder, search
-├── mcp/                 ← (design only) remote MCP server spec
+├── mcp/                 ← MCP server docs + deploy guide
+├── mcp_server/          ← the MCP server (FastAPI + FastMCP)
+├── .claude/skills/      ← Claude Code skills shipped with the vault
 └── pyproject.toml
 ```
 
@@ -70,10 +74,10 @@ uv sync
 That's enough to ingest text-only files (Markdown, code, notebooks, CSVs). For full PDF extraction with figures and tables:
 
 ```bash
-uv pip install --prerelease=allow "mineru[pipeline]"
+uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" "transformers==4.53.3" six
 ```
 
-`uv sync` will prune MinerU on every subsequent run because it isn't in the lockfile (its transitive deps include pre-releases that break `uv`'s resolver). Re-run the line above after each sync, or wrap both in a `scripts/setup.sh` of your own.
+Keep the `==2.7.6` pin: the unpinned latest (mineru 3.4.0) requires `transformers>=4.57.3` but imports a symbol removed in 4.57, so every PDF silently falls back to `pypdf`. `uv sync` will prune MinerU on every subsequent run because it isn't in the lockfile (its transitive deps include pre-releases that break `uv`'s resolver). Re-run the pinned line above after each sync, or wrap both in a `scripts/setup.sh` of your own.
 
 To enable summaries and topic tagging, copy `.env.example` to `.env` and add a provider's credentials:
 
@@ -101,7 +105,7 @@ Sub-directory structure under `inbox/` is preserved end-to-end. The same file dr
 uv run python scripts/ingest.py --search "what happens when a packet is dropped" --top-k 5
 ```
 
-Returns the most semantically similar passages across every processed source, with citation paths. The first call after a fresh clone downloads a ~100 MB embedding model to `~/.cache/huggingface/`.
+Returns the most semantically similar passages across every processed source and hand-written `knowledge/` note, with citation paths. The first call after a fresh clone downloads a ~100 MB embedding model to `~/.cache/huggingface/`.
 
 ### Chat with the vault
 
@@ -127,9 +131,15 @@ Open the repo root as an Obsidian vault. `knowledge/index/Home.md` is your entry
 | `--dry-run --inbox` | Show the plan, don't write anything |
 | `--backfill-summaries` | Add Summary + Key points + Topics to existing records that lack them |
 | `--rebuild-concepts` | Regenerate concept notes from current metadata (free, no LLM) |
+| `--rebuild-connections` | Rebuild the concept relationship graph in `metadata/connections.jsonl` (free, no LLM) |
+| `--rebuild-dashboards` | Regenerate entity dashboards under `knowledge/index/entities/` (free, no LLM) |
+| `--describe-concepts --limit N` | Write AI-generated, source-grounded descriptions into concept notes (LLM; cached by source hash) |
+| `--caption-figures --limit N` | Caption extracted figures/tables with a vision LLM (cached in `metadata/captions.jsonl`) |
 | `--rebuild-search-index` | Re-encode every chunk and overwrite the search index |
 | `--search "query" --top-k N` | Semantic search the vault |
 | `ask.py "question"` (separate script) | Retrieval-augmented chat: top-k chunks + LLM → citation-backed answer |
+| `sweep.py --write-report` (separate script) | Lint the vault: orphans, dangling links, relation problems, index drift, stale memory (free, no LLM) |
+| `consolidate.py --dry-run` (separate script) | Consolidate assistant memory: promote confirmed facts into entity notes, digest the rest (free, no LLM) |
 
 ## Configuration
 
@@ -149,6 +159,13 @@ Everything is via environment variables in `.env`:
 | `MINERU_DEVICE_MODE` | `cpu` / `mps` / `cuda` for MinerU inference. |
 | `BRAIN_EMBED_DEVICE` | Same for the semantic-search embedder. |
 | `MINERU_MODEL_SOURCE` | `huggingface` (default) or `modelscope`. |
+| `BRAIN_MINERU_FORMULA` | `true` (default) / `false`. Disable MinerU's formula model (it hallucinates LaTeX on handwriting). |
+| `BRAIN_MINERU_LANG` | OCR language passed to MinerU (default `en`). |
+| `BRAIN_PDF_EXTRACTOR` | Set to `vlm` to route PDFs through the vision-LLM page transcriber (handwritten/scanned notes). |
+| `BRAIN_VLM_MODEL` | Vision model for the `vlm` extractor (default `claude-sonnet-4-6`). |
+| `BRAIN_VLM_SCALE` | Page render resolution for the `vlm` extractor (default 2.0). |
+| `BRAIN_AUTO_DESCRIBE=1` | Auto-run concept descriptions after ingest (costs LLM calls; off by default). |
+| `BRAIN_PROFILE_MAX_BYTES` | Byte budget for `knowledge/assistant/PROFILE.md` writes via `profile_update` (default 4096). |
 
 ## How agents use it
 
@@ -158,7 +175,7 @@ Two patterns work well today:
 
 **As an oracle in this repo.** Ask Claude Code from `~/brain/` itself: *"What does my vault say about X?"*, *"Quiz me on COMP0023"*, *"Find sources that connect Y and Z"*. The agent has read access to everything; it can grep, read processed Markdown, follow wikilinks, and synthesise across sources with citations.
 
-Both rely on you running the agent locally. For remote agents (claude.ai, third-party MCP clients), see `mcp/README.md` — there's a design for a self-hosted MCP server but no implementation yet.
+**Over MCP, from anywhere.** The [Model Context Protocol](https://modelcontextprotocol.io) server in `mcp_server/` (FastAPI + FastMCP) exposes the vault to any MCP client: semantic search, read, directory listing, metadata/concept-graph queries, and bearer-authenticated writes confined to `knowledge/` (every write is committed to git). Run it locally with `mcp_server/run-local.sh` and register it with `claude mcp add` (contract in `mcp/README.md`; remote deploy behind Cloudflare Access in `mcp/DEPLOY.md`). The bundled **`brain-project-note`** skill in `.claude/skills/` builds on it: from *any* repo on your machine, it summarises the project and session you're working on into `knowledge/projects/<slug>/` — a full-rewrite overview note plus dated session logs. Install it globally with `cp -r .claude/skills/brain-project-note ~/.claude/skills/`.
 
 ## Extending
 
@@ -189,7 +206,7 @@ The system prompt for summarization lives in `scripts/ingest_lib/summarize.py`. 
 - **PDF extraction quality depends on MinerU.** Scanned PDFs without text layers need OCR, which MinerU handles but is slow. Mathematical typesetting is hit-or-miss.
 - **Summaries cost money** if you use a hosted provider. A fraction of a cent per page; under two cents per typical source on Haiku 4.5, GPT-5-mini, or Gemini 2.5 Flash. Free on local providers (Ollama etc.). Disable with `BRAIN_SKIP_SUMMARY=1`.
 - **Concept canonicalization isn't perfect.** The summarizer is asked to reuse existing topic names but occasionally drifts. Slugification catches case and punctuation variants; semantic drift across paraphrases doesn't.
-- **No write-side MCP yet.** Agents on other machines can't add to the vault without a deployed MCP server (see `mcp/README.md` for the design).
+- **Remote write access needs the MCP server hosted.** Locally it's one command (`mcp_server/run-local.sh`); exposing it to other machines or to claude.ai means standing up the server with a bearer token behind Cloudflare Access — see `mcp/DEPLOY.md`.
 - **Repo size grows with `archive/raw/`.** PDFs aren't diff-friendly, so git history bloats. Long-term, you'll want git-lfs or a separate object store for the raw archive.
 
 ## License

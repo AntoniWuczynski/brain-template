@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# Sync the public ``template`` branch from the current ``main`` working tree.
+# Push framework changes from this private fork up to the public template
+# repo (``upstream`` remote). Sync the local ``template`` branch from the
+# current ``main`` working tree, then push it to ``upstream:main``.
+#
+# Mental model: brain-template is the canonical framework. This private
+# repo is a downstream consumer with personal content layered on top.
+# When you make framework changes here that should be shared, run this.
 #
 # Run from the main branch (clean or dirty — the script copies the working
-# tree, not the committed state). It creates the ``template`` branch on
-# first run (as an orphan, so none of your personal history is included),
-# or refreshes it on subsequent runs.
+# tree, not the committed state). The local ``template`` branch is an
+# orphan on first creation (no shared history with your personal content)
+# and gets refreshed on subsequent runs.
 #
 # Files synced from main:
-#   - scripts/, pyproject.toml, uv.lock
+#   - scripts/, mcp_server/, pyproject.toml, uv.lock
 #   - AGENTS.md, CLAUDE.md, mcp/, .devcontainer/, .gitignore, .gitattributes
 #   - .env.example, .claude/CODEBASE.md, .claude/{hooks,memory,patterns}/.gitkeep
 #   - .obsidian/{app,appearance,core-plugins,graph}.json
@@ -16,6 +22,7 @@
 #
 # Files sourced from _template/ on main (overlay specific to the public branch):
 #   - README.md, LICENSE, TODO.md, WORK_LOG.md, CONTRIBUTING.md
+#   - .claude/skills/            (from _template/.claude/skills/ — bundled skills)
 #   - knowledge/index/Home.md            (from _template/Home.md)
 #   - .github/PULL_REQUEST_TEMPLATE.md   (from _template/PULL_REQUEST_TEMPLATE.md)
 #
@@ -26,8 +33,8 @@
 #   - hand-written notes anywhere else under knowledge/
 #   - .env, .obsidian/workspace.json
 #
-# After the script runs, push to your public remote with the line it
-# prints at the end.
+# After the script runs, push to ``upstream`` with the line it prints
+# at the end.
 
 set -euo pipefail
 
@@ -70,6 +77,7 @@ fi
 # Framework files to copy verbatim from main.
 FRAMEWORK_PATHS=(
     "scripts"
+    "mcp_server"
     "pyproject.toml"
     "uv.lock"
     "AGENTS.md"
@@ -122,6 +130,14 @@ cp "_template/CONTRIBUTING.md"          "$WORKTREE/CONTRIBUTING.md"
 cp "_template/Home.md"                  "$WORKTREE/knowledge/index/Home.md"
 cp "_template/PULL_REQUEST_TEMPLATE.md" "$WORKTREE/.github/PULL_REQUEST_TEMPLATE.md"
 
+# Bundled Claude Code skills (e.g. brain-project-note): the template README
+# tells users to `cp -r .claude/skills/brain-project-note ~/.claude/skills/`,
+# so the skills must actually be present on the template branch.
+if [ -d "_template/.claude/skills" ]; then
+    mkdir -p "$WORKTREE/.claude"
+    cp -R "_template/.claude/skills" "$WORKTREE/.claude/"
+fi
+
 # Ensure the empty directories the framework expects exist, with .gitkeep
 # files so git tracks them.
 echo "seeding .gitkeep markers..."
@@ -172,12 +188,11 @@ git commit -m "sync framework from main ($(date +%Y-%m-%d))"
 echo
 echo "template branch updated. To publish:"
 echo
-echo "  # first time: create the public repo (do this once)"
-echo "  gh repo create <your-user>/brain-template --public --source=$ROOT --remote=public --push=false"
-echo
-echo "  # add the remote on the main repo (do this once)"
-echo "  git -C $ROOT remote add public git@github.com:<your-user>/brain-template.git"
+echo "  # first time setup (do this once)"
+echo "  gh repo create <your-user>/brain-template --public --source=$ROOT --remote=upstream --push=false"
+echo "  # or, if you already have the public repo:"
+echo "  git -C $ROOT remote add upstream git@github.com:<your-user>/brain-template.git"
 echo
 echo "  # push the template branch as main on the public repo"
-echo "  git -C $ROOT push public template:main"
+echo "  git -C $ROOT push upstream template:main"
 echo

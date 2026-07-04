@@ -10,18 +10,27 @@ Both functions are deterministic given the same filesystem state.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from .concepts import ConceptStats, rebuild_concepts
+from .concepts import rebuild_concepts
 from .config import VaultPaths
-from .extractors import ExtractionResult, dispatch_extractor, registered_extensions
+from .connections import rebuild_connections
+from .dashboards import rebuild_dashboards
+from .extractors import ExtractionResult, dispatch_extractor
 from .hashing import sha256_of
 from .metadata import IndexRecord, append_record, latest_records_by_path
-from .notes import NoteContent, write_index_note, write_processed_note
+from .notes import (
+    NoteContent,
+    derived_assets_dirname,
+    derived_note_relpath,
+    write_index_note,
+    write_processed_note,
+)
 from .semantic import build_index as _build_search_index
 from .summarize import is_enabled as _summary_enabled, summarize as _summarize
 
@@ -156,31 +165,84 @@ def run_ingest(
     for item in plan.skipped_unsupported:
         logger.info("skip (unsupported extension): %s", item.relative_path)
 
+    # Load the record index ONCE and update it in memory after each append
+    # (the same pattern backfill_summaries uses). Reading it per file made
+    # ingest O(files x JSONL size) — a 200-file drop re-parsed the whole
+    # multi-MB index 200 times.
+    known = {} if dry_run else latest_records_by_path(paths.metadata_index_jsonl)
+
     for item in plan.items:
-        outcome = _process_one(paths, item, dry_run=dry_run, logger=logger)
+        outcome = _process_one(paths, item, dry_run=dry_run, logger=logger, known=known)
         if outcome == "processed":
             stats.processed += 1
         elif outcome == "partial":
             stats.partial += 1
         elif outcome == "manual_review":
             stats.manual_review += 1
+        else:
+            # 'skipped' (stat failure, or a file that vanished between
+            # planning and execution): count it so the run summary adds up
+            # to the number of planned items instead of silently dropping one.
+            stats.skipped += 1
 
     # Refresh concept notes whenever we actually wrote new content (and
     # not on dry-runs). Cheap: just walks the JSONL, no LLM calls.
     if not dry_run and (stats.processed or stats.partial):
-        cs = rebuild_concepts(paths, logger=logger)
-        logger.info(
-            "concepts: written=%d skipped=%d removed=%d",
-            cs.written, cs.skipped, cs.removed,
-        )
-        # Refresh the semantic search index so new content is queryable
-        # immediately. Cheap (~1 chunk/ms on MPS); failure is non-fatal
-        # — search just stays stale until the next rebuild.
+        # Build the semantic index first: concept centroids (and thus the
+        # connection graph's semantic edges) read fresh vectors from it.
+        # Cheap (~1 chunk/ms on MPS); failure is non-fatal — search just
+        # stays stale until the next rebuild.
         try:
             n = _build_search_index(paths, logger=logger)
             logger.info("semantic: indexed %d chunks", n)
         except Exception as exc:  # noqa: BLE001
             logger.warning("semantic: index build failed (%r) — skipping", exc)
+        # Discover concept relationships (deterministic; uses the index above
+        # when present, co-occurrence alone when not). Non-fatal.
+        related = None
+        try:
+            conn = rebuild_connections(paths, logger=logger)
+            related = conn.related
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("connections: rebuild failed (%r) — skipping", exc)
+        # Refresh concept notes last, linking each to its related concepts.
+        # Wrapped like the other derived-view rebuilds: a bad concept note
+        # must not crash a run whose files were already processed & recorded.
+        try:
+            cs = rebuild_concepts(paths, logger=logger, related=related)
+            logger.info(
+                "concepts: written=%d unchanged=%d skipped=%d removed=%d",
+                cs.written, cs.unchanged, cs.skipped, cs.removed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("concepts: rebuild failed (%r) — skipping", exc)
+        # Entity dashboards are derived views over the same notes; a
+        # failure must not fail the ingest run (same pattern as the
+        # connections rebuild above).
+        try:
+            db = rebuild_dashboards(paths, logger=logger)
+            logger.info(
+                "dashboards: written=%d unchanged=%d", db.written, db.unchanged
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dashboards: rebuild failed (%r) — skipping", exc)
+        # Processing Dashboard + Manual Review: derived from index.jsonl + the
+        # filesystem, non-fatal like the other derived views.
+        try:
+            from .status import rebuild_status
+            rebuild_status(paths, logger=logger)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("status: rebuild failed (%r) — skipping", exc)
+        # Opt-in: generate AI concept descriptions inline (costs LLM calls, so
+        # off by default). Only stale concepts regenerate. Non-fatal.
+        if os.environ.get("BRAIN_AUTO_DESCRIBE") == "1":
+            try:
+                from .describe import rebuild_descriptions
+                ds = rebuild_descriptions(paths, logger=logger)
+                logger.info("describe: generated=%d skipped=%d",
+                            ds.generated, ds.skipped_uptodate)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("describe: failed (%r) — skipping", exc)
     return stats
 
 
@@ -190,6 +252,7 @@ def _process_one(
     *,
     dry_run: bool,
     logger: logging.Logger,
+    known: dict[str, IndexRecord],
 ) -> str:
     rel = item.relative_path
     src = item.src
@@ -209,9 +272,12 @@ def _process_one(
 
     src_hash = sha256_of(src)
     raw_target = paths.archive_raw / rel
-    processed_target = paths.archive_processed / Path(rel).with_suffix(".md")
-    index_note_target = paths.knowledge_index / Path(rel).with_suffix(".md")
-    assets_dir = processed_target.parent / (processed_target.stem + "_assets")
+    # Keep the source's extension in the derived names so report.pdf and
+    # report.docx in one folder don't clobber each other at report.md.
+    derived_rel = derived_note_relpath(rel)
+    processed_target = paths.archive_processed / derived_rel
+    index_note_target = paths.knowledge_index / derived_rel
+    assets_dir = processed_target.parent / derived_assets_dirname(rel)
 
     if dry_run:
         logger.info(
@@ -254,7 +320,12 @@ def _process_one(
             raw_target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, raw_target)
 
-    # 2. Run the extractor.
+    # 2. Run the extractor. Clear any assets from a PREVIOUS extraction of
+    #    this source first: on a re-ingest (changed hash) the old
+    #    content-hash-named images would otherwise linger unreferenced and
+    #    accumulate forever. archive/processed is regenerable by contract.
+    if assets_dir.exists():
+        shutil.rmtree(assets_dir, ignore_errors=True)
     try:
         result = extractor(src, assets_dir)
     except Exception as exc:  # noqa: BLE001
@@ -268,7 +339,14 @@ def _process_one(
 
     # 3. On manual_review move file to archive/failed and update metadata.
     if result.status == "manual_review":
-        _move_to_failed(raw_target, paths)
+        moved = _move_to_failed(raw_target, paths)
+        # Record the ACTUAL destination (which may be a .N suffix), not the
+        # plain path — otherwise the metadata source-of-truth points at the
+        # wrong bytes when a path fails more than once.
+        failed_rel = (
+            str(moved.relative_to(paths.root)) if moved is not None
+            else str((paths.archive_failed / rel).relative_to(paths.root))
+        )
         _record_failure(
             paths,
             rel=rel,
@@ -276,9 +354,7 @@ def _process_one(
             size=size,
             extension=src.suffix.lower(),
             error=result.error or "unknown extractor error",
-            raw_path=str(
-                (paths.archive_failed / rel).relative_to(paths.root)
-            ),
+            raw_path=failed_rel,
             extractor_name=result.extractor,
         )
         logger.warning("  manual_review: %s — %s", rel, result.error)
@@ -294,6 +370,7 @@ def _process_one(
         title=title,
         paths=paths,
         logger=logger,
+        known=known,
     )
     full_notes = list(result.notes) + summary_notes
 
@@ -340,6 +417,9 @@ def _process_one(
         topics=list(topics),
     )
     append_record(paths.metadata_index_jsonl, record)
+    # Reflect the append in the in-memory index so later files in this run
+    # reuse the same summary cache / canonical-topic list without re-reading.
+    known[record.relative_path] = record
     logger.info(
         "  %s: %s (extractor=%s, %d asset(s))",
         result.status,
@@ -380,8 +460,10 @@ def backfill_summaries(
 
     if not _summary_enabled():
         logger.error(
-            "summarization is disabled (set ANTHROPIC_API_KEY and unset "
-            "BRAIN_SKIP_SUMMARY) — nothing to do"
+            "summarization is disabled — configure an LLM provider "
+            "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / "
+            "BRAIN_LOCAL_URL; see scripts/README.md) and unset "
+            "BRAIN_SKIP_SUMMARY — nothing to do"
         )
         return stats
 
@@ -464,27 +546,67 @@ def backfill_summaries(
         stats.processed += 1
         logger.info("  summarized: %s (topics=%d)", rec.relative_path, len(out.topics))
 
-    # After backfilling summaries, refresh concept notes so cross-source
-    # links land in one shot.
-    cs = rebuild_concepts(paths, logger=logger)
+    # After backfilling summaries, refresh the connection graph then the
+    # concept notes so cross-source links and related-concept links land in
+    # one shot.
+    related = None
+    try:
+        conn = rebuild_connections(paths, logger=logger)
+        related = conn.related
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("connections: rebuild failed (%r) — skipping", exc)
+    cs = rebuild_concepts(paths, logger=logger, related=related)
     logger.info(
-        "concepts: written=%d skipped=%d removed=%d",
-        cs.written, cs.skipped, cs.removed,
+        "concepts: written=%d unchanged=%d skipped=%d removed=%d",
+        cs.written, cs.unchanged, cs.skipped, cs.removed,
     )
     return stats
 
 
 def _strip_frontmatter_header(text: str) -> str:
-    """Drop the ``# Title`` + ``> ...`` block we wrote in ``write_processed_note``.
+    """Recover just the extracted body from a processed note.
 
-    Keeps the actual extracted body so summarization isn't biased by the
-    header we generated. Strips up to the first ``---`` separator we wrote.
+    ``write_processed_note`` wraps the body as::
+
+        # Title
+        > Source/Hash/Extractor/Status
+        ---
+        <body>
+        ---
+        ## Processing notes
+        <notes>
+
+    We must strip BOTH the leading title/meta block (up to the first
+    ``---``) AND the trailing ``---`` + ``## Processing notes`` footer.
+    Missing the footer meant ``backfill_summaries`` fed the old notes back
+    to the summarizer and re-wrapped them, growing a duplicate
+    ``## Processing notes`` section on every backfill (and embedding the
+    stale metadata into the search index). The trailing strip loops so a
+    note already carrying several duplicated footers heals to a single body.
     """
     lines = text.splitlines(keepends=True)
+    start = 0
     for i, ln in enumerate(lines):
         if ln.strip() == "---" and i > 0:
-            return "".join(lines[i + 1 :]).lstrip()
-    return text
+            start = i + 1
+            break
+    body = "".join(lines[start:]).lstrip()
+    # Strip every trailing '---\n\n## Processing notes\n...' footer.
+    while True:
+        blines = body.splitlines(keepends=True)
+        cut = None
+        for j in range(len(blines) - 1, -1, -1):
+            if blines[j].strip() == "## Processing notes":
+                k = j - 1
+                while k >= 0 and blines[k].strip() == "":
+                    k -= 1
+                if k >= 0 and blines[k].strip() == "---":
+                    cut = k
+                break
+        if cut is None:
+            break
+        body = "".join(blines[:cut]).rstrip() + "\n"
+    return body
 
 
 def _maybe_summarize(
@@ -495,6 +617,7 @@ def _maybe_summarize(
     title: str,
     paths: VaultPaths,
     logger: logging.Logger,
+    known: dict[str, IndexRecord],
 ) -> tuple[str, list[str], list[str], list[str]]:
     """Return ``(summary, key_points, topics, extra_notes)``.
 
@@ -502,13 +625,15 @@ def _maybe_summarize(
     matches; otherwise calls the LLM. Skipped when the result is not
     ``processed``, when the body is empty, or when summarization is
     disabled (no ``ANTHROPIC_API_KEY`` / ``BRAIN_SKIP_SUMMARY=1``).
+    ``known`` is the caller's in-memory record index (updated as the run
+    progresses) — read from it instead of re-parsing the JSONL per file.
     """
     if result.status != "processed":
         return "", [], [], []
     if not (result.markdown or "").strip():
         return "", [], [], []
 
-    latest = latest_records_by_path(paths.metadata_index_jsonl)
+    latest = known
 
     # Hash-keyed cache: any prior record with the same source_hash carries
     # a summary we can reuse — but only if it has the new ``topics``
@@ -555,13 +680,17 @@ def _collect_existing_topics(latest: dict[str, IndexRecord]) -> list[str]:
     return out
 
 
-def _move_to_failed(raw_target: Path, paths: VaultPaths) -> None:
+def _move_to_failed(raw_target: Path, paths: VaultPaths) -> Path | None:
+    """Move a failed raw file into ``archive/failed/``. Returns the FINAL
+    destination path (which may carry a ``.N`` suffix if a prior failure
+    already occupies the plain name), or None if there was nothing to move,
+    so the caller can record the true location in metadata."""
     if not raw_target.exists():
-        return
+        return None
     try:
         rel = raw_target.relative_to(paths.archive_raw)
     except ValueError:
-        return
+        return None
     failed_target = paths.archive_failed / rel
     failed_target.parent.mkdir(parents=True, exist_ok=True)
     if failed_target.exists():
@@ -574,6 +703,7 @@ def _move_to_failed(raw_target: Path, paths: VaultPaths) -> None:
                 break
             i += 1
     shutil.move(str(raw_target), str(failed_target))
+    return failed_target
 
 
 def _record_failure(

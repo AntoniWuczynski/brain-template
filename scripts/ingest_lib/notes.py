@@ -4,24 +4,11 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
-
-
-_GENERATED_FRONTMATTER_KEYS: frozenset[str] = frozenset(
-    {
-        "title",
-        "type",
-        "source_file",
-        "source_hash",
-        "created",
-        "updated",
-        "status",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -60,6 +47,36 @@ def _atomic_write(path: Path, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def fm_scalar(value: Any) -> str:
+    """YAML-safe serialization of one frontmatter scalar for line assembly.
+
+    Plain-safe strings stay UNQUOTED — byte-identical to the old
+    ``f"{value}"`` interpolation for the common case, so notes that don't
+    trigger an edge case are not rewritten (skip-unchanged holds). A string
+    that needs quoting (contains ``: ``, leading ``[``/``@``/``{``…) gets a
+    valid quoted form instead of unparseable YAML; a date/datetime renders
+    as its ISO string instead of ``datetime.date(...)``.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    dumped = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True).strip()
+    if dumped.endswith("..."):          # safe_dump appends a doc-end marker to bare scalars
+        dumped = dumped[:-3].strip()
+    return dumped
+
+
+def fm_list(value: Any) -> str:
+    """YAML-safe inline list. A bare string coerces to a one-element list
+    (rather than being dropped); a non-list/str becomes ``[]``."""
+    if isinstance(value, list):
+        seq: list[Any] = value
+    elif isinstance(value, str) and value.strip():
+        seq = [value]
+    else:
+        seq = []
+    return yaml.safe_dump(seq, default_flow_style=True, allow_unicode=True).strip()
 
 
 def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -223,7 +240,11 @@ def _summary_block(content: NoteContent) -> str:
         return "_(empty — extraction failed; see Processing notes)_"
     if content.status == "partial":
         return "_(extraction was incomplete; see Processing notes)_"
-    return "_(no auto-summary — set ANTHROPIC_API_KEY to enable, or write one here.)_"
+    return (
+        "_(no auto-summary — configure an LLM provider (ANTHROPIC_API_KEY / "
+        "OPENAI_API_KEY / GOOGLE_API_KEY / BRAIN_LOCAL_URL) to enable, or "
+        "write one here.)_"
+    )
 
 
 def _key_points_block(content: NoteContent) -> str:
@@ -239,8 +260,31 @@ def _processing_notes_block(content: NoteContent) -> str:
     return f"- Extractor: `{content.extractor}`\n{bullets}"
 
 
+def derived_note_relpath(source_relative_path: str) -> str:
+    """Repo-relative path (under ``archive/processed`` or ``knowledge/index``)
+    of a source's generated Markdown note.
+
+    Keeps the source's OWN extension and appends ``.md``, so ``report.pdf`` ->
+    ``report.pdf.md`` and ``report.docx`` -> ``report.docx.md`` never collide
+    at ``report.md`` (which silently clobbered one source's note, index note
+    and assets dir). Extensionless sources are unchanged (``README`` ->
+    ``README.md``). The processed-note wikilink references this path WITH the
+    ``.md`` so Obsidian still resolves the embed."""
+    return source_relative_path.replace(os.sep, "/") + ".md"
+
+
+def derived_assets_dirname(source_relative_path: str) -> str:
+    """Assets-dir name next to the processed note: keeps the extension too
+    (``report.pdf`` -> ``report.pdf_assets``) so two same-stem sources don't
+    share one assets dir."""
+    return Path(source_relative_path).name + "_assets"
+
+
 def _processed_link_path(source_relative_path: str) -> str:
-    return _strip_extension(source_relative_path)
+    # Reference the processed note by its full name (incl. the trailing .md)
+    # so an Obsidian embed of report.pdf.md resolves — a bare [[report.pdf]]
+    # would be read as a literal .pdf file reference, not the .md twin.
+    return derived_note_relpath(source_relative_path)
 
 
 def _strip_extension(path_str: str) -> str:

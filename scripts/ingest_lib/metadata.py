@@ -45,6 +45,9 @@ class IndexRecord:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
 
 
+_RECORD_FIELDS: frozenset[str] = frozenset(IndexRecord.__dataclass_fields__)
+
+
 def iter_records(jsonl_path: Path) -> Iterator[IndexRecord]:
     if not jsonl_path.exists():
         return
@@ -58,7 +61,19 @@ def iter_records(jsonl_path: Path) -> Iterator[IndexRecord]:
             except json.JSONDecodeError:
                 # Skip malformed lines but don't lose the others.
                 continue
-            yield IndexRecord(**data)
+            if not isinstance(data, dict):
+                continue
+            # Drop unknown keys rather than crashing: the schema has grown
+            # twice already (summary/key_points, then topics), and a single
+            # record written by a newer/older tool version — or hand-edited
+            # with a stray key — must not abort the whole run with a
+            # TypeError. Missing keys still fall back to dataclass defaults.
+            known = {k: v for k, v in data.items() if k in _RECORD_FIELDS}
+            try:
+                yield IndexRecord(**known)
+            except TypeError:
+                # e.g. a required field is absent: skip this line, keep the rest.
+                continue
 
 
 def latest_records_by_path(jsonl_path: Path) -> dict[str, IndexRecord]:
@@ -73,9 +88,13 @@ def append_record(jsonl_path: Path, record: IndexRecord) -> None:
     """Append a record to the JSONL. Creates the file if missing.
 
     Uses a tempfile + os.replace dance only when the file doesn't yet
-    exist; subsequent writes use a plain append-with-fsync, which is
-    atomic at the line level on POSIX as long as the line is < PIPE_BUF
-    (4 KiB), and our records are well under that.
+    exist; subsequent writes append with fsync. Records routinely exceed
+    the PIPE_BUF (4 KiB) single-write atomicity window — asset-heavy
+    MinerU records reach hundreds of KB — so before appending we ensure
+    the file ends in a newline: if a previous write was torn (crash /
+    concurrent run left a partial line), this starts the new record on its
+    own line instead of concatenating onto the stub, so at most one record
+    is lost to a torn tail rather than two silently merging.
     """
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     line = record.to_json_line() + "\n"
@@ -95,7 +114,14 @@ def append_record(jsonl_path: Path, record: IndexRecord) -> None:
                 pass
             raise
     else:
-        with jsonl_path.open("a", encoding="utf-8") as fh:
+        with jsonl_path.open("a+", encoding="utf-8") as fh:
+            # Self-heal a torn tail: if the file doesn't end in '\n', add one
+            # before appending so a partial prior line can't swallow this one.
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() > 0:
+                fh.seek(fh.tell() - 1)
+                if fh.read(1) != "\n":
+                    fh.write("\n")
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
