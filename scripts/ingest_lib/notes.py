@@ -4,9 +4,8 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -29,7 +28,7 @@ class NoteContent:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -49,7 +48,7 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def fm_scalar(value: Any) -> str:
+def fm_scalar(value: object) -> str:
     """YAML-safe serialization of one frontmatter scalar for line assembly.
 
     Plain-safe strings stay UNQUOTED — byte-identical to the old
@@ -67,11 +66,11 @@ def fm_scalar(value: Any) -> str:
     return dumped
 
 
-def fm_list(value: Any) -> str:
+def fm_list(value: object) -> str:
     """YAML-safe inline list. A bare string coerces to a one-element list
     (rather than being dropped); a non-list/str becomes ``[]``."""
     if isinstance(value, list):
-        seq: list[Any] = value
+        seq: list[object] = value
     elif isinstance(value, str) and value.strip():
         seq = [value]
     else:
@@ -79,7 +78,7 @@ def fm_list(value: Any) -> str:
     return yaml.safe_dump(seq, default_flow_style=True, allow_unicode=True).strip()
 
 
-def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+def _split_frontmatter(text: str) -> tuple[dict[str, object], str]:
     """Return (frontmatter_dict, body). Empty dict if no frontmatter."""
     if not text.startswith("---\n") and not text.startswith("---\r\n"):
         return {}, text
@@ -107,29 +106,30 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 
 def _merge_frontmatter(
-    existing: dict[str, Any],
+    existing: dict[str, object],
     *,
-    generated: dict[str, Any],
-) -> dict[str, Any]:
+    generated: dict[str, object],
+) -> dict[str, object]:
     """Generated keys are refreshed; everything else from `existing` is kept.
 
     `created` is preserved from `existing` if present (immutable once set).
     """
-    merged: dict[str, Any] = dict(existing)
+    merged: dict[str, object] = dict(existing)
     for k, v in generated.items():
         if k == "created" and existing.get("created"):
             continue
         merged[k] = v
     # Ensure required keys exist even if neither side provided them.
-    for k, default in (
+    required_lists: tuple[tuple[str, list[str]], ...] = (
         ("topics", []),
         ("aliases", []),
-    ):
+    )
+    for k, default in required_lists:
         merged.setdefault(k, default)
     return merged
 
 
-def _frontmatter_to_yaml(fm: dict[str, Any]) -> str:
+def _frontmatter_to_yaml(fm: dict[str, object]) -> str:
     # Stable key ordering for determinism: required keys first, then alphabetical.
     required = [
         "title",
@@ -142,7 +142,7 @@ def _frontmatter_to_yaml(fm: dict[str, Any]) -> str:
         "topics",
         "aliases",
     ]
-    ordered: dict[str, Any] = {}
+    ordered: dict[str, object] = {}
     for k in required:
         if k in fm:
             ordered[k] = fm[k]
@@ -184,13 +184,13 @@ def write_index_note(
     content: NoteContent,
 ) -> None:
     """Write the Obsidian-friendly index note. Preserves user frontmatter on update."""
-    existing_fm: dict[str, Any] = {}
+    existing_fm: dict[str, object] = {}
     if target.exists():
         existing_text = target.read_text(encoding="utf-8")
         existing_fm, _ = _split_frontmatter(existing_text)
 
     now_iso = _utc_now_iso()
-    generated_fm: dict[str, Any] = {
+    generated_fm: dict[str, object] = {
         "title": content.title,
         "type": "source_note",
         "source_file": content.source_relative_path,
@@ -202,7 +202,11 @@ def write_index_note(
     merged_fm = _merge_frontmatter(existing_fm, generated=generated_fm)
     # Topics merge: take the union of auto-extracted and user-edited.
     if content.topics:
-        existing_topics = list(merged_fm.get("topics") or [])
+        raw_topics = merged_fm.get("topics")
+        # Frontmatter is heterogeneous; a well-formed topics value is a list.
+        existing_topics = (
+            [str(t) for t in raw_topics] if isinstance(raw_topics, list) else []
+        )
         merged_topics: list[str] = []
         seen: set[str] = set()
         for t in list(content.topics) + existing_topics:

@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from pathlib import Path
 
 # Make ``ingest_lib`` importable when running this file directly
@@ -104,7 +104,7 @@ def _configure_logger(logs_dir: Path, *, dry_run: bool) -> tuple[logging.Logger,
     ``consolidate-`` filename — same handlers, same UTC format, its own
     log family so consolidation runs are greppable apart from ingests."""
     logs_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     suffix = "-dryrun" if dry_run else ""
     log_path = logs_dir / f"consolidate-{ts}{suffix}.log"
 
@@ -179,7 +179,7 @@ def _reindex(paths, stats: ConsolidateStats, *, logger: logging.Logger) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    as_of = args.as_of or datetime.now(tz=timezone.utc).date()
+    as_of = args.as_of or datetime.now(tz=UTC).date()
 
     paths = default_paths()
     paths.ensure()

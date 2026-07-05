@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from .base import ExtractionResult
 
@@ -42,7 +43,7 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     n_obj = sum(1 for _ in body.iter(qn("w:object")))
     n_visual = n_drawings + n_pict + n_obj
     notes: list[str] = []
-    status = "processed"
+    status: Literal["processed", "partial", "manual_review"] = "processed"
     if n_visual:
         notes.append(
             f"{n_visual} embedded image(s)/drawing(s)/object(s) not extracted "

@@ -296,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  concepts           : {conn.concepts}")
         print(f"  co-occurrence edges: {conn.cooccurrence_edges}")
         print(f"  semantic edges     : {conn.semantic_edges}")
-        print(f"  output             : metadata/connections.jsonl")
+        print("  output             : metadata/connections.jsonl")
         print(f"  log                : {log_path.relative_to(paths.root)}")
         return 0
 

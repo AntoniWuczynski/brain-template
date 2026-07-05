@@ -285,7 +285,7 @@ def _check_relations(paths: VaultPaths) -> list[Finding]:
             # (rel, target) -> clean date spans, for the overlap check.
             # Entries with bad or inverted dates are excluded so one bad
             # entry doesn't cascade into spurious overlap findings.
-            spans: dict[tuple[str, str], list[tuple[Relation, date, date]]] = defaultdict(list)
+            spans: dict[tuple[str, str], list[tuple[Relation, date | None, date | None]]] = defaultdict(list)
             for r in relations:
                 if not (paths.root / note_path_for_node(r.target)).is_file():
                     findings.append(Finding(

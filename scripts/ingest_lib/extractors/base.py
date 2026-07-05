@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
+from collections.abc import Callable
 
 _BACKTICK_RUN = re.compile(r"`+")
 

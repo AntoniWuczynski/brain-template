@@ -21,6 +21,8 @@ vision call + file walk are verified by running.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 import base64
 import hashlib
 import json
@@ -50,7 +52,10 @@ _CAPTION_PROMPT = (
     "Reply with the description only — no preamble."
 )
 
-_MEDIA_TYPES = {
+# The exact literal set Anthropic's Base64ImageSourceParam.media_type accepts.
+_AnthropicMediaType = Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
+
+_MEDIA_TYPES: dict[str, _AnthropicMediaType] = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
@@ -110,7 +115,7 @@ def upsert_caption(md_text: str, ref: str, image_hash: str, caption: str) -> str
 # vision glue (verified by running)
 # ---------------------------------------------------------------------------
 
-def _media_type(path: Path) -> str:
+def _media_type(path: Path) -> _AnthropicMediaType:
     return _MEDIA_TYPES.get(path.suffix.lower(), "image/jpeg")
 
 
@@ -136,12 +141,30 @@ def caption_image(path: Path, *, logger: logging.Logger | None = None) -> str | 
     return None
 
 
-def _caption_anthropic(model: str, b64: str, media_type: str, log: logging.Logger) -> str | None:
+def _caption_anthropic(
+    model: str, b64: str, media_type: _AnthropicMediaType, log: logging.Logger
+) -> str | None:
     try:
         import anthropic
+        from anthropic.types import (
+            Base64ImageSourceParam,
+            ImageBlockParam,
+            MessageParam,
+            TextBlockParam,
+        )
     except ImportError as exc:
         log.warning("caption: anthropic SDK missing (%s)", exc)
         return None
+    content: list[TextBlockParam | ImageBlockParam] = [
+        ImageBlockParam(
+            type="image",
+            source=Base64ImageSourceParam(
+                type="base64", media_type=media_type, data=b64
+            ),
+        ),
+        TextBlockParam(type="text", text=_CAPTION_PROMPT),
+    ]
+    messages: list[MessageParam] = [{"role": "user", "content": content}]
     try:
         # Construct INSIDE the try: a missing key raises at .create() time
         # (TypeError: could not resolve authentication) which anthropic.APIError
@@ -150,16 +173,16 @@ def _caption_anthropic(model: str, b64: str, media_type: str, log: logging.Logge
         resp = client.messages.create(
             model=model,
             max_tokens=_MAX_CAPTION_TOKENS,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": media_type, "data": b64}},
-                {"type": "text", "text": _CAPTION_PROMPT},
-            ]}],
+            messages=messages,
         )
     except Exception as exc:  # noqa: BLE001 — SDK error hierarchy varies; degrade to skip
         log.warning("caption: anthropic call failed (%r)", exc)
         return None
-    text = " ".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+    # isinstance narrows the ContentBlock union to the text variant, so `.text`
+    # is well-typed (only TextBlock carries it).
+    text = " ".join(
+        b.text for b in resp.content if isinstance(b, anthropic.types.TextBlock)
+    ).strip()
     return text or None
 
 
@@ -171,19 +194,22 @@ def _caption_openai_compatible(
     except ImportError as exc:
         log.warning("caption: openai SDK missing (%s) — needed for %s", exc, provider)
         return None
-    kwargs: dict[str, object] = {}
+    base_url: str | None = None
+    api_key: str | None = None
     if provider == "local":
-        base = os.environ.get("BRAIN_LOCAL_URL")
-        if not base:
+        base_url = os.environ.get("BRAIN_LOCAL_URL")
+        if not base_url:
             log.warning("caption: local provider requires BRAIN_LOCAL_URL")
             return None
-        kwargs["base_url"] = base
-        kwargs["api_key"] = os.environ.get("BRAIN_LOCAL_API_KEY") or "not-needed"
+        api_key = os.environ.get("BRAIN_LOCAL_API_KEY") or "not-needed"
     data_uri = f"data:{media_type};base64,{b64}"
     try:
-        # Construct inside the try: OpenAI(**kwargs) raises OpenAIError at
-        # construction when no key is set, outside any handler otherwise.
-        client = OpenAI(**kwargs)
+        # Construct inside the try: OpenAI() raises OpenAIError at construction
+        # when no key is set, outside any handler otherwise.
+        client = (
+            OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+            if base_url else OpenAI()
+        )
         resp = client.chat.completions.create(
             model=model,
             # max_completion_tokens, not max_tokens: the default openai model

@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from typing import Literal
 
 from .base import ExtractionResult
 
@@ -157,7 +158,7 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
     # Honesty: unparseable lines are dropped from the schema. Say so, and
     # mark the note partial rather than silently claiming full extraction.
     notes: list[str] = []
-    status = "processed"
+    status: Literal["processed", "partial", "manual_review"] = "processed"
     if skipped:
         notes.append(f"skipped {skipped} unparseable JSON line(s)")
         status = "partial"

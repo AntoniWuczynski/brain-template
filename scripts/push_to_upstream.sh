@@ -14,7 +14,8 @@
 # and gets refreshed on subsequent runs.
 #
 # Files synced from main:
-#   - scripts/, mcp_server/, pyproject.toml, uv.lock
+#   - scripts/, mcp_server/, tests/, .github/workflows/ci.yml
+#   - pyproject.toml, uv.lock
 #   - AGENTS.md, CLAUDE.md, mcp/, .devcontainer/, .gitignore, .gitattributes
 #   - .env.example, .claude/CODEBASE.md, .claude/{hooks,memory,patterns}/.gitkeep
 #   - .obsidian/{app,appearance,core-plugins,graph}.json
@@ -78,6 +79,8 @@ fi
 FRAMEWORK_PATHS=(
     "scripts"
     "mcp_server"
+    "tests"
+    ".github/workflows/ci.yml"
     "pyproject.toml"
     "uv.lock"
     "AGENTS.md"

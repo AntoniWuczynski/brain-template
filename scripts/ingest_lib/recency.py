@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from pathlib import Path
-from typing import Final, Sequence
+from typing import Final
+from collections.abc import Sequence
 
 from . import semantic
 from .config import VaultPaths
@@ -96,7 +97,7 @@ def _parse_when(raw: str) -> datetime | None:
     if parsed.tzinfo is None:
         # Frontmatter dates are written in UTC by convention; a bare date
         # parses naive, so pin it rather than crash on aware-naive math.
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -184,7 +185,7 @@ def memory_search(
             raise ValueError(
                 f"unknown type token(s) {unknown} — valid: {', '.join(_TYPE_TOKENS)}"
             )
-    when = now or datetime.now(timezone.utc)
+    when = now or datetime.now(UTC)
     log = logger or logging.getLogger(__name__)
 
     # Filtering happens after fetch, so a filtered query must over-fetch a

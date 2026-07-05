@@ -233,7 +233,9 @@ def summarize(
                     provider, model, exc)
         return None
 
-    if parsed is None:
+    # _call_provider is generic over any Pydantic schema, but summarize()
+    # always asks for DocSummary — narrow so its fields are well-typed.
+    if not isinstance(parsed, DocSummary):
         return None
 
     notes = [f"summary: {provider}/{model}", *provider_notes, *extra_notes]
@@ -426,33 +428,34 @@ def _call_openai_compatible(
 ) -> tuple[BaseModel | None, list[str]]:
     """Shared code path for OpenAI and any OpenAI-compatible local server."""
     try:
-        from openai import OpenAI
+        from openai import Omit, OpenAI, omit
+        from openai.types import ReasoningEffort
+        from openai.types.chat import ChatCompletionMessageParam
     except ImportError as exc:
         log.warning("summary: openai SDK missing (%s) — needed for %s provider",
                     exc, label)
         return None, []
-    client_kwargs: dict[str, object] = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)
-    create_kwargs: dict[str, object] = {}
-    if label == "openai":
-        # gpt-5-mini is a reasoning model: spend the minimum on thinking so
-        # the token budget goes to the structured output, not thoughts.
-        # Only for real OpenAI — local servers may reject the param.
-        create_kwargs["reasoning_effort"] = "minimal"
+    # gpt-5-mini is a reasoning model: spend the minimum on thinking so the
+    # token budget goes to the structured output, not thoughts. Only for real
+    # OpenAI — local servers may reject the param, so send the SDK's `omit`
+    # sentinel (drops it) otherwise.
+    reasoning: ReasoningEffort | Omit
+    reasoning = "minimal" if label == "openai" else omit
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    client = (
+        OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+        if base_url else OpenAI()
+    )
     try:
         completion = client.chat.completions.parse(
             model=model,
             max_completion_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=messages,
             response_format=schema,
-            **create_kwargs,
+            reasoning_effort=reasoning,
         )
     except Exception as exc:  # OpenAI SDK exception hierarchy varies by version
         hint = ""
@@ -495,24 +498,24 @@ def _call_gemini(
         log.warning("summary: gemini requires GOOGLE_API_KEY or GEMINI_API_KEY")
         return None, []
     client = genai.Client(api_key=api_key)
-    config_kwargs: dict[str, object] = dict(
-        system_instruction=system,
-        response_mime_type="application/json",
-        response_schema=schema,
-        max_output_tokens=max_tokens,
-    )
     # gemini-2.5-flash thinks by default and thoughts count against
     # max_output_tokens, starving the JSON. Disable thinking for this
     # extraction workload (Google's own recommendation). Guarded: older
     # google-genai builds lack ThinkingConfig.
-    _thinking = getattr(types, "ThinkingConfig", None)
-    if _thinking is not None:
-        config_kwargs["thinking_config"] = _thinking(thinking_budget=0)
+    thinking_cfg = getattr(types, "ThinkingConfig", None)
     try:
         response = client.models.generate_content(
             model=model,
             contents=user,
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                response_schema=schema,
+                max_output_tokens=max_tokens,
+                thinking_config=(
+                    thinking_cfg(thinking_budget=0) if thinking_cfg is not None else None
+                ),
+            ),
         )
     except Exception as exc:  # genai exception types vary
         log.warning("summary: gemini call failed (%r)", exc)

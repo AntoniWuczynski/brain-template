@@ -40,9 +40,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from pathlib import Path
-from typing import Any
 
 from .concepts import (  # private helpers, but module-internal
     _AUTO_END,
@@ -154,7 +153,7 @@ def _fm_list(raw: object) -> list[str]:
     return []
 
 
-def _note_frontmatter(path: Path) -> dict[str, Any]:
+def _note_frontmatter(path: Path) -> dict[str, object]:
     """Tolerant frontmatter read for the columns EntityInfo doesn't carry
     (project status/topics, meeting date/attendees/project)."""
     try:
@@ -313,7 +312,7 @@ def _write_dashboard(
             if _render(prev_updated) == existing:
                 return False
 
-    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _atomic_write(target, _render(now))
     return True
 

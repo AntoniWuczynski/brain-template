@@ -27,8 +27,9 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
+from typing import Literal
 
 from .config import VaultPaths
 from .hashing import sha256_of
@@ -82,10 +83,12 @@ def _dashboard_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str,
         folder_status.setdefault(folder, Counter())[r.status] += 1
 
     lines: list[str] = ["## Totals", ""]
+    statuses: tuple[Literal["processed", "partial", "manual_review"], ...] = (
+        "processed", "partial", "manual_review",
+    )
     lines += _table(
         ("status", "count"),
-        [(s, str(by_status.get(s, 0)))
-         for s in ("processed", "partial", "manual_review")],
+        [(s, str(by_status[s])) for s in statuses],
     )
     lines += ["", "## By extractor", ""]
     lines += _table(("extractor", "count"),
@@ -242,7 +245,7 @@ def _write_managed(target: Path, *, title: str, auto_body: str) -> bool:
         if prev and _render(prev) == existing:
             return False
 
-    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _atomic_write(target, _render(now))
     return True
 

@@ -1,0 +1,57 @@
+name: CI
+
+# One lean job — lint + typecheck + test on a single Ubuntu / Python 3.12
+# runner. No version/OS matrix, no packaging: this is a personal-vault
+# framework, not a product (see CLAUDE.md / .claude/CODEBASE.md).
+#
+# The path filters below mean this never runs on the constant `mcp(...)`
+# vault-note commits the MCP server makes: those touch only knowledge/ etc.,
+# never code, so they don't burn Actions minutes.
+
+on:
+  push:
+    branches: [main]
+    paths: &code-paths
+      - "scripts/**"
+      - "mcp_server/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths: *code-paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Skip torch + sentence-transformers: the tests monkeypatch the embedder
+      # and mypy ignores those (stubless) SDKs, so the ~2 GB ML stack isn't
+      # needed and CI stays fast. uv still installs everything else from the
+      # locked env (numpy, the LLM SDKs mypy checks against, etc.).
+      - name: Install dependencies
+        run: uv sync --no-install-package torch --no-install-package sentence-transformers
+
+      - name: Lint (ruff)
+        run: uv run --no-sync ruff check .
+
+      - name: Typecheck (mypy)
+        run: uv run --no-sync mypy scripts mcp_server
+
+      - name: Test (pytest)
+        run: uv run --no-sync pytest -q

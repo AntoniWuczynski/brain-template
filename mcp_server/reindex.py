@@ -29,7 +29,11 @@ import logging
 import sys
 import threading
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal, TYPE_CHECKING
+from collections.abc import Callable
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # Make the ingest_lib package importable. Same shim the CLI scripts use.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -60,7 +64,7 @@ class IndexRefresher:
         audit: AuditLog,
         enabled: bool = True,
         debounce_seconds: float = 2.0,
-        encode: Callable[[list[str]], object] | None = None,
+        encode: Callable[[list[str]], np.ndarray] | None = None,
         request_push: Callable[[], str] | None = None,
     ) -> None:
         self._vault_root = vault_root

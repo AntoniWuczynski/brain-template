@@ -182,7 +182,9 @@ def _call_anthropic(*, model: str, system: str, user: str, log: logging.Logger) 
     except Exception as exc:  # noqa: BLE001 — SDK error hierarchy varies
         log.warning("ask: anthropic call failed (%r)", exc)
         return None
-    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+    # isinstance narrows the ContentBlock union to the text variant, so
+    # `.text` is well-typed (only TextBlock carries it).
+    return "".join(b.text for b in resp.content if isinstance(b, anthropic.types.TextBlock))
 
 
 def _call_openai_compat(
@@ -196,32 +198,33 @@ def _call_openai_compat(
     label: str,
 ) -> str | None:
     try:
-        from openai import OpenAI
+        from openai import Omit, OpenAI, omit
+        from openai.types import ReasoningEffort
+        from openai.types.chat import ChatCompletionMessageParam
     except ImportError as exc:
         log.warning("ask: openai SDK missing (%s) — needed for %s provider", exc, label)
         return None
-    client_kwargs: dict[str, object] = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    create_kwargs: dict[str, object] = {}
-    if label == "openai":
-        # gpt-5-mini reasons; keep thinking minimal so the answer isn't
-        # truncated. Only for real OpenAI (local servers may reject it).
-        create_kwargs["reasoning_effort"] = "minimal"
+    # gpt-5-mini reasons; keep thinking minimal so the answer isn't truncated.
+    # Only for real OpenAI — local servers may reject the param, so send the
+    # SDK's `omit` sentinel (drops it) otherwise.
+    reasoning: ReasoningEffort | Omit
+    reasoning = "minimal" if label == "openai" else omit
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
     try:
-        # Construct inside the try: OpenAI(**kwargs) raises OpenAIError at
-        # construction when no key is set, which nothing outside catches.
-        client = OpenAI(**client_kwargs)
+        # Construct inside the try: OpenAI() raises OpenAIError at construction
+        # when no key is set, which nothing outside catches.
+        client = (
+            OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+            if base_url else OpenAI()
+        )
         completion = client.chat.completions.create(
             model=model,
             max_completion_tokens=_MAX_TOKENS,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            **create_kwargs,
+            messages=messages,
+            reasoning_effort=reasoning,
         )
     except Exception as exc:  # SDK exception types vary
         hint = ""
@@ -250,20 +253,20 @@ def _call_gemini(*, model: str, system: str, user: str, log: logging.Logger) -> 
         log.warning("ask: gemini requires GOOGLE_API_KEY or GEMINI_API_KEY")
         return None
     client = genai.Client(api_key=api_key)
-    config_kwargs: dict[str, object] = dict(
-        system_instruction=system,
-        max_output_tokens=_MAX_TOKENS,
-    )
     # Disable thinking (thoughts count against the output cap, truncating the
     # answer). Guarded for older google-genai builds lacking ThinkingConfig.
-    _thinking = getattr(types, "ThinkingConfig", None)
-    if _thinking is not None:
-        config_kwargs["thinking_config"] = _thinking(thinking_budget=0)
+    thinking_cfg = getattr(types, "ThinkingConfig", None)
     try:
         resp = client.models.generate_content(
             model=model,
             contents=user,
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=_MAX_TOKENS,
+                thinking_config=(
+                    thinking_cfg(thinking_budget=0) if thinking_cfg is not None else None
+                ),
+            ),
         )
     except Exception as exc:
         log.warning("ask: gemini call failed (%r)", exc)

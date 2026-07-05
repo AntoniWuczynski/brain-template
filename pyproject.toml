@@ -69,10 +69,45 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "mypy>=1.11",
     "pytest>=9.0.3",
+    "ruff>=0.6",
 ]
 
 [tool.hatch.build.targets.wheel]
 # This project is not meant to be packaged; declare a synthetic
 # package list so hatch doesn't fail.
 packages = ["scripts/ingest_lib"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pragmatic set for a personal-vault framework: errors, pyflakes, warnings,
+# pyupgrade, and bugbear. Not isort (would reorder many imports for no
+# behaviour gain) and not the whole zoo. Add rules deliberately, not en masse.
+select = ["E", "F", "W", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The scripts/ sys.path shim (insert before importing ingest_lib) is a
+# deliberate, load-bearing pattern; E402 (import-not-at-top) is expected there.
+"mcp_server/entity_tools.py" = ["E402"]
+"mcp_server/memory_tools.py" = ["E402"]
+"mcp_server/provenance.py" = ["E402"]
+"mcp_server/reindex.py" = ["E402"]
+"mcp_server/tools.py" = ["E402"]
+"scripts/ingest_lib/semantic.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+# Third-party ML/LLM SDKs (torch, sentence_transformers, mineru, anthropic,
+# openai, google.genai, python-docx/pptx, nbformat, pypdf, pypdfium2) ship no
+# usable stubs; ignore their import types rather than drown in stub-gap noise.
+# We still typecheck OUR code's own annotations.
+ignore_missing_imports = true
+check_untyped_defs = true
+# The scripts/ package is imported via a sys.path shim, not installed; point
+# mypy at it so cross-module imports resolve.
+mypy_path = "scripts"
+explicit_package_bases = true

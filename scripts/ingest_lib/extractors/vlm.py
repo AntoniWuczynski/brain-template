@@ -204,30 +204,33 @@ def _transcribe_page(
 
 def _vision_anthropic(*, png: bytes, model: str) -> str | None:
     import anthropic
+    from anthropic.types import (
+        Base64ImageSourceParam,
+        ImageBlockParam,
+        MessageParam,
+        TextBlockParam,
+    )
 
     client = anthropic.Anthropic()
     b64 = base64.standard_b64encode(png).decode()
+    content: list[ImageBlockParam | TextBlockParam] = [
+        ImageBlockParam(
+            type="image",
+            source=Base64ImageSourceParam(
+                type="base64", media_type="image/png", data=b64
+            ),
+        ),
+        TextBlockParam(type="text", text=_PROMPT),
+    ]
+    messages: list[MessageParam] = [{"role": "user", "content": content}]
     resp = client.messages.create(
         model=model,
         max_tokens=_MAX_OUTPUT_TOKENS,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": b64,
-                        },
-                    },
-                    {"type": "text", "text": _PROMPT},
-                ],
-            }
-        ],
+        messages=messages,
     )
-    parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+    # isinstance narrows the ContentBlock union to TextBlock, which alone
+    # carries `.text`.
+    parts = [b.text for b in resp.content if isinstance(b, anthropic.types.TextBlock)]
     # Return the text (possibly "" for a genuinely blank page); None is
     # reserved for a real failure, which surfaces as an exception here.
     return "".join(parts)
@@ -236,15 +239,18 @@ def _vision_anthropic(*, png: bytes, model: str) -> str | None:
 def _vision_openai_compatible(*, png: bytes, model: str, provider: str) -> str | None:
     from openai import OpenAI
 
-    kwargs: dict[str, object] = {}
+    base_url: str | None = None
+    api_key: str | None = None
     if provider == "local":
         base_url = os.environ.get("BRAIN_LOCAL_URL")
         if not base_url:
             _LOG.warning("vlm: local provider requires BRAIN_LOCAL_URL")
             return None
-        kwargs["base_url"] = base_url
-        kwargs["api_key"] = os.environ.get("BRAIN_LOCAL_API_KEY") or "not-needed"
-    client = OpenAI(**kwargs)
+        api_key = os.environ.get("BRAIN_LOCAL_API_KEY") or "not-needed"
+    client = (
+        OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+        if base_url else OpenAI()
+    )
     b64 = base64.standard_b64encode(png).decode()
     completion = client.chat.completions.create(
         model=model,
@@ -277,12 +283,13 @@ def _vision_gemini(*, png: bytes, model: str) -> str | None:
         _LOG.warning("vlm: gemini requires GOOGLE_API_KEY or GEMINI_API_KEY")
         return None
     client = genai.Client(api_key=api_key)
+    contents: list[types.PartUnionDict] = [
+        types.Part.from_bytes(data=png, mime_type="image/png"),
+        _PROMPT,
+    ]
     resp = client.models.generate_content(
         model=model,
-        contents=[
-            types.Part.from_bytes(data=png, mime_type="image/png"),
-            _PROMPT,
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(max_output_tokens=_MAX_OUTPUT_TOKENS),
     )
     return getattr(resp, "text", None) or None

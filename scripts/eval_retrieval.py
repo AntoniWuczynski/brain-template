@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n".join(_render_table(report)))
 
     if args.write_report:
-        as_of = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        as_of = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         target = paths.root / _REPORT
         _atomic_write(target, _render_report(report, as_of=as_of))
         print(f"\nwrote {_REPORT}")

@@ -28,7 +28,7 @@ import json
 import logging
 import threading
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     """ISO-8601 UTC with a Z suffix, matching vault frontmatter style."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class AuditLog:

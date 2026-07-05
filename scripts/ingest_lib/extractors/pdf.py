@@ -51,6 +51,7 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
         # When the fallback ALSO fails, keep both errors — otherwise the
         # pypdf failure reason (the actual reason nothing was produced) is
         # lost and the failure is undiagnosable from the log / index.jsonl.
+        error: str | None
         if fallback.status == "manual_review":
             error = f"mineru: {result.error}; pypdf: {fallback.error}"
         else:
