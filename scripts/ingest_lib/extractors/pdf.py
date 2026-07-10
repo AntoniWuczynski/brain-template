@@ -205,6 +205,17 @@ def _extract_with_mineru(src: Path, assets_dir: Path) -> ExtractionResult:
             assets=copied,
             notes=notes,
         )
+    except Exception as exc:  # noqa: BLE001 — any output-handling crash must degrade
+        # An unexpected failure while gathering MinerU's outputs (unreadable
+        # markdown, a copy error, a locate crash) would otherwise escape and
+        # abort the whole ingest. Degrade to manual_review like the handled
+        # cases so extract() falls back to pypdf/partial instead.
+        return ExtractionResult(
+            status="manual_review",
+            extractor="pdf-mineru",
+            markdown="",
+            error=f"mineru output handling failed: {exc!r}",
+        )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

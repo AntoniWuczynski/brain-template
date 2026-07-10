@@ -1,8 +1,2 @@
-{"query": "error handling and exceptions in software", "expected": ["university/COMP0010/comp0010-week-6-lesson-1-error-handling.pdf"], "note": "COMP0010 dedicated error-handling lesson"}
-{"query": "singleton design pattern", "expected": ["university/COMP0010/comp0010-week-19-23-10-lesson-2-design-patterns-overview-and-singleton.pdf"], "note": "design patterns overview + singleton"}
-{"query": "builder design pattern", "expected": ["university/COMP0010/comp0010-week-19-23-10-lesson-4-builder-design-pattern.pdf"], "note": "builder pattern lesson"}
-{"query": "observer design pattern", "expected": ["university/COMP0010/comp0010-week-26-30-10-lesson-1-observer-design-pattern.pdf"], "note": "observer pattern lesson"}
-{"query": "dynamic analysis and fuzzing", "expected": ["university/COMP0010/comp0010-week-9-lesson-1-dynamic-analysis-fuzzing.pptx.pdf"], "note": "fuzzing lesson"}
-{"query": "recursion in Haskell functional programming", "expected": ["university/COMP0002/Haskell_4_Recursion.pdf"], "note": "Haskell recursion"}
-{"query": "directed and undirected graphs data structures", "expected": ["university/COMP0005/M-comp0005-4.1 Undirected Graphs.pdf", "university/COMP0005/M-comp0005-4.2 Directed Graphs.pdf"], "note": "graph lectures (multi-source)"}
-{"query": "requirements engineering foundations", "expected": ["university/COMP0101/01_foundations.pdf"], "note": "COMP0101 foundations"}
+{"query": "example query about a topic you have ingested", "expected": ["notes/example-note.md"], "note": "placeholder — replace with queries over your own sources; see scripts/README.md"}
+{"query": "another example retrieval query", "expected": ["research/example-paper.md"], "note": "placeholder — each expected path is a source_relative_path in metadata/index.jsonl"}

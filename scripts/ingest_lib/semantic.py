@@ -58,6 +58,38 @@ _TARGET_TOKENS = 400          # rough budget per chunk; English ≈ chars/4
 _TARGET_CHARS = _TARGET_TOKENS * 4
 _MIN_CHARS = 80               # skip tiny chunks (headings on their own line)
 
+# Per-model retrieval query instruction. BGE v1.5 is trained to prepend this
+# to the QUERY only (passages are embedded raw), which is exactly how the
+# index is built — so this is a query-side-only change that needs NO reindex.
+# Keyed to _MODEL_NAME so a future model swap can't silently apply the wrong
+# prefix. Disable with BRAIN_QUERY_INSTRUCTION=0 (e.g. to A/B via the eval
+# harness).
+_QUERY_INSTRUCTIONS: dict[str, str] = {
+    "BAAI/bge-small-en-v1.5": "Represent this sentence for searching relevant passages: ",
+}
+
+
+def _query_prefix() -> str:
+    if os.environ.get("BRAIN_QUERY_INSTRUCTION", "1") == "0":
+        return ""
+    return _QUERY_INSTRUCTIONS.get(_MODEL_NAME, "")
+
+
+def encode_query(model, query: str):
+    """Encode a search query with the model's documented retrieval instruction
+    (query-side only). Shared by ``search`` and ``describe._retrieve`` so both
+    query the index the same way."""
+    import numpy as np  # type: ignore[import-not-found]
+
+    return np.asarray(
+        model.encode(
+            [_query_prefix() + query],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ),
+        dtype=np.float32,
+    )
+
 
 @dataclass(frozen=True)
 class Chunk:
@@ -85,9 +117,13 @@ class SearchHit:
 # Chunking
 # ---------------------------------------------------------------------------
 
+# Anchored on the literal ``> Source:`` line that ``write_processed_note``
+# always emits as the first blockquote line — NOT on any ``# heading … >
+# quote … ---`` shape. A DOTALL ``.*?`` here used to span arbitrary body
+# lines until a later blockquote + ``---``, silently eating a curated note's
+# body that happened to precede a callout and a horizontal rule.
 _HEADER_BLOCK_RE = re.compile(
-    r"\A(?:#\s.*?\n+>\s.*?\n(?:>\s.*?\n)*\n+---\n+)",
-    re.DOTALL,
+    r"\A#\s[^\n]*\n+>\s*Source:[^\n]*\n(?:>\s[^\n]*\n)*\n+---\n+",
 )
 
 
@@ -179,9 +215,18 @@ def chunk_markdown(text: str, *, min_chars: int = _MIN_CHARS) -> list[str]:
 import threading as _threading
 _CACHE_LOCK = _threading.Lock()
 _EMBEDDER_CACHE: tuple[object, str] | None = None
-# key is (vectors_mtime, meta_mtime) so a search can't cache a vectors
-# file from one rebuild against a meta file from another.
-_INDEX_CACHE: tuple[tuple[float, float], object, list[dict]] | None = None
+# key is (vectors_path, meta_path, vectors_mtime, meta_mtime): the mtimes
+# stop a search caching a vectors file from one rebuild against a meta file
+# from another, and the paths stop two vaults in one process (the pytest
+# suite) serving each other's index on an mtime collision.
+_IndexKey = tuple[str, str, float, float]
+_INDEX_CACHE: tuple[_IndexKey, object, list[dict]] | None = None
+# BM25 index built from the SAME generation of meta as _INDEX_CACHE, keyed
+# identically. Building it from the already-loaded meta (not a second,
+# independently-mtime'd read) guarantees vectors, meta and lexical rows all
+# come from one rebuild — a reindex between two separate loads used to pair
+# generation-A meta with generation-B lexical rows (IndexError / wrong hits).
+_LEXICAL_CACHE: tuple[_IndexKey, object] | None = None
 
 
 @contextmanager
@@ -237,7 +282,10 @@ def _load_index(vectors_path: Path, meta_path: Path):
 
     global _INDEX_CACHE
     try:
-        key = (vectors_path.stat().st_mtime, meta_path.stat().st_mtime)
+        key = (
+            str(vectors_path), str(meta_path),
+            vectors_path.stat().st_mtime, meta_path.stat().st_mtime,
+        )
     except OSError:
         return None
     # Snapshot the global into a local before reading its fields: a
@@ -247,13 +295,30 @@ def _load_index(vectors_path: Path, meta_path: Path):
     # mismatch).
     cache = _INDEX_CACHE
     if cache is not None and cache[0] == key:
-        return cache[1], cache[2]
+        return key, cache[1], cache[2]
     vectors = np.load(vectors_path)
     with meta_path.open("r", encoding="utf-8") as fh:
         meta = [json.loads(ln) for ln in fh if ln.strip()]
     with _CACHE_LOCK:
         _INDEX_CACHE = (key, vectors, meta)
-    return vectors, meta
+    return key, vectors, meta
+
+
+def _lexical_for_generation(key: _IndexKey, meta: list[dict]):
+    """BM25 index over the ALREADY-LOADED meta rows, cached under the same
+    ``(vectors_mtime, meta_mtime)`` key as ``_load_index``. Building it here
+    (not via a second, independently-mtime'd read of the meta file) keeps
+    vectors, meta and lexical rows on one generation."""
+    from . import lexical as _lex
+
+    global _LEXICAL_CACHE
+    cache = _LEXICAL_CACHE
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    index = _lex.build_lexical_index([str(m.get("text", "")) for m in meta])
+    with _CACHE_LOCK:
+        _LEXICAL_CACHE = (key, index)
+    return index
 
 
 def _autodetect_device() -> str:
@@ -667,6 +732,31 @@ def _hit_from_row(meta: list[dict], i: int, score: float) -> SearchHit:
     )
 
 
+def chunks_for_source(paths: VaultPaths, source_relative_path: str) -> list[dict]:
+    """Every indexed chunk of one source, ordered by ``chunk_idx``.
+
+    A read-only view over ``embeddings_meta.jsonl`` (no vectors, no model) so
+    a caller can expand a single search hit into its neighbouring chunks
+    instead of reading the whole file. Empty list when the index is absent or
+    the source has no chunks. Rows are keyed by ``(source_relative_path,
+    chunk_idx)`` — chunk indices are relative to the current index generation
+    and shift when the source is re-chunked (e.g. after a rebuild)."""
+    meta_path = paths.metadata / "embeddings_meta.jsonl"
+    if not meta_path.exists():
+        return []
+    try:
+        with meta_path.open("r", encoding="utf-8", errors="replace") as fh:
+            rows = [json.loads(ln) for ln in fh if ln.strip()]
+    except (OSError, ValueError):
+        return []
+    selected = [
+        r for r in rows
+        if isinstance(r, dict) and r.get("source_relative_path") == source_relative_path
+    ]
+    selected.sort(key=lambda r: int(r.get("chunk_idx", 0)))
+    return selected
+
+
 def search(
     paths: VaultPaths,
     query: str,
@@ -708,7 +798,7 @@ def search(
     if loaded is None:
         log.warning("semantic: index file disappeared between exists() check and load")
         return []
-    vectors, meta = loaded
+    key, vectors, meta = loaded
     if len(meta) != vectors.shape[0]:
         log.warning(
             "semantic: index size mismatch (vectors=%d, meta=%d) — rebuild required",
@@ -716,7 +806,10 @@ def search(
         )
         return []
     n = len(meta)
-    cand = min(_CANDIDATES, n)
+    # Widen the candidate pool when top_k exceeds it, so a large request (e.g.
+    # recency.memory_search's fetch_k=500 filtered path) isn't silently
+    # truncated to 100. Behaviour-preserving for the MCP callers (top_k<=50).
+    cand = min(n, max(_CANDIDATES, top_k))
 
     # --- dense ranking (skipped for lexical mode -> no model load) ----------
     dense_rank: list[int] = []
@@ -731,10 +824,7 @@ def search(
             log.warning("semantic: model load failed (%r) — falling back to lexical", exc)
             mode = "lexical"
         if mode != "lexical":
-            q_vec = np.asarray(
-                model.encode([query], normalize_embeddings=True, show_progress_bar=False),
-                dtype=np.float32,
-            )
+            q_vec = encode_query(model, query)
             dense_scores = (vectors @ q_vec.T).ravel()
             top = np.argpartition(-dense_scores, cand - 1)[:cand]
             dense_rank = [int(i) for i in top[np.argsort(-dense_scores[top])]]
@@ -744,15 +834,13 @@ def search(
     lex_rank: list[int] = []
     if mode in ("lexical", "hybrid"):
         from . import lexical as _lex
-        lidx = _lex.load_lexical_index(meta_path)
-        if lidx is None:
-            if mode == "lexical":
-                log.warning("semantic: lexical index unavailable")
-                return []
-        else:
-            lex_scores = _lex.score(lidx, query)
-            lex_rank = [i for i, _s in sorted(
-                lex_scores.items(), key=lambda kv: (-kv[1], kv[0]))][:cand]
+        # Build BM25 from the meta we already loaded (same generation), not a
+        # second independently-mtime'd read that a concurrent reindex could
+        # desync from `meta`.
+        lidx = _lexical_for_generation(key, meta)
+        lex_scores = _lex.score(lidx, query)
+        lex_rank = [i for i, _s in sorted(
+            lex_scores.items(), key=lambda kv: (-kv[1], kv[0]))][:cand]
 
     # --- fuse ---------------------------------------------------------------
     if mode == "dense":

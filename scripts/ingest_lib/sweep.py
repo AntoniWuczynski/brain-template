@@ -11,6 +11,9 @@ Finding categories (exact strings):
 
 - ``archive-orphan-file``        raw file with no index.jsonl record
 - ``archive-orphan-record``      record whose raw_path file is missing
+- ``archive-corrupt``            raw file whose bytes no longer match its
+                                 recorded source_hash (opt-in; re-hashes
+                                 archive/raw)
 - ``missing-artifact``           record's processed/index note missing
 - ``dangling-wikilink``          ``[[target]]`` that resolves to nothing
 - ``relation-problem``           parse_relations problems, verbatim
@@ -80,17 +83,22 @@ def run_sweep(
     logger: logging.Logger,
     as_of: date,
     stale_days: int = 30,
+    check_integrity: bool = False,
 ) -> SweepReport:
     """Run every check and return the findings, deterministically ordered
     by ``(category, path, detail)``. ``as_of`` (not the wall clock) anchors
-    the staleness check so the same vault state always sweeps the same."""
+    the staleness check so the same vault state always sweeps the same.
+
+    ``check_integrity`` additionally re-hashes every ``archive/raw`` file
+    against its recorded ``source_hash`` (``archive-corrupt``) — off by
+    default because it reads the whole immutable archive (GBs)."""
     latest = latest_records_by_path(paths.metadata_index_jsonl)
     # Virtual knowledge records: topics for fragmentation, paths for the
     # unindexed check — exactly the record set the enrichment pipeline sees.
     knowledge_recs = scan_knowledge(paths, logger=logger).records
 
     findings: list[Finding] = []
-    findings += _check_archive(paths, latest)
+    findings += _check_archive(paths, latest, check_integrity=check_integrity)
     findings += _check_wikilinks(paths)
     findings += _check_relations(paths)
     findings += _check_fragmentation(list(latest.values()) + knowledge_recs)
@@ -153,9 +161,10 @@ def _read_text(path: Path) -> str | None:
 
 
 def _check_archive(
-    paths: VaultPaths, latest: dict[str, IndexRecord]
+    paths: VaultPaths, latest: dict[str, IndexRecord], *, check_integrity: bool = False
 ) -> list[Finding]:
-    """archive-orphan-file / archive-orphan-record / missing-artifact."""
+    """archive-orphan-file / archive-orphan-record / missing-artifact, and
+    (when ``check_integrity``) archive-corrupt."""
     findings: list[Finding] = []
 
     known_raw = {rec.raw_path for rec in latest.values() if rec.raw_path}
@@ -175,11 +184,27 @@ def _check_archive(
                 ))
 
     for rel, rec in sorted(latest.items()):
-        if rec.raw_path and not (paths.root / rec.raw_path).is_file():
+        raw_file = (paths.root / rec.raw_path) if rec.raw_path else None
+        if rec.raw_path and (raw_file is None or not raw_file.is_file()):
             findings.append(Finding(
                 "archive-orphan-record", rel,
                 f"raw_path missing on disk: {rec.raw_path}",
             ))
+        elif check_integrity and raw_file is not None and rec.source_hash:
+            # Bit-rot / accidental edit / immutability violation: the raw
+            # bytes no longer hash to what was recorded at ingest time. Skip
+            # unreadable files (an OSError is not a corruption finding).
+            try:
+                current = sha256_of(raw_file)
+            except OSError:
+                current = ""
+            if current and current != rec.source_hash:
+                findings.append(Finding(
+                    "archive-corrupt", rel,
+                    f"raw file hash changed since ingest "
+                    f"(recorded {rec.source_hash[:12]}, now {current[:12]}) "
+                    "— archive/raw must be immutable",
+                ))
         for label, artifact in (
             ("processed_path", rec.processed_path),
             ("index_note_path", rec.index_note_path),

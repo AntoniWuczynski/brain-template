@@ -35,6 +35,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from ingest_lib import (  # type: ignore[import-not-found]  # noqa: E402
+    chunks_for_source as _chunks_for_source,
     latest_records_by_path as _latest_records_by_path,
     paths_for_root as _paths_for_root,
     related_concepts as _related_concepts,
@@ -186,6 +187,18 @@ class SearchOut(BaseModel):
     hits: list[SearchHitOut]
 
 
+class ChunkOut(BaseModel):
+    chunk_idx: int
+    text: str
+    is_target: bool
+
+
+class ChunkContextOut(BaseModel):
+    source_relative_path: str
+    total_chunks: int
+    chunks: list[ChunkOut]
+
+
 class ReadOut(BaseModel):
     path: str
     content: str
@@ -303,9 +316,11 @@ def tool_search(
                 cfg.vault_root,
                 _hit_gate_path(h.source_relative_path, getattr(h, "origin", "")),
             )
-        # ValueError guards a degenerate row (empty source_relative_path ->
-        # Path('').with_suffix): drop that one hit, don't fail the search.
-        except (SafetyError, ValueError):
+        except SafetyError:
+            # The hit's backing artifact isn't readable under the policy —
+            # drop that one hit, don't fail the whole search. (_hit_gate_path
+            # is pure string ops and resolve_read only raises SafetyError, so
+            # no other exception reaches here.)
             continue
         safe.append(h)
     hits = safe
@@ -355,9 +370,67 @@ def _hit_gate_path(source_relative_path: str, origin: str) -> str:
     return "archive/processed/" + _derived_note_relpath(source_relative_path)
 
 
+def tool_chunk_context(
+    cfg: ServerConfig,
+    runtime: Runtime,
+    source_relative_path: str,
+    chunk_idx: int,
+    before: int = 1,
+    after: int = 1,
+) -> ChunkContextOut:
+    """Return a search hit's neighbouring chunks — cheaper than reading the
+    whole backing file just to see the context around one snippet. Gated by
+    the same read policy as ``vault_search``: a hit whose backing artifact you
+    could not read directly returns nothing here either."""
+    if not source_relative_path or not source_relative_path.strip():
+        raise ToolError("source_relative_path must be non-empty")
+    if chunk_idx < 0:
+        raise ToolError("chunk_idx must be >= 0")
+    if not 0 <= before <= 20 or not 0 <= after <= 20:
+        raise ToolError("before/after must be in [0, 20]")
+    _rate_check_read()
+
+    paths = _paths_for_root(cfg.vault_root)
+    rows = _chunks_for_source(paths, source_relative_path)
+    if not rows:
+        raise ToolError("no indexed chunks for that source (rebuild the index?)")
+    # Gate on the read policy, keyed by the source's own origin (as search does).
+    origin = str(rows[0].get("origin", ""))
+    try:
+        resolve_read(cfg.vault_root, _hit_gate_path(source_relative_path, origin))
+    except SafetyError:
+        raise ToolError("not found or not readable") from None
+
+    lo, hi = chunk_idx - before, chunk_idx + after
+    window = [
+        ChunkOut(
+            chunk_idx=int(r.get("chunk_idx", 0)),
+            text=str(r.get("text", "")),
+            is_target=int(r.get("chunk_idx", 0)) == chunk_idx,
+        )
+        for r in rows
+        if lo <= int(r.get("chunk_idx", 0)) <= hi
+    ]
+    runtime.audit.access_event(
+        agent=current_agent(),
+        tool="vault_chunk_context",
+        paths=[source_relative_path],
+        query=f"chunk {chunk_idx} ±({before},{after})",
+    )
+    return ChunkContextOut(
+        source_relative_path=source_relative_path,
+        total_chunks=len(rows),
+        chunks=window,
+    )
+
+
 def tool_read(cfg: ServerConfig, runtime: Runtime, path: str) -> ReadOut:
-    """Read a file from the vault. Allowed paths cover everything outside
-    the deny-list (system files, secrets, logs). Binary files refused."""
+    """Read a UTF-8 text file from the vault. Reads are allowlist-based: only
+    paths under READ_ALLOW_PREFIXES (knowledge/, archive/, inbox/, metadata/)
+    or the READ_ALLOW_ROOT_FILES vault docs are permitted, with the DENY_*
+    lists (secrets, logs, the embeddings index) applied on top. Everything
+    else — and any refusal — returns the same opaque 'not found or not
+    readable'. Binary and oversize files are refused."""
     _rate_check_read()
     resolved = resolve_read(cfg.vault_root, path)
     if not resolved.is_file():
@@ -395,7 +468,14 @@ def tool_list(cfg: ServerConfig, runtime: Runtime, path: str = "") -> ListOut:
     if not resolved.is_dir():
         raise ToolError("not found or not readable")
     entries: list[ListEntry] = []
-    for child in sorted(resolved.iterdir()):
+    # iterdir on an unreadable directory raises OSError carrying the absolute
+    # path; convert to the same opaque error tool_read uses so the filesystem
+    # layout never leaks to the agent.
+    try:
+        children = sorted(resolved.iterdir())
+    except OSError:
+        raise ToolError("not found or not readable") from None
+    for child in children:
         if child.name.startswith("."):
             continue
         # Only list entries the read allowlist would accept, so the root
@@ -699,6 +779,13 @@ def tool_update_concept_user_section(
                 )
             auto_part = full[: marker_pos + len(_USER_SECTION_MARKER)]
             new_full = auto_part + "\n\n" + content.lstrip() + ("\n" if not content.endswith("\n") else "")
+            # _check_note_size only bounded the client content; the composed
+            # note (auto-generated header + content) can still exceed the cap.
+            if len(new_full.encode()) > MAX_NOTE_BYTES:
+                raise ToolError(
+                    f"composed concept note would exceed {MAX_NOTE_BYTES} bytes; "
+                    "trim the user section"
+                )
             _atomic_write_text(resolved, new_full)
             outcome = _commit(
                 cfg,

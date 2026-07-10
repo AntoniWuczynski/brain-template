@@ -99,6 +99,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"Also write the findings to {_REPORT_REL} (atomic write).",
     )
+    parser.add_argument(
+        "--check-integrity",
+        action="store_true",
+        help="Also re-hash every archive/raw file against its recorded "
+             "source_hash (archive-corrupt). Reads the whole archive (GBs), "
+             "so it is off by default.",
+    )
     return parser
 
 
@@ -117,7 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("repo root: %s", paths.root)
     logger.info("log file: %s", log_path.relative_to(paths.root))
 
-    report = run_sweep(paths, logger=logger, as_of=as_of, stale_days=args.stale_days)
+    report = run_sweep(
+        paths, logger=logger, as_of=as_of, stale_days=args.stale_days,
+        check_integrity=args.check_integrity,
+    )
 
     if args.write_report:
         _atomic_write(paths.root / _REPORT_REL, render_report(report, as_of=as_of))

@@ -4,6 +4,8 @@
     uv run python scripts/eval_retrieval.py                 # print the table
     uv run python scripts/eval_retrieval.py --write-report  # + knowledge/index/retrieval-eval.md
     uv run python scripts/eval_retrieval.py --golden path.jsonl --top-k 10
+    uv run python scripts/eval_retrieval.py --compare-modes # dense vs lexical vs hybrid
+    uv run python scripts/eval_retrieval.py --mine-log      # real queries -> candidates + zero-hit report
 
 Reads ``scripts/eval/retrieval_golden.jsonl`` — lines of
 ``{"query", "expected": [source_paths], "note"?}`` — runs each query through
@@ -46,18 +48,66 @@ def _load_golden(path: Path) -> list[dict]:
     return out
 
 
-def _retriever(paths, top_k: int):
+def _retriever(paths, top_k: int, mode: str = "hybrid"):
     """query -> ordered, de-duplicated source paths from the live index."""
     def retrieve(query: str, n: int) -> list[str]:
-        hits = semantic_search(paths, query, top_k=max(n, top_k))
+        # Over-fetch CHUNKS before de-duping to SOURCES: n chunks dominated by
+        # one multi-chunk source would otherwise yield far fewer than n
+        # distinct sources, so an expected source whose best chunk ranks just
+        # outside n is scored a miss. Fetch a wide chunk pool, then return the
+        # first n distinct sources. (The ×5 only bites for n>20 once
+        # semantic.search's candidate cap is lifted above 100 — it is.)
+        hits = semantic_search(paths, query, top_k=max(n, top_k) * 5, mode=mode)
         seen: set[str] = set()
         ordered: list[str] = []
         for h in hits:
             if h.source_relative_path not in seen:
                 seen.add(h.source_relative_path)
                 ordered.append(h.source_relative_path)
-        return ordered
+        return ordered[:n]
     return retrieve
+
+
+_MODES = ("dense", "lexical", "hybrid")
+
+
+def _run_mine_log(paths) -> int:
+    """Mine the MCP access log into golden candidates + a zero-hit report."""
+    from ingest_lib.evalmine import candidate_lines, load_access_log
+
+    log_path = paths.logs / "mcp-access.jsonl"
+    mined = load_access_log(log_path)
+    if not mined:
+        print(f"no search queries mined from {log_path} "
+              "(no access log yet, or no vault_search/memory_search calls).")
+        return 0
+    zero_hit = [m for m in mined if not m.ever_hit]
+    out_path = _SCRIPTS_DIR / "eval" / "mined_candidates.jsonl"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(out_path, "\n".join(candidate_lines(mined)) + "\n")
+
+    print(f"mined {len(mined)} distinct quer{'y' if len(mined) == 1 else 'ies'} "
+          f"from {log_path.name} -> {out_path.relative_to(paths.root)}")
+    print("  (expected left EMPTY — confirm relevance before promoting to "
+          "retrieval_golden.jsonl)")
+    if zero_hit:
+        print(f"\n{len(zero_hit)} query/queries that NEVER returned a hit "
+              "(retrieval failures to investigate):")
+        for m in zero_hit[:20]:
+            print(f"  - ({m.occurrences}x) {m.query[:70]}")
+    return 0
+
+
+def _run_compare_modes(paths, golden: list[dict], top_k: int) -> int:
+    """Score each retrieval mode over the golden set, side by side."""
+    fetch = max(top_k, max(_KS))
+    print(f"{'mode':>8}  {'recall@5':>9} {'recall@10':>10} {'MRR':>6}  (n={len(golden)})")
+    print("-" * 48)
+    for mode in _MODES:
+        rep = evaluate(golden, _retriever(paths, top_k, mode), ks=_KS, fetch=fetch)
+        print(f"{mode:>8}  {rep.recall_at(5):>9.3f} {rep.recall_at(10):>10.3f} "
+              f"{rep.mrr():>6.3f}")
+    return 0
 
 
 def _render_table(report: EvalReport) -> list[str]:
@@ -113,7 +163,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top-k", type=int, default=10, help="results fetched per query")
     ap.add_argument("--write-report", action="store_true",
                     help=f"also write {_REPORT}")
+    ap.add_argument("--mine-log", action="store_true",
+                    help="mine real queries from logs/mcp-access.jsonl into "
+                         "scripts/eval/mined_candidates.jsonl + a zero-hit report")
+    ap.add_argument("--compare-modes", action="store_true",
+                    help="score dense/lexical/hybrid side by side over the golden set")
     args = ap.parse_args(argv)
+
+    paths = default_paths()
+
+    if args.mine_log:
+        return _run_mine_log(paths)
 
     if not args.golden.is_file():
         print(f"golden set not found: {args.golden}", file=sys.stderr)
@@ -123,8 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         print("golden set is empty — add {query, expected} lines to it.")
         return 0
 
-    paths = default_paths()
-    report = evaluate(golden, _retriever(paths, args.top_k), ks=_KS, fetch=args.top_k)
+    if args.compare_modes:
+        return _run_compare_modes(paths, golden, args.top_k)
+    # fetch enough distinct sources to score the largest k honestly: at
+    # --top-k 5, recall@10 must still see 10 sources, not silently equal r@5.
+    fetch = max(args.top_k, max(_KS))
+    report = evaluate(golden, _retriever(paths, args.top_k), ks=_KS, fetch=fetch)
 
     print("\n".join(_render_table(report)))
 

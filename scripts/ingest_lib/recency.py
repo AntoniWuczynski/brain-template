@@ -60,9 +60,9 @@ _CANDIDATE_MULTIPLIER: Final[int] = 5
 # When a ``types`` filter is active the filter runs AFTER candidate fetch,
 # so a sparse type (a few knowledge/people notes in a 1600-chunk index) can
 # be starved out of a small candidate pool. Over-fetch a much larger pool
-# before filtering. semantic.search has no internal upper cap (it does
-# min(top_k, n) and the matmul scans every vector regardless), so a generous
-# number is cheap.
+# before filtering. semantic.search widens its candidate pool to the
+# requested top_k (min(n, max(100, top_k))) and the matmul scans every vector
+# regardless, so a generous number is cheap and is actually honoured.
 _FILTERED_CANDIDATE_CAP: Final[int] = 500
 
 
@@ -185,6 +185,11 @@ def memory_search(
             raise ValueError(
                 f"unknown type token(s) {unknown} — valid: {', '.join(_TYPE_TOKENS)}"
             )
+    if halflife_days <= 0:
+        # recency_weight would ZeroDivisionError at 0 and boost old notes
+        # (or OverflowError) for negatives. Validate at the boundary, like
+        # `types` — this is exported public API.
+        raise ValueError("halflife_days must be > 0")
     when = now or datetime.now(UTC)
     log = logger or logging.getLogger(__name__)
 

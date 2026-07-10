@@ -23,7 +23,7 @@ ingestion without per-agent custom integrations.
 
 ## Tools
 
-Fifteen tools, registered in [`mcp_server/app.py`](../mcp_server/app.py) and
+Seventeen tools, registered in [`mcp_server/app.py`](../mcp_server/app.py) and
 implemented in [`mcp_server/tools.py`](../mcp_server/tools.py) (read/write),
 [`mcp_server/entity_tools.py`](../mcp_server/entity_tools.py) (entity) and
 [`mcp_server/memory_tools.py`](../mcp_server/memory_tools.py) (memory).
@@ -32,8 +32,9 @@ implemented in [`mcp_server/tools.py`](../mcp_server/tools.py) (read/write),
 
 | Name | Description | I/O |
 |---|---|---|
-| `vault_search` | Semantic search over processed sources **and curated knowledge notes**. Knowledge hits carry their vault path (`knowledge/...`) as `source_relative_path` and are read-gated on that path. | `query: string, top_k?: int=10` → `{hits: [{score, source_relative_path, title, chunk_idx, snippet}]}` |
+| `vault_search` | Hybrid (semantic + BM25 via reciprocal-rank fusion) search over processed sources **and curated knowledge notes**. `mode` selects `hybrid` (default — fuses dense embeddings with a BM25 lexical pass), `dense` (embeddings only), or `lexical` (BM25 only, needs no embedding model). Knowledge hits carry their vault path (`knowledge/...`) as `source_relative_path` and are read-gated on that path. | `query: string, top_k?: int=10, mode?: "dense"\|"lexical"\|"hybrid" = "hybrid"` → `{hits: [{score, source_relative_path, title, chunk_idx, snippet}]}` |
 | `vault_read` | Read a UTF-8 text file by vault-relative path. Refuses binary, secrets, `.git/`, `logs/`. | `path: string` → `{path, content, size_bytes}` |
+| `vault_chunk_context` | Expand one `vault_search` hit into its neighbouring chunks — cheaper than reading the whole file. Same read-gate as search; chunk indices are relative to the current index generation. | `source_relative_path: string, chunk_idx: int, before?: int=1, after?: int=1` → `{source_relative_path, total_chunks, chunks: [{chunk_idx, text, is_target}]}` |
 | `vault_list` | List a directory (hidden entries omitted). | `path?: string=""` → `{path, entries: [{name, is_dir, size_bytes?}]}` |
 | `vault_metadata_query` | Query `metadata/index.jsonl`. | `by: "status"\|"extension"\|"extractor"\|"path_prefix"\|"all", value?: string, limit?: int=50` → `{records: [...]}` |
 | `vault_related` | Concepts most related to a concept, by co-occurrence + semantic similarity. | `concept: string, limit?: int=8` → `{concept, related: [...]}` |
@@ -152,9 +153,9 @@ explicit verb, never a silent truncation.
   `127.0.0.1:8765`, persists a token at `~/.brain-mcp-token`, and prints the
   `claude mcp add` command to register it (push is off by default).
 - **As a service** — `mcp_server/systemd/brain-mcp.service`; see `DEPLOY.md`.
-- **Smoke tests** — `uv run python -m mcp_server.manual_test` (full stack,
-  rewinds its own writes) and `uv run python -m mcp_server.test_replace_note`
-  (isolated, safe on a dirty tree).
+- **Smoke test** — `uv run python -m mcp_server.manual_test` (full stack,
+  rewinds its own writes). The write-policy and search-gate invariants it used
+  to duplicate now run in CI via `tests/test_mcp_write_policy.py`.
 
 ## Non-goals (deliberately)
 

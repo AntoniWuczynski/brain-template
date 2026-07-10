@@ -186,7 +186,10 @@ def write_index_note(
     """Write the Obsidian-friendly index note. Preserves user frontmatter on update."""
     existing_fm: dict[str, object] = {}
     if target.exists():
-        existing_text = target.read_text(encoding="utf-8")
+        # errors="replace": a hand-corrupted index note (invalid UTF-8) must
+        # not abort the whole batch. The read only feeds _split_frontmatter
+        # (already YAML-error tolerant) and the file is fully rewritten below.
+        existing_text = target.read_text(encoding="utf-8", errors="replace")
         existing_fm, _ = _split_frontmatter(existing_text)
 
     now_iso = _utc_now_iso()

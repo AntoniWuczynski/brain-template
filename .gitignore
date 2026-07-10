@@ -37,9 +37,15 @@ logs/mcp-access.jsonl
 # Semantic search index is regenerable from archive/processed/
 # (rebuilt by every ingest, or by --rebuild-search-index)
 metadata/embeddings.npy
-metadata/embeddings.npy.tmp.npy
+metadata/embeddings.tmp.npy
 metadata/embeddings_meta.jsonl
+metadata/embeddings_meta.jsonl.tmp
 metadata/.embeddings.lock
+
+# Mined eval candidates hold real search-query strings (from the access log);
+# they are a scratchpad for hand-promotion into retrieval_golden.jsonl, not
+# durable state, and must never be committed or synced to the public template.
+scripts/eval/mined_candidates.jsonl
 
 # Concept-relationship graph is derived from index.jsonl + embeddings
 # (rebuilt by every ingest, or by --rebuild-connections)

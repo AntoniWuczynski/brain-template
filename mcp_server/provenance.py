@@ -58,8 +58,21 @@ def _safe_agent(agent: str) -> str:
 # Whitespace-tolerant matcher for a top-level ``<key>:`` line. ``author :``
 # (space before the colon) is still a YAML key, so an exact ``author:``
 # match would let a client smuggle a duplicate spoofed key past the strip.
+# This canonical (unquoted) form is what ``_carry_forward`` uses to recover
+# the SERVER's own line from the prior note — it must NOT match a quoted key,
+# so a pre-existing quoted forgery can never be promoted to carried state.
 def _key_line_re(key: str) -> re.Pattern[str]:
     return re.compile(rf"^\s*{re.escape(key)}\s*:")
+
+
+# Quote-tolerant matcher for the STRIP loop only. A quoted YAML key
+# (``"author":`` / ``'author':``) parses as the same key, so an unquoted-only
+# strip would leave a forged provenance line on disk — and on the
+# replace/append path where the prior note lacks that server key, the forged
+# line becomes the sole effective value. Matches ``author:``, ``author :``,
+# ``"author":``, ``'author' :`` but not ``authored_by:`` or ``title:``.
+def _strip_key_line_re(key: str) -> re.Pattern[str]:
+    return re.compile(rf"""^\s*["']?{re.escape(key)}["']?\s*:""")
 
 
 def _carry_forward(prior: str) -> dict[str, str]:
@@ -165,8 +178,9 @@ def stamp_provenance(
         return f"---\n{block}\n---\n{content}"
 
     # Strip EVERY server-owned key the client may have supplied (not just
-    # the ones re-asserted this mode) so nothing forged survives.
-    strip_res = [_key_line_re(k) for k in _PROVENANCE_KEYS]
+    # the ones re-asserted this mode) so nothing forged survives. Quote-
+    # tolerant: a quoted key is still an effective YAML key.
+    strip_res = [_strip_key_line_re(k) for k in _PROVENANCE_KEYS]
     kept: list[str] = []
     for line in lines[1:close_idx]:
         if any(r.match(line) for r in strip_res):

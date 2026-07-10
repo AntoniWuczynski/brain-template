@@ -25,6 +25,7 @@ from .relations import RELATION_VOCAB, EntityInfo, Relation, entity_notes, parse
 from .semantic import (
     SearchHit,
     build_index as build_search_index,
+    chunks_for_source,
     search as semantic_search,
     upsert_notes,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "run_ingest",
     "run_sweep",
     "semantic_search",
+    "chunks_for_source",
     "upsert_notes",
     "write_index_note",
     "write_processed_note",

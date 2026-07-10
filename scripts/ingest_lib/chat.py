@@ -123,10 +123,15 @@ def _format_context(hits: list[SearchHit]) -> str:
     blocks = []
     for i, h in enumerate(hits, start=1):
         # Fence each passage: retrieved vault text is untrusted content, not
-        # instructions to the model (prompt-injection defence).
+        # instructions to the model (prompt-injection defence). Neutralise a
+        # literal <passage>/</passage> in the snippet so injected source text
+        # can't close the fence early and present as outside the untrusted zone.
+        snippet = h.snippet.replace("</passage>", "<\\/passage>").replace(
+            "<passage>", "<\\passage>"
+        )
         blocks.append(
             f"[{i}] (source: {h.source_relative_path}, chunk {h.chunk_idx})\n"
-            f"<passage>\n{h.snippet}\n</passage>"
+            f"<passage>\n{snippet}\n</passage>"
         )
     return "\n\n---\n\n".join(blocks)
 

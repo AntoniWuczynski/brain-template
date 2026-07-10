@@ -32,7 +32,9 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     parts: list[str] = []
     body = doc.element.body
     _walk_block_children(body, qn, parts)
-    markdown = "\n\n".join(p for p in parts if p is not None) + "\n"
+    # _walk_block_children only ever appends strings (never None), so no
+    # None-filter is needed here.
+    markdown = "\n\n".join(parts) + "\n"
 
     # Embedded images/drawings and OLE objects carry no extractable text, so
     # a doc that has them is only PARTIALLY captured. Say so honestly and

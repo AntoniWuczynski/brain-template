@@ -27,7 +27,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, NamedTuple
 
 from .base import ExtractionResult
 from .. import summarize as _summ
@@ -41,12 +41,45 @@ _DEFAULT_SCALE: Final[float] = 2.0
 _MAX_OUTPUT_TOKENS: Final[int] = 4096
 
 # Vision-capable defaults per provider. Override with BRAIN_VLM_MODEL.
+# The ``local`` default is resolved at CALL time (see ``_default_vlm_model``)
+# so BRAIN_LOCAL_MODEL takes effect when set after import — consistent with
+# summarize._select_model. This literal only holds the static fallback.
 _DEFAULT_VLM_MODELS: Final[dict[str, str]] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5-mini",
     "gemini": "gemini-2.5-flash",
-    "local": os.environ.get("BRAIN_LOCAL_MODEL") or "llama3.2-vision",
+    "local": "llama3.2-vision",
 }
+
+
+def _default_vlm_model(provider: str) -> str:
+    """Default vision model for ``provider``, read at call time.
+
+    Mirrors ``summarize._select_model``: BRAIN_LOCAL_MODEL is looked up here,
+    not in the module-level dict literal, so setting it after import is
+    honoured. Falls back to ``anthropic`` for an unknown provider."""
+    if provider == "local":
+        return os.environ.get("BRAIN_LOCAL_MODEL") or _DEFAULT_VLM_MODELS["local"]
+    return _DEFAULT_VLM_MODELS.get(provider, _DEFAULT_VLM_MODELS["anthropic"])
+
+
+class _VisionText(NamedTuple):
+    """One page's transcription. ``text`` may be "" (a genuinely blank page
+    is a success); ``truncated`` means generation stopped at the output-token
+    cap, so the text is cut off mid-page. Failure is represented by a
+    ``_PageFailure`` at the call sites, never by a ``_VisionText``."""
+
+    text: str
+    truncated: bool
+
+
+class _PageFailure(NamedTuple):
+    """One page's transcription FAILURE, carrying the underlying reason
+    (an exception repr, or a short structural description) so an all-pages-
+    failed document can report the first real cause instead of a bare count."""
+
+    reason: str
+
 
 _PROMPT: Final[str] = (
     "You are transcribing ONE page of handwritten lecture notes into "
@@ -76,9 +109,7 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
             error="vlm: no LLM provider configured (set ANTHROPIC_API_KEY or "
             "BRAIN_LLM_PROVIDER)",
         )
-    model = os.environ.get("BRAIN_VLM_MODEL") or _DEFAULT_VLM_MODELS.get(
-        provider, _DEFAULT_VLM_MODELS["anthropic"]
-    )
+    model = os.environ.get("BRAIN_VLM_MODEL") or _default_vlm_model(provider)
 
     try:
         pages_png = _render_pages(src)
@@ -101,6 +132,8 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
     sections: list[str] = []
     saved_assets: list[Path] = []
     failed_pages: list[int] = []
+    truncated_pages: list[int] = []
+    first_error: str | None = None   # first page's failure reason, for the log/error
 
     for i, png in enumerate(pages_png, start=1):
         # Persist the rendered page so the original handwriting/diagrams stay
@@ -110,18 +143,32 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
         saved_assets.append(asset)
         rel = f"{assets_dir.name}/{asset.name}"
 
-        text = _transcribe_page(
+        result = _transcribe_page(
             png=png, provider=provider, model=model, page_no=i
         )
-        if text is None:
-            # None == the API call FAILED (exception / structural error).
+        if not isinstance(result, _VisionText):
+            # Anything that isn't a _VisionText is a FAILURE (exception /
+            # structural error). Keep the FIRST reason so an all-pages-failed
+            # document can surface the underlying cause, not just a count.
             failed_pages.append(i)
+            if first_error is None and isinstance(result, _PageFailure):
+                first_error = result.reason
             body = "_(transcription failed for this page — see rendered image)_"
         else:
             # An empty string is a genuinely blank page (the vision helpers
             # return "" on success, None only on failure), so it is NOT a
             # failed page and must not downgrade the whole document.
-            body = text.strip() or "_(blank page)_"
+            body = result.text.strip() or "_(blank page)_"
+            if result.truncated:
+                # The model stopped at the output cap: the tail of the page
+                # is missing. Keep what we got, mark it visibly, and let the
+                # document downgrade to partial — never record a cut-off
+                # transcription as complete.
+                truncated_pages.append(i)
+                body += (
+                    "\n\n_(transcription truncated at the model output cap"
+                    " — see rendered image)_"
+                )
         sections.append(f"## Page {i}\n\n{body}\n\n![Page {i}]({rel})")
 
     markdown = "\n\n".join(sections) + "\n"
@@ -135,11 +182,16 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
         # raw file to archive/failed, so the rendered page PNGs would be
         # orphaned under archive/processed. Clean them up and return no assets.
         shutil.rmtree(assets_dir, ignore_errors=True)
+        error = f"vlm: all {len(pages_png)} page(s) failed transcription"
+        if first_error is not None:
+            # Thread the first page's underlying cause so the failure is
+            # diagnosable from index.jsonl / the log, not a bare count.
+            error += f"; first error: {first_error}"
         return ExtractionResult(
             status="manual_review",
             extractor="pdf-vlm",
             markdown="",
-            error=f"vlm: all {len(pages_png)} page(s) failed transcription",
+            error=error,
         )
     if failed_pages:
         notes.append(
@@ -149,6 +201,12 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
         status = "partial"
     else:
         status = "processed"
+    if truncated_pages:
+        notes.append(
+            f"vlm: {len(truncated_pages)} page(s) truncated at the "
+            f"{_MAX_OUTPUT_TOKENS}-token output cap: {truncated_pages}"
+        )
+        status = "partial"
 
     return ExtractionResult(
         status=status,
@@ -186,23 +244,31 @@ def _render_pages(src: Path) -> list[bytes]:
 # ---------------------------------------------------------------------------
 
 def _transcribe_page(
-    *, png: bytes, provider: str, model: str, page_no: int
-) -> str | None:
+    *, png: bytes, provider: str, model: str, page_no: int, prompt: str = _PROMPT
+) -> _VisionText | _PageFailure:
+    page: _VisionText | None
     try:
         if provider == "anthropic":
-            return _vision_anthropic(png=png, model=model)
-        if provider in ("openai", "local"):
-            return _vision_openai_compatible(png=png, model=model, provider=provider)
-        if provider == "gemini":
-            return _vision_gemini(png=png, model=model)
+            page = _vision_anthropic(png=png, model=model, prompt=prompt)
+        elif provider in ("openai", "local"):
+            page = _vision_openai_compatible(png=png, model=model, provider=provider, prompt=prompt)
+        elif provider == "gemini":
+            page = _vision_gemini(png=png, model=model, prompt=prompt)
+        else:
+            _LOG.warning("vlm: provider %r has no vision path", provider)
+            return _PageFailure(f"provider {provider!r} has no vision path")
     except Exception as exc:  # noqa: BLE001 — one page failing must not kill the doc
         _LOG.warning("vlm: %s/%s page %d failed (%r)", provider, model, page_no, exc)
-        return None
-    _LOG.warning("vlm: provider %r has no vision path", provider)
-    return None
+        return _PageFailure(repr(exc))
+    if page is None:
+        # A vision helper returned None for a structural/config failure (no
+        # choices, blocked/empty response, missing BRAIN_LOCAL_URL/key). Carry
+        # a generic reason so the all-pages-failed error isn't blank.
+        return _PageFailure(f"{provider} returned no usable result")
+    return page
 
 
-def _vision_anthropic(*, png: bytes, model: str) -> str | None:
+def _vision_anthropic(*, png: bytes, model: str, prompt: str = _PROMPT) -> _VisionText | None:
     import anthropic
     from anthropic.types import (
         Base64ImageSourceParam,
@@ -220,7 +286,7 @@ def _vision_anthropic(*, png: bytes, model: str) -> str | None:
                 type="base64", media_type="image/png", data=b64
             ),
         ),
-        TextBlockParam(type="text", text=_PROMPT),
+        TextBlockParam(type="text", text=prompt),
     ]
     messages: list[MessageParam] = [{"role": "user", "content": content}]
     resp = client.messages.create(
@@ -233,10 +299,14 @@ def _vision_anthropic(*, png: bytes, model: str) -> str | None:
     parts = [b.text for b in resp.content if isinstance(b, anthropic.types.TextBlock)]
     # Return the text (possibly "" for a genuinely blank page); None is
     # reserved for a real failure, which surfaces as an exception here.
-    return "".join(parts)
+    # stop_reason == "max_tokens" means the transcription was cut off at
+    # _MAX_OUTPUT_TOKENS — report it so the page isn't recorded as complete.
+    return _VisionText("".join(parts), truncated=resp.stop_reason == "max_tokens")
 
 
-def _vision_openai_compatible(*, png: bytes, model: str, provider: str) -> str | None:
+def _vision_openai_compatible(
+    *, png: bytes, model: str, provider: str, prompt: str = _PROMPT
+) -> _VisionText | None:
     from openai import OpenAI
 
     base_url: str | None = None
@@ -263,7 +333,7 @@ def _vision_openai_compatible(*, png: bytes, model: str, provider: str) -> str |
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{b64}"},
                     },
-                    {"type": "text", "text": _PROMPT},
+                    {"type": "text", "text": prompt},
                 ],
             }
         ],
@@ -271,10 +341,15 @@ def _vision_openai_compatible(*, png: bytes, model: str, provider: str) -> str |
     if not completion.choices:
         return None
     # "" is a blank page (success); None only on the structural failure above.
-    return completion.choices[0].message.content or ""
+    # finish_reason == "length" means the output-token cap cut the page off
+    # (reasoning models can even burn the whole cap and return no content).
+    choice = completion.choices[0]
+    return _VisionText(
+        choice.message.content or "", truncated=choice.finish_reason == "length"
+    )
 
 
-def _vision_gemini(*, png: bytes, model: str) -> str | None:
+def _vision_gemini(*, png: bytes, model: str, prompt: str = _PROMPT) -> _VisionText | None:
     from google import genai
     from google.genai import types
 
@@ -285,11 +360,21 @@ def _vision_gemini(*, png: bytes, model: str) -> str | None:
     client = genai.Client(api_key=api_key)
     contents: list[types.PartUnionDict] = [
         types.Part.from_bytes(data=png, mime_type="image/png"),
-        _PROMPT,
+        prompt,
     ]
     resp = client.models.generate_content(
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(max_output_tokens=_MAX_OUTPUT_TOKENS),
     )
-    return getattr(resp, "text", None) or None
+    # "" is a blank page (success); None only on failure — resp.text is None
+    # when there are no candidates/text parts (blocked or structural failure),
+    # and that must stay a failure, but an empty string must survive.
+    text = getattr(resp, "text", None)
+    if not isinstance(text, str):
+        return None
+    truncated = False
+    candidates = getattr(resp, "candidates", None)
+    if candidates:
+        truncated = candidates[0].finish_reason == types.FinishReason.MAX_TOKENS
+    return _VisionText(text, truncated=truncated)

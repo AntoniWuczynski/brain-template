@@ -63,6 +63,12 @@ dependencies = [
 [tool.uv]
 managed = true
 
+[tool.pytest.ini_options]
+# Collect only from tests/. Without this, pytest walks the whole vault tree
+# (inbox/, archive/, the 22k tracked source files) — importing and executing
+# any test-shaped file that lands there, and paying a full-tree scan every run.
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

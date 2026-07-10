@@ -90,10 +90,12 @@ the absolute local path when there is no remote. No annotations or prose —
    - `vault_read` it. **Not found** → `vault_create_note`. **Found**
      (same-day rerun) → `vault_append_to_note` a new `## <HH:MM>Z` subsection.
 6. **Report** the `commit_sha` from each `WriteResult`. If `committed` is
-   false, surface the `warning` — don't claim success. Remind the user that
-   concept links + semantic search pick the notes up after a reindex in the
-   brain repo: `uv run python scripts/ingest.py --rebuild-search-index`
-   then `uv run python scripts/ingest.py --rebuild-concepts`.
+   false, surface the `warning` — don't claim success. No manual reindex:
+   the MCP server re-embeds every write in the background (debounced a
+   couple of seconds), so the notes are searchable within seconds; a write
+   that changes `topics`/`relations` also rebuilds concept links and
+   dashboards automatically. The `index_refresh` field on each
+   `WriteResult` (`queued`/`off`/`skipped`) reports where that stands.
 
 ## Write-tool decision
 

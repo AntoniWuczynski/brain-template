@@ -273,7 +273,19 @@ def _append_caption(paths: VaultPaths, image_hash: str, caption: str, model: str
                 pass
             raise
     else:
+        # Self-heal a torn tail: if the last write didn't end in '\n', the new
+        # JSON line would concatenate onto it and corrupt two entries. Probe
+        # the last byte in BINARY — captions are written ensure_ascii=False, so
+        # a tail cut mid-UTF-8 would crash a text-mode read before any write.
+        with path.open("rb") as probe:
+            probe.seek(0, os.SEEK_END)
+            needs_nl = probe.tell() > 0
+            if needs_nl:
+                probe.seek(-1, os.SEEK_END)
+                needs_nl = probe.read(1) != b"\n"
         with path.open("a", encoding="utf-8") as fh:
+            if needs_nl:
+                fh.write("\n")
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())

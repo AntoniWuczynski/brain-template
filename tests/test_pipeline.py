@@ -2,9 +2,10 @@
 
 Covers the repo's headline invariants — none of which had a test before:
 SHA-256 idempotency skip, re-process on content change, archive-immutability
-hash-clash -> manual_review, failed-file numeric-suffix naming with a
-matching metadata record, the backfill Processing-notes de-duplication, and
-metadata unknown-key tolerance.
+hash-clash -> manual_review, failed-file de-duplication (identical bytes
+reused, different bytes suffixed), a manual_review-only run still refreshing
+the status dashboards, the backfill Processing-notes de-duplication, and
+metadata unknown-key + torn-tail tolerance.
 
 Summarization is disabled (BRAIN_SKIP_SUMMARY) so nothing hits an LLM.
 """
@@ -23,6 +24,7 @@ from ingest_lib.metadata import (  # type: ignore[import-not-found]
     latest_records_by_path,
 )
 from ingest_lib.pipeline import (  # type: ignore[import-not-found]
+    _move_to_failed,
     _strip_frontmatter_header,
     plan_ingest,
     run_ingest,
@@ -197,3 +199,108 @@ def test_append_record_self_heals_a_torn_tail(tmp_path: Path):
     # The new record lands on its own line — recoverable, not merged into the stub.
     recs = list(iter_records(paths.metadata_index_jsonl))
     assert [r.relative_path for r in recs] == ["notes/a.txt"]
+
+
+@pytest.mark.parametrize("tail", [
+    '{"s": "Wuczyń'.encode(),          # torn on the final byte of 'ń'
+    '{"s": "Wuczyń'.encode()[:-1],     # torn mid multibyte sequence
+])
+def test_append_record_self_heals_a_multibyte_torn_tail(tmp_path: Path, tail: bytes):
+    # The torn-tail probe must not decode the last byte as text: a tail ending
+    # mid-UTF-8 raised UnicodeDecodeError before any write, crashing every retry.
+    paths = _vault(tmp_path)
+    paths.metadata_index_jsonl.write_bytes(tail)
+    rec = IndexRecord(
+        relative_path="notes/a.txt", source_hash="h", size_bytes=1,
+        extension=".txt", extractor="text", status="processed",
+        raw_path="x", processed_path=None, index_note_path=None,
+    )
+    append_record(paths.metadata_index_jsonl, rec)
+    recs = list(iter_records(paths.metadata_index_jsonl))
+    assert [r.relative_path for r in recs] == ["notes/a.txt"]
+
+
+# --------------------------------------------- failed-file de-duplication (F2)
+
+def test_failed_move_dedupes_identical_bytes(tmp_path: Path):
+    # A file that keeps failing on every re-run must not stack byte-identical
+    # copies (x.docx, x.docx.1, x.docx.2, ...) in archive/failed/.
+    paths = _vault(tmp_path)
+    rel = "bad.docx"
+    (paths.archive_raw).mkdir(parents=True, exist_ok=True)
+
+    def _raw_with(content: bytes) -> Path:
+        p = paths.archive_raw / rel
+        p.write_bytes(content)
+        return p
+
+    first = _move_to_failed(_raw_with(b"corrupt"), paths)
+    assert first is not None and first.name == "bad.docx"
+    # Same bytes fail again: reuse the existing copy, don't mint '.1'.
+    second = _move_to_failed(_raw_with(b"corrupt"), paths)
+    assert second == first
+    assert sorted(p.name for p in paths.archive_failed.glob("bad.docx*")) == ["bad.docx"]
+    # Different bytes DO get a distinct suffix (no data loss).
+    third = _move_to_failed(_raw_with(b"a different corruption"), paths)
+    assert third is not None and third.name == "bad.docx.1"
+
+
+def test_manual_review_only_run_refreshes_status_dashboard(tmp_path: Path):
+    # A run that only produces failures must still write the Manual Review
+    # dashboard — that's the run whose whole point is surfacing the failure.
+    paths = _vault(tmp_path)
+    p = paths.inbox / "bad.docx"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"not a real docx zip")  # docx extractor -> manual_review
+
+    stats = _ingest(paths)
+    assert stats.manual_review == 1
+    assert stats.processed == 0 and stats.partial == 0
+
+    review = paths.knowledge_index / "Manual Review.md"
+    assert review.exists()
+    assert "bad.docx" in review.read_text(encoding="utf-8")
+
+
+def test_failed_reextraction_preserves_previous_assets(tmp_path: Path, monkeypatch):
+    # F5: a re-extraction that FAILS must not destroy the previous good
+    # extraction's assets (archive/processed is regenerable, but only from a
+    # SUCCESSFUL run — a failed one leaves nothing to regenerate from).
+    from ingest_lib import pipeline as pl
+    from ingest_lib.extractors import ExtractionResult
+
+    paths = _vault(tmp_path)
+    rel = "notes/doc.pdf"
+    raw = paths.archive_raw / rel
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"version one")
+
+    calls = {"n": 0}
+
+    def fake_dispatch(_src, relative_path=None):
+        def extract(src: Path, assets_dir: Path) -> ExtractionResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                assets_dir.mkdir(parents=True, exist_ok=True)
+                (assets_dir / "fig1.png").write_bytes(b"figure-bytes")
+                return ExtractionResult(status="processed", extractor="stub",
+                                        markdown="body one\n",
+                                        assets=[assets_dir / "fig1.png"])
+            raise RuntimeError("extractor blew up on re-run")
+        return extract
+
+    monkeypatch.setattr(pl, "dispatch_extractor", fake_dispatch)
+
+    plan1 = pl.plan_ingest(paths, sources=[paths.archive_raw], from_archive=True, logger=_LOG)
+    assert pl.run_ingest(paths, plan1, dry_run=False, logger=_LOG).processed == 1
+    asset = paths.root / "archive/processed/notes/doc.pdf_assets/fig1.png"
+    assert asset.is_file()
+
+    # Change the raw bytes so it re-extracts; the extractor now fails.
+    raw.write_bytes(b"version two - different")
+    plan2 = pl.plan_ingest(paths, sources=[paths.archive_raw], from_archive=True, logger=_LOG)
+    pl.run_ingest(paths, plan2, dry_run=False, logger=_LOG)
+
+    # The previous good asset must still exist (failed run preserved it).
+    assert asset.is_file()
+    assert asset.read_bytes() == b"figure-bytes"

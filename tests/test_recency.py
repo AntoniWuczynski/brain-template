@@ -52,6 +52,17 @@ def test_future_dates_weigh_one() -> None:
     assert recency_weight(_iso(NOW), halflife_days=30.0, now=NOW) == 1.0
 
 
+def test_memory_search_rejects_nonpositive_halflife(tmp_path: Path) -> None:
+    # memory_search is public library API; halflife_days<=0 otherwise reaches
+    # recency_weight and raises ZeroDivisionError / OverflowError deep inside.
+    # Validate it at the boundary like the `types` parameter already is.
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    for bad in (0, -30):
+        with pytest.raises(ValueError, match="halflife_days"):
+            memory_search(paths, "q", halflife_days=bad, now=NOW, logger=_LOG)
+
+
 # ---------------------------------------------------------------------------
 # memory_search
 # ---------------------------------------------------------------------------

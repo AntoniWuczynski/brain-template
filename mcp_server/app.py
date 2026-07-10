@@ -134,6 +134,21 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         return await _offload(_tools.tool_read, cfg, runtime, path)
 
     @mcp.tool()
+    async def vault_chunk_context(
+        source_relative_path: str, chunk_idx: int, before: int = 1, after: int = 1,
+    ) -> dict:
+        """Expand one ``vault_search`` hit into its neighbouring chunks —
+        cheaper and more focused than ``vault_read`` on the whole file. Pass a
+        hit's ``source_relative_path`` and ``chunk_idx``; returns that chunk
+        plus ``before``/``after`` neighbours and the source's total chunk
+        count. Gated by the same read policy as search."""
+        return await _offload(
+            _tools.tool_chunk_context, cfg, runtime,
+            source_relative_path=source_relative_path, chunk_idx=chunk_idx,
+            before=before, after=after,
+        )
+
+    @mcp.tool()
     async def vault_list(path: str = "") -> dict:
         """List entries under a vault directory. Empty path lists the root.
         Hidden files (those starting with .) are omitted."""

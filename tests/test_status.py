@@ -99,3 +99,50 @@ def test_user_tail_preserved(tmp_path: Path):
     append_record(paths.metadata_index_jsonl, _rec("b.txt", "processed", extractor="text", ext=".txt", src_hash="h2"))
     rebuild_status(paths, logger=_LOG)
     assert "MY IMPORTANT NOTE" in target.read_text(encoding="utf-8")
+
+
+def _rec_dated(rel: str, status: str, *, src_hash: str, created: str) -> IndexRecord:
+    r = _rec(rel, status, extractor="text", ext=".md", src_hash=src_hash)
+    return IndexRecord(**{**r.__dict__, "created_at": created})
+
+
+def test_now_dashboard_recent_and_attention(tmp_path: Path):
+    paths = _vault(tmp_path)
+    append_record(paths.metadata_index_jsonl,
+                  _rec_dated("notes/old.md", "processed", src_hash="h1",
+                             created="2026-06-01T00:00:00Z"))
+    append_record(paths.metadata_index_jsonl,
+                  _rec_dated("notes/new.md", "processed", src_hash="h2",
+                             created="2026-07-09T00:00:00Z"))
+    append_record(paths.metadata_index_jsonl,
+                  _rec_dated("notes/bad.md", "manual_review", src_hash="h3",
+                             created="2026-07-08T00:00:00Z"))
+    # An unconsolidated assistant fact.
+    fact = paths.knowledge / "assistant" / "inbox" / "fact-1.md"
+    fact.parent.mkdir(parents=True, exist_ok=True)
+    fact.write_text("---\nmemory_status: unconsolidated\n---\n\nAnna likes uv.\n", encoding="utf-8")
+
+    st = rebuild_status(paths, logger=_LOG)
+    assert st.now_written
+    now = (paths.knowledge_index / "Now.md").read_text(encoding="utf-8")
+
+    # Newest source appears above the older one in "Recently added".
+    assert now.index("notes/new.md") < now.index("notes/old.md")
+    # Attention counts surface review backlog + unconsolidated facts.
+    assert "| Sources needing review | 1 |" in now
+    assert "| Assistant facts unconsolidated | 1 |" in now
+    # At-a-glance groups by top-level area.
+    assert "| notes | 3 |" in now
+
+
+def test_now_dashboard_skip_unchanged(tmp_path: Path):
+    paths = _vault(tmp_path)
+    append_record(paths.metadata_index_jsonl,
+                  _rec_dated("notes/a.md", "processed", src_hash="h1",
+                             created="2026-07-01T00:00:00Z"))
+    first = rebuild_status(paths, logger=_LOG)
+    assert first.now_written
+    before = (paths.knowledge_index / "Now.md").read_bytes()
+    second = rebuild_status(paths, logger=_LOG)
+    assert not second.now_written  # no index change -> byte-for-byte no-op
+    assert (paths.knowledge_index / "Now.md").read_bytes() == before

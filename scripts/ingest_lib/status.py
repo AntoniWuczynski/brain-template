@@ -12,6 +12,9 @@ managed-zone / skip-unchanged style as the entity dashboards:
 - ``Manual Review.md`` — one row per ``partial`` / ``manual_review`` record
   (and any file physically sitting in ``archive/failed/``) with the recorded
   extractor error verbatim and the exact retry command.
+- ``Now.md`` — a landing view: recently added sources (newest first), an
+  at-a-glance area breakdown, and a "needs attention" panel (review backlog,
+  inbox pending, unconsolidated assistant facts) linking to the other two.
 
 Everything is derived from ``index.jsonl`` + the filesystem — no log
 parsing, no timestamps in the body — so a rebuild over unchanged state is a
@@ -41,12 +44,16 @@ _AUTO_END = "<!-- AUTO-GENERATED-END -->"
 
 _DASHBOARD_NAME = "Processing Dashboard.md"
 _REVIEW_NAME = "Manual Review.md"
+_NOW_NAME = "Now.md"
+
+_NOW_RECENT_LIMIT = 15
 
 
 @dataclass(frozen=True)
 class StatusStats:
     dashboard_written: bool = False
     review_written: bool = False
+    now_written: bool = False
     inbox_pending: int = 0
     inbox_ingested: int = 0
     needs_review: int = 0
@@ -187,6 +194,75 @@ def _review_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, in
     return "\n".join(lines), len(flagged)
 
 
+def _unconsolidated_fact_count(paths: VaultPaths) -> int:
+    """How many assistant facts are waiting to be consolidated — the ``.md``
+    notes sitting in ``knowledge/assistant/inbox/``."""
+    inbox = paths.knowledge / "assistant" / "inbox"
+    if not inbox.is_dir():
+        return 0
+    return sum(1 for f in inbox.glob("*.md") if f.is_file())
+
+
+def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]:
+    """A landing view: what's recent and what needs attention. Derived from
+    ``index.jsonl`` + the filesystem (``created_at`` is a stable record field),
+    so a rebuild over unchanged state is a byte-for-byte no-op."""
+    # Recently added sources: newest created_at first, path as the tie-break
+    # so equal timestamps order deterministically.
+    recent = sorted(records, key=lambda r: (r.created_at, r.relative_path), reverse=True)
+    recent = recent[:_NOW_RECENT_LIMIT]
+
+    needs_review = sum(1 for r in records if r.status in ("partial", "manual_review"))
+    unconsolidated = _unconsolidated_fact_count(paths)
+
+    # Inbox pending (files not yet matching an ingested hash).
+    known_hashes = {r.source_hash for r in records}
+    pending = 0
+    if paths.inbox.is_dir():
+        for f in paths.inbox.rglob("*"):
+            if not f.is_file() or f.name == ".DS_Store" or f.name.startswith("._"):
+                continue
+            try:
+                if sha256_of(f) not in known_hashes:
+                    pending += 1
+            except OSError:
+                pending += 1
+
+    lines: list[str] = ["## Needs attention", ""]
+    lines += _table(
+        ("item", "count", "where"),
+        [
+            ("Sources needing review", str(needs_review), "[[Manual Review]]"),
+            ("Inbox files pending ingestion", str(pending), "[[Processing Dashboard]]"),
+            ("Assistant facts unconsolidated", str(unconsolidated),
+             "`knowledge/assistant/inbox/`"),
+        ],
+    )
+
+    lines += ["", f"## Recently added sources ({len(recent)})", ""]
+    if recent:
+        rows: list[tuple[str, ...]] = [
+            (r.created_at[:10] or "—", r.relative_path, str(r.status))
+            for r in recent
+        ]
+        lines += _table(("added", "source", "status"), rows)
+    else:
+        lines += ["_(no sources ingested yet — drop files in `inbox/` and run ingest.)_"]
+
+    # At a glance: total + by top-level folder.
+    by_top: Counter = Counter()
+    for r in records:
+        top = Path(r.relative_path).parts[0] if Path(r.relative_path).parts else "."
+        by_top[top] += 1
+    lines += ["", f"## At a glance ({len(records)} sources)", ""]
+    lines += _table(
+        ("area", "sources"),
+        [(k, str(v)) for k, v in sorted(by_top.items())],
+    )
+
+    return "\n".join(lines), {"needs_review": needs_review, "inbox_pending": pending}
+
+
 def _retry_command(r: IndexRecord) -> str:
     if r.status == "partial":
         # The raw file is still in archive/raw; re-ingest re-extracts it
@@ -261,9 +337,11 @@ def rebuild_status(paths: VaultPaths, *, logger: logging.Logger) -> StatusStats:
 
     dash_body, counts = _dashboard_body(paths, records)
     review_body, needs = _review_body(paths, records)
+    now_body, _now_counts = _now_body(paths, records)
 
     dash_target = paths.knowledge_index / _DASHBOARD_NAME
     review_target = paths.knowledge_index / _REVIEW_NAME
+    now_target = paths.knowledge_index / _NOW_NAME
 
     written_paths: list[str] = []
     dash_written = _write_managed(dash_target, title="Processing Dashboard", auto_body=dash_body)
@@ -272,16 +350,21 @@ def rebuild_status(paths: VaultPaths, *, logger: logging.Logger) -> StatusStats:
     review_written = _write_managed(review_target, title="Manual Review", auto_body=review_body)
     if review_written:
         written_paths.append(review_target.relative_to(paths.root).as_posix())
+    now_written = _write_managed(now_target, title="Now", auto_body=now_body)
+    if now_written:
+        written_paths.append(now_target.relative_to(paths.root).as_posix())
 
     logger.info(
-        "status: dashboard %s, review %s (%d inbox pending, %d need review)",
+        "status: dashboard %s, review %s, now %s (%d inbox pending, %d need review)",
         "written" if dash_written else "unchanged",
         "written" if review_written else "unchanged",
+        "written" if now_written else "unchanged",
         counts["inbox_pending"], needs,
     )
     return StatusStats(
         dashboard_written=dash_written,
         review_written=review_written,
+        now_written=now_written,
         inbox_pending=counts["inbox_pending"],
         inbox_ingested=counts["inbox_ingested"],
         needs_review=needs,

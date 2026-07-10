@@ -52,12 +52,13 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-UMask=0077
-
 # Network — only outbound to GitHub for push and Cloudflare for tunnel.
 # (No fine-grained outbound restriction here; rely on the user's firewall
 # if they want it.)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+# User-namespace isolation: the service's root maps to an unprivileged host UID.
 PrivateUsers=true
 
 [Install]

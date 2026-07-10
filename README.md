@@ -74,7 +74,7 @@ uv sync
 That's enough to ingest text-only files (Markdown, code, notebooks, CSVs). For full PDF extraction with figures and tables:
 
 ```bash
-uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" "transformers==4.53.3" six
+uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six
 ```
 
 Keep the `==2.7.6` pin: the unpinned latest (mineru 3.4.0) requires `transformers>=4.57.3` but imports a symbol removed in 4.57, so every PDF silently falls back to `pypdf`. `uv sync` will prune MinerU on every subsequent run because it isn't in the lockfile (its transitive deps include pre-releases that break `uv`'s resolver). Re-run the pinned line above after each sync, or wrap both in a `scripts/setup.sh` of your own.
@@ -128,11 +128,13 @@ Open the repo root as an Obsidian vault. `knowledge/index/Home.md` is your entry
 | `--inbox` | Process every supported file under `inbox/` |
 | `--raw` | Re-process files already in `archive/raw/` (no copy step) |
 | `--path <file>` | Process a single file |
+| `--retry-partial` | Re-extract every `partial` record, e.g. after installing MinerU (`archive/processed/` is regenerable) |
 | `--dry-run --inbox` | Show the plan, don't write anything |
 | `--backfill-summaries` | Add Summary + Key points + Topics to existing records that lack them |
 | `--rebuild-concepts` | Regenerate concept notes from current metadata (free, no LLM) |
 | `--rebuild-connections` | Rebuild the concept relationship graph in `metadata/connections.jsonl` (free, no LLM) |
 | `--rebuild-dashboards` | Regenerate entity dashboards under `knowledge/index/entities/` (free, no LLM) |
+| `--rebuild-status` | Regenerate the Processing Dashboard + Manual Review notes under `knowledge/index/` (free, no LLM; also runs after each ingest) |
 | `--describe-concepts --limit N` | Write AI-generated, source-grounded descriptions into concept notes (LLM; cached by source hash) |
 | `--caption-figures --limit N` | Caption extracted figures/tables with a vision LLM (cached in `metadata/captions.jsonl`) |
 | `--rebuild-search-index` | Re-encode every chunk and overwrite the search index |

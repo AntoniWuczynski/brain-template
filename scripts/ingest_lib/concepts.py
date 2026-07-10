@@ -146,6 +146,7 @@ def rebuild_concepts(
                 display_name=display,
                 records=records,
                 paths=paths,
+                logger=logger,
                 related_list=(related or {}).get(slug, []),
             )
         except OSError as exc:
@@ -251,6 +252,7 @@ def _write_concept_note(
     display_name: str,
     records: list[IndexRecord],
     paths: VaultPaths,
+    logger: logging.Logger,
     related_list: list[Related] | None = None,
 ) -> bool:
     """Render and write one concept note. Returns ``True`` if the file was
@@ -263,14 +265,16 @@ def _write_concept_note(
     existing = ""
     if target.exists():
         existing = target.read_text(encoding="utf-8", errors="replace")
-        end_pos = existing.find(_AUTO_END)
-        if end_pos >= 0:
-            user_tail = existing[end_pos + len(_AUTO_END) :].lstrip("\n")
-        # If the file exists without our markers, treat the entire body as
-        # user content (i.e. the user pre-created this concept note by
-        # hand). We then prepend the generated block above their content.
-        elif _AUTO_START not in existing:
-            user_tail = _existing_body_after_frontmatter(existing)
+        resolved = _resolve_user_tail(existing)
+        if resolved is None:
+            logger.warning(
+                "concept note %s has an AUTO-GENERATED-START marker but no "
+                "AUTO-GENERATED-END — skipping to avoid clobbering hand-written "
+                "content; restore the marker to resume regeneration.",
+                target,
+            )
+            return False
+        user_tail = resolved
 
     if not user_tail.strip():
         user_tail = (
@@ -374,6 +378,28 @@ def _short_snippet(rec: IndexRecord) -> str:
             s = s[:137] + "…"
         return f" — _{s}_"
     return ""
+
+
+def _resolve_user_tail(existing: str) -> str | None:
+    """Extract the hand-written tail an auto-generated note must preserve.
+
+    Returns the tail text (possibly ``""``) to keep on the next render, or
+    ``None`` to REFUSE the rewrite entirely. Refusal is the ambiguous case:
+    the ``AUTO-GENERATED-START`` marker is present but ``AUTO-GENERATED-END``
+    is gone (the user deleted or mangled it), so the boundary between the
+    generated block and hand-written content can't be found — rewriting would
+    silently destroy everything the user wrote below where the marker was, and
+    the MCP reindex would auto-commit that loss. Mirrors the removal pass,
+    which likewise refuses to touch a note with ambiguous markers.
+    """
+    end_pos = existing.find(_AUTO_END)
+    if end_pos >= 0:
+        return existing[end_pos + len(_AUTO_END) :].lstrip("\n")
+    if _AUTO_START not in existing:
+        # No markers at all: a note the user pre-created by hand. Its whole
+        # body is user content; the generated block gets prepended above it.
+        return _existing_body_after_frontmatter(existing)
+    return None  # START present, END gone: refuse to avoid clobbering.
 
 
 def _existing_body_after_frontmatter(text: str) -> str:
