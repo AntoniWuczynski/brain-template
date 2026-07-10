@@ -20,10 +20,12 @@ uv run python scripts/ingest.py --dry-run --inbox         # see the plan
 uv run python scripts/ingest.py --inbox                   # do it
 uv run python scripts/ingest.py --raw                     # re-process archive
 uv run python scripts/ingest.py --path inbox/foo.pdf      # single file
+uv run python scripts/ingest.py --retry-partial           # re-extract partial notes, e.g. after installing MinerU
 uv run python scripts/ingest.py --backfill-summaries      # fill missing summaries (LLM)
 uv run python scripts/ingest.py --rebuild-concepts        # refresh concept index (free)
 uv run python scripts/ingest.py --rebuild-connections     # rebuild concept graph (free)
 uv run python scripts/ingest.py --rebuild-dashboards      # refresh entity dashboards (free)
+uv run python scripts/ingest.py --rebuild-status          # refresh status dashboards (free; auto after each ingest)
 uv run python scripts/ingest.py --describe-concepts --limit 20  # AI concept descriptions (LLM)
 uv run python scripts/ingest.py --caption-figures --limit 20    # caption figures (vision LLM)
 uv run python scripts/ingest.py --rebuild-search-index    # rebuild semantic index (free)
@@ -50,9 +52,22 @@ weights). BM25 runs over the chunk text already in
 ``metadata/embeddings_meta.jsonl`` (``ingest_lib/lexical.py``, an mtime-cached
 in-memory inverted index) — no new files on disk. Measure changes with
 ``scripts/eval_retrieval.py`` (recall@k / MRR over
-``scripts/eval/retrieval_golden.jsonl``).
+``scripts/eval/retrieval_golden.jsonl``). Two extra modes: ``--compare-modes``
+scores dense / lexical / hybrid side by side over the golden set, and
+``--mine-log`` harvests the real query distribution from
+``logs/mcp-access.jsonl`` into ``scripts/eval/mined_candidates.jsonl`` (with a
+zero-hit report of queries that never returned a result). Mined candidates
+carry ``expected: []`` — a human confirms relevance before promoting a line
+into the golden set; the file is gitignored (it holds real query strings) and
+never synced to the template.
 
 - First run downloads ~100 MB of model weights to ``~/.cache/huggingface/``.
+- **Query instruction.** ``bge-small-en-v1.5`` is trained to prepend
+  ``"Represent this sentence for searching relevant passages: "`` to the
+  *query* (passages stay raw), which is how the index is built — so it is
+  applied at query time only, needs **no** reindex, and is keyed to the model
+  name (a model swap won't apply the wrong prefix). A/B it with the eval
+  harness by setting ``BRAIN_QUERY_INSTRUCTION=0`` to disable.
 - **Only ``status: processed`` records are indexed.** ``partial`` notes —
   every PDF extracted by the pypdf fallback when MinerU isn't installed —
   are deliberately **not** searchable, so on a MinerU-less machine
@@ -243,16 +258,20 @@ orphans (raw files vs `index.jsonl` records, both directions), dangling
 wikilinks, relation problems (malformed entries, missing targets, bad
 dates, inverted/overlapping intervals), near-duplicate concept slugs,
 search-index drift (stale/missing/unindexed rows), and stale
-unconsolidated assistant memory. Read-only unless `--write-report` is
-given; always exits 0 (the per-category counts are the signal, and a
-linter that fails the shell breaks cron pipelines). Checks live in
-`ingest_lib/sweep.py`.
+unconsolidated assistant memory. With `--check-integrity` it also re-hashes
+every `archive/raw` file against its recorded `source_hash`
+(`archive-corrupt`) to catch bit-rot or an accidental edit of the immutable
+archive — off by default because it reads the whole archive (GBs). Read-only
+unless `--write-report` is given; always exits 0 (the per-category counts are
+the signal, and a linter that fails the shell breaks cron pipelines). Checks
+live in `ingest_lib/sweep.py`.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--as-of YYYY-MM-DD` | today (UTC) | Anchor date for the staleness check and the report's `updated:` stamp — pin it for a fully reproducible sweep |
 | `--stale-days N` | 30 | Flag `knowledge/assistant/` notes left `memory_status: unconsolidated` longer than N days |
 | `--write-report` | off | Also write findings to `knowledge/index/sweep-report.md` (atomic write) |
+| `--check-integrity` | off | Also re-hash every `archive/raw` file vs its recorded `source_hash` (`archive-corrupt`). Reads the whole archive, so opt-in |
 
 ## Memory consolidation
 
@@ -287,6 +306,37 @@ concurrent MCP write could race the same note or the git index.
 | `--min-confirmations N` | 3 | Promote unapproved facts at this confirmation count |
 | `--dry-run` | off | Plan but write nothing (still creates a log file) |
 | `--no-reindex` | off | Skip the post-run enrichment refresh (semantic upsert + connection graph + concept notes) |
+
+## Connectors (pull external sources)
+
+`scripts/pull.py` pulls an external source into the vault as archivable
+snapshots. A **connector** is the one non-deterministic edge of the system:
+it fetches new/changed items and writes each as a snapshot under
+`inbox/<source_class>/`; the normal ingest pipeline then copies them to the
+immutable `archive/raw/` and extracts them. The fetch is the only networked
+step and happens *before* the archive boundary, so idempotency and honesty
+hold downstream exactly as for a hand-dropped file.
+
+```bash
+uv run python scripts/pull.py --list                 # registered connectors
+uv run python scripts/pull.py <name> --dry-run        # report, write nothing
+uv run python scripts/pull.py <name> --then-ingest    # pull, then ingest inbox/
+```
+
+The SDK lives in `ingest_lib/connectors/`: a connector is a `name` plus a
+`pull(state) -> Iterator[Snapshot]`, over a shared runner that skips
+unchanged items (per-connector state in `metadata/connectors/<name>.json`,
+keyed by native id + payload hash) and writes each snapshot atomically. A
+connector carries **no** extraction logic — that lives in a matching
+extractor registered by source-class prefix in
+`extractors._SOURCE_CLASS_REGISTRY` (consulted before the file-extension
+map, so a `.json` snapshot under `meetings/granola/` routes to the right
+extractor instead of the generic text one). Exits 0, so it is cron/launchd-
+safe like `sweep`/`consolidate`. Secrets come from `.env` — never a flag.
+
+No concrete connectors ship yet (the contract landed first); adding one is a
+`pull()` + an extractor + an `.env` stanza. See `IDEAS.md` §4 (meeting
+connector) for the first planned plugin.
 
 ## Source-grounded concept descriptions
 
@@ -393,6 +443,14 @@ rendered page image is kept as an asset so the original stays viewable.
 - Cost is ~one vision call per page (~cents). Set the env var only for
   handwritten modules — leave it unset so printed material keeps using
   MinerU.
+
+**Standalone images** (`.jpg` `.png` `.webp` `.gif` `.bmp` `.tiff`, and
+`.heic`/`.heif` with the optional `pillow-heif` package) are ingested
+automatically by `extractors/image.py` — no env var needed. Each photo,
+whiteboard, screenshot or scan is transcribed/described by the same vision
+model (reusing the handwriting extractor's dispatch and honest
+`[illegible]`/never-invent rules); with no vision backend configured the
+image is marked `manual_review`, never captioned from nothing.
 
 MinerU is deliberately *not* in `pyproject.toml`'s lockfile because
 some of its transitive deps are pre-releases. The ingestion script

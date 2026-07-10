@@ -46,8 +46,8 @@ from pathlib import Path
 from .concepts import (  # private helpers, but module-internal
     _AUTO_END,
     _AUTO_START,
-    _existing_body_after_frontmatter,
     _existing_frontmatter,
+    _resolve_user_tail,
 )
 from .config import VaultPaths
 from .notes import _atomic_write, _split_frontmatter, fm_list, fm_scalar
@@ -105,7 +105,7 @@ def rebuild_dashboards(
         header, rows = _rows_for_group(sub, infos, paths)
         try:
             wrote = _write_dashboard(
-                target=target, title=title, header=header, rows=rows
+                target=target, title=title, header=header, rows=rows, logger=logger
             )
         except OSError as exc:
             logger.warning("dashboard '%s': failed to write (%s)", sub, exc)
@@ -241,6 +241,7 @@ def _write_dashboard(
     title: str,
     header: tuple[str, ...],
     rows: list[str],
+    logger: logging.Logger,
 ) -> bool:
     """Render and write one dashboard. Returns ``True`` if the file was
     written, ``False`` if skipped because nothing but the ``updated:``
@@ -252,13 +253,16 @@ def _write_dashboard(
     existing = ""
     if target.exists():
         existing = target.read_text(encoding="utf-8", errors="replace")
-        end_pos = existing.find(_AUTO_END)
-        if end_pos >= 0:
-            user_tail = existing[end_pos + len(_AUTO_END) :].lstrip("\n")
-        # A file without our markers was pre-created by hand: treat its
-        # whole body as user content and prepend the generated block.
-        elif _AUTO_START not in existing:
-            user_tail = _existing_body_after_frontmatter(existing)
+        resolved = _resolve_user_tail(existing)
+        if resolved is None:
+            logger.warning(
+                "dashboard %s has an AUTO-GENERATED-START marker but no "
+                "AUTO-GENERATED-END — skipping to avoid clobbering hand-written "
+                "content; restore the marker to resume regeneration.",
+                target,
+            )
+            return False
+        user_tail = resolved
 
     if not user_tail.strip():
         user_tail = (

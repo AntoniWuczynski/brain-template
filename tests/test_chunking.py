@@ -91,6 +91,44 @@ def test_trailing_whitespace_fence_still_stripped_without_eating_body() -> None:
     assert "topics" not in joined
 
 
+def test_knowledge_note_body_before_quote_and_rule_is_not_eaten() -> None:
+    # The header strip must anchor on the generated '> Source:' block, not
+    # any '# heading ... > quote ... ---' shape. A curated note whose body
+    # precedes a blockquote and a '---' separator kept all its body invisible
+    # to search under the old DOTALL regex.
+    note = (
+        "# Kern call\n\n"
+        "We discussed the retrieval eval harness and agreed to expand the "
+        "golden query set before shipping the ranking change.\n\n"
+        "> A memorable aside worth keeping in the record.\n\n"
+        "---\n\n"
+        "Action items captured after the call, also long enough to index.\n"
+    )
+    joined = "\n".join(chunk_markdown(note))
+    assert "retrieval eval harness" in joined
+    assert "memorable aside" in joined
+    assert "Action items" in joined
+
+
+def test_generated_processed_header_still_stripped() -> None:
+    # The real write_processed_note header (title + '> Source/Hash/Extractor/
+    # Status' block + '---') must still be stripped, not embedded.
+    processed = (
+        "# Lecture 3\n\n"
+        "> Source: `university/COMP0005/lec3.pdf`  \n"
+        "> Hash: `abc123`  \n"
+        "> Extractor: `mineru`  \n"
+        "> Status: `processed`\n\n"
+        "---\n\n"
+        "The genuine lecture body about amortised analysis, long enough to "
+        "clear the minimum chunk size threshold comfortably.\n"
+    )
+    joined = "\n".join(chunk_markdown(processed))
+    assert "amortised analysis" in joined
+    assert "Source:" not in joined
+    assert "Extractor:" not in joined
+
+
 def test_leading_horizontal_rule_without_frontmatter_keeps_body() -> None:
     text = (
         "---\n"
@@ -110,7 +148,7 @@ def test_search_modes(tmp_path, monkeypatch):
     import json
     import numpy as np
     from ingest_lib.config import paths_for_root
-    from ingest_lib import semantic, lexical
+    from ingest_lib import semantic
 
     paths = paths_for_root(tmp_path / "vault")
     paths.ensure()
@@ -126,7 +164,6 @@ def test_search_modes(tmp_path, monkeypatch):
     with (paths.metadata / "embeddings_meta.jsonl").open("w") as fh:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
-    lexical._CACHE = None  # avoid cross-test cache
 
     class _FakeModel:
         def encode(self, texts, **kw):
@@ -150,7 +187,7 @@ def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
     import json
     import numpy as np
     from ingest_lib.config import paths_for_root
-    from ingest_lib import semantic, lexical
+    from ingest_lib import semantic
 
     paths = paths_for_root(tmp_path / "vault")
     paths.ensure()
@@ -159,7 +196,6 @@ def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
         json.dumps({"source_relative_path": "x.pdf", "text": "unique-token here",
                     "chunk_idx": 0, "title": "x", "origin": "", "source_hash": "h"}) + "\n",
         encoding="utf-8")
-    lexical._CACHE = None
 
     # If lexical mode touched the embedder this would raise.
     def _boom():
@@ -168,3 +204,68 @@ def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
 
     hits = semantic.search(paths, "unique-token", top_k=1, mode="lexical")
     assert [h.source_relative_path for h in hits] == ["x.pdf"]
+
+
+def test_search_honors_top_k_above_default_candidate_cap(tmp_path, monkeypatch):
+    # A top_k larger than the 100-candidate pool must widen the pool, not be
+    # silently truncated — recency.memory_search's filtered path fetches 500.
+    import json
+    import numpy as np
+    from ingest_lib.config import paths_for_root
+    from ingest_lib import semantic
+
+    paths = paths_for_root(tmp_path / "vault")
+    paths.ensure()
+    n = 150
+    # Distinct unit vectors in a 150-d space so every row is a candidate.
+    vecs = np.eye(n, dtype=np.float32)
+    np.save(paths.metadata / "embeddings.npy", vecs)
+    with (paths.metadata / "embeddings_meta.jsonl").open("w") as fh:
+        for i in range(n):
+            fh.write(json.dumps({
+                "source_relative_path": f"doc{i}.md", "text": f"chunk number {i}",
+                "chunk_idx": 0, "title": f"t{i}", "origin": "", "source_hash": "h",
+            }) + "\n")
+
+    class _FakeModel:
+        def encode(self, texts, **kw):
+            return np.ones((1, n), dtype=np.float32)  # ties across all rows
+    monkeypatch.setattr(semantic, "_load_embedder", lambda: (_FakeModel(), "cpu"))
+
+    hits = semantic.search(paths, "anything", top_k=150, mode="dense")
+    assert len(hits) == 150
+
+
+def test_query_instruction_prepended_and_toggleable(tmp_path, monkeypatch):
+    # BGE v1.5's documented retrieval usage: the instruction is prepended to
+    # the QUERY only (passages stay raw), so no reindex is needed.
+    import json
+    import numpy as np
+    from ingest_lib.config import paths_for_root
+    from ingest_lib import semantic
+
+    paths = paths_for_root(tmp_path / "vault")
+    paths.ensure()
+    np.save(paths.metadata / "embeddings.npy", np.array([[1.0]], dtype=np.float32))
+    (paths.metadata / "embeddings_meta.jsonl").write_text(
+        json.dumps({"source_relative_path": "x.md", "text": "t", "chunk_idx": 0,
+                    "title": "x", "origin": "", "source_hash": "h"}) + "\n",
+        encoding="utf-8")
+
+    seen: list[str] = []
+
+    class _FakeModel:
+        def encode(self, texts, **kw):
+            seen.extend(texts)
+            return np.array([[1.0]], dtype=np.float32)
+
+    monkeypatch.setattr(semantic, "_load_embedder", lambda: (_FakeModel(), "cpu"))
+
+    monkeypatch.delenv("BRAIN_QUERY_INSTRUCTION", raising=False)
+    semantic.search(paths, "graphs", top_k=1, mode="dense")
+    assert seen[-1] == "Represent this sentence for searching relevant passages: graphs"
+
+    # Toggle off for A/B measurement: the raw query is encoded.
+    monkeypatch.setenv("BRAIN_QUERY_INSTRUCTION", "0")
+    semantic.search(paths, "graphs", top_k=1, mode="dense")
+    assert seen[-1] == "graphs"

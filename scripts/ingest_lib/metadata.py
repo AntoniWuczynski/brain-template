@@ -52,7 +52,10 @@ _RECORD_FIELDS: frozenset[str] = frozenset(IndexRecord.__dataclass_fields__)
 def iter_records(jsonl_path: Path) -> Iterator[IndexRecord]:
     if not jsonl_path.exists():
         return
-    with jsonl_path.open("r", encoding="utf-8") as fh:
+    # errors="replace": a tail torn mid-UTF-8 (see append_record) must not
+    # crash the read — the mojibaked line fails json.loads below and is
+    # skipped like any other malformed line, keeping the valid records.
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -115,14 +118,20 @@ def append_record(jsonl_path: Path, record: IndexRecord) -> None:
                 pass
             raise
     else:
-        with jsonl_path.open("a+", encoding="utf-8") as fh:
-            # Self-heal a torn tail: if the file doesn't end in '\n', add one
-            # before appending so a partial prior line can't swallow this one.
-            fh.seek(0, os.SEEK_END)
-            if fh.tell() > 0:
-                fh.seek(fh.tell() - 1)
-                if fh.read(1) != "\n":
-                    fh.write("\n")
+        # Self-heal a torn tail: if the file doesn't end in '\n', add one
+        # before appending so a partial prior line can't swallow this one.
+        # Probe the last byte in BINARY — a text-mode read of a tail cut
+        # mid-UTF-8 (index.jsonl uses ensure_ascii=False) would raise
+        # UnicodeDecodeError before any write, crashing every retry.
+        with jsonl_path.open("rb") as probe:
+            probe.seek(0, os.SEEK_END)
+            needs_nl = probe.tell() > 0
+            if needs_nl:
+                probe.seek(-1, os.SEEK_END)
+                needs_nl = probe.read(1) != b"\n"
+        with jsonl_path.open("a", encoding="utf-8") as fh:
+            if needs_nl:
+                fh.write("\n")
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())

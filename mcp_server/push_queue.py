@@ -32,7 +32,7 @@ from .git_ops import GitError, _git
 
 log = logging.getLogger(__name__)
 
-# Matches the synchronous push timeout in git_ops.commit_and_push.
+# Upper bound on a single `git push` so a hung remote can't wedge the worker.
 _PUSH_TIMEOUT_S = 15.0
 
 

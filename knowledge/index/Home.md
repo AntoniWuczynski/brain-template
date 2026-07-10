@@ -19,6 +19,8 @@ For the full system overview see [`../../README.md`](../../README.md). For agent
 - `university/` — course-organised material.
 - `research/` — papers, lit-review notes, derivations.
 - `people/`, `organisations/` — entity notes.
+- `meetings/` — one note per meeting, by year.
+- `assistant/` — assistant memory: inbox/ archive/ digests/ PROFILE.md.
 - `notes/` — anything that doesn't fit the above yet.
 
 ## Workflow
@@ -28,7 +30,10 @@ For the full system overview see [`../../README.md`](../../README.md). For agent
 3. Each file is copied to `archive/raw/`, extracted to `archive/processed/`, and gets a generated index note in `knowledge/index/<rel/path>.md`.
 4. Curate: move or link the index note into the right subfolder, add tags, write your own thoughts under the auto-generated section.
 
-## Status dashboards (planned)
+## Status dashboards
 
-- [[Processing Dashboard]] — counts and most-recent runs (TODO).
-- [[Manual Review]] — files in `archive/failed/` waiting for a human (TODO).
+Generated after each ingest; run `uv run python scripts/ingest.py --rebuild-status` to force a refresh.
+
+- [[Now]] — landing view: recently added sources + what needs attention.
+- [[Processing Dashboard]] — counts and most-recent runs.
+- [[Manual Review]] — files in `archive/failed/` waiting for a human.

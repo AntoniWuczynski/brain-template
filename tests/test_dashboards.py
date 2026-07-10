@@ -213,3 +213,28 @@ def test_user_tail_preserved_across_rewrite(tmp_path: Path) -> None:
     rewritten = target.read_text(encoding="utf-8")
     assert "[[knowledge/people/borys-nowak]]" in rewritten
     assert "My own notes about these people." in rewritten
+
+
+def test_deleted_end_marker_refuses_rewrite_and_preserves_user_tail(tmp_path: Path) -> None:
+    # Same data-loss guard as concept notes: a deleted END marker must make
+    # the writer refuse, not silently clobber the hand-written tail.
+    paths = _seed(tmp_path)
+    rebuild_dashboards(paths, logger=_LOG)
+
+    target = paths.knowledge_index / "entities" / "people.md"
+    text = target.read_text(encoding="utf-8")
+    sentinel = "# Irreplaceable\n\nHand-written dashboard notes.\n"
+    text = text + "\n" + sentinel
+    text = text.replace("<!-- AUTO-GENERATED-END -->\n", "")
+    target.write_text(text, encoding="utf-8")
+
+    # Force a table change so the writer would otherwise rewrite people.md.
+    _write(
+        tmp_path,
+        "knowledge/people/borys-nowak.md",
+        "---\ntitle: Borys Nowak\ntype: person\n---\n\n# Borys Nowak\n",
+    )
+    stats = rebuild_dashboards(paths, logger=_LOG)
+
+    assert "knowledge/index/entities/people.md" not in stats.written_paths
+    assert sentinel in target.read_text(encoding="utf-8")

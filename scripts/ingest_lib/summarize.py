@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Final
 
@@ -268,11 +269,15 @@ def _build_user_block(
     # Fence the untrusted body so ingested text can't be read as instructions
     # (prompt injection into durable topics/summaries). The topic hint stays
     # OUTSIDE the fence — it is a real instruction from us.
+    # A literal ``</document>`` inside the source would otherwise close the
+    # fence early and let the text after it read as instructions. Break the
+    # closing tag with a space (still human-readable, no longer the fence).
+    safe_body = re.sub(r"(?i)</\s*document\s*>", "</ document>", body)
     return (
         f"# {title}\n"
         f"_(source: `{source_relative_path}`)_\n\n"
         f"{topic_hint}"
-        f"<document>\n{body}\n</document>"
+        f"<document>\n{safe_body}\n</document>"
     )
 
 

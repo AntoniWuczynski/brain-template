@@ -417,8 +417,8 @@ def load_edges(paths: VaultPaths) -> list[Edge]:
             continue
         if not all(k in row for k in ("a", "b", "kind", "weight")):
             continue
-        edges.append(
-            Edge(
+        try:
+            edge = Edge(
                 a=row["a"],
                 b=row["b"],
                 kind=row["kind"],
@@ -429,7 +429,12 @@ def load_edges(paths: VaultPaths) -> list[Edge]:
                 valid_from=str(row.get("valid_from") or ""),
                 valid_until=str(row.get("valid_until") or ""),
             )
-        )
+        except (ValueError, TypeError):
+            # Structurally present but malformed (non-numeric weight,
+            # non-iterable sources): skip it, don't fail the whole read —
+            # the docstring promises malformed lines are skipped.
+            continue
+        edges.append(edge)
     return edges
 
 

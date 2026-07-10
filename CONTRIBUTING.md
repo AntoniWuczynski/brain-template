@@ -16,7 +16,7 @@ If you want to improve the framework itself, PRs are welcome.
 
 - **Personal workflow opinions.** This is a template — keep changes generic and configurable.
 - **Heavy new dependencies.** The stack is intentionally lean. A new dep needs justification in the PR description.
-- **MCP server implementation.** There's a design doc at `mcp/README.md` that the maintainer intends to implement themselves. Corrections to the design are fine; large code drops likely aren't.
+- **MCP server changes.** The server is implemented in `mcp_server/`, with its contract in `mcp/README.md`. Small fixes and contract corrections are welcome; large redesigns are the maintainer's call — open an issue first.
 - **Reformatting / "improving" the code style** without behavioural change. Save the noise.
 
 ## Setup
@@ -25,12 +25,14 @@ If you want to improve the framework itself, PRs are welcome.
 gh repo clone <your-username>/brain-template brain
 cd brain
 uv sync
-uv pip install --prerelease=allow "mineru[pipeline]"   # only if touching PDF code
+uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six   # only if touching PDF code
 ```
 
-No formal test suite yet. The expected smoke test for any PR:
+Run the test suite (`tests/`, also run in CI) and the smoke test for any PR:
 
 ```bash
+uv run --no-sync pytest -q
+# Then the round-trip smoke test:
 # Drop a small file into inbox/
 printf '# Test note\n\nSome content.\n' > inbox/test.md
 uv run python scripts/ingest.py --inbox

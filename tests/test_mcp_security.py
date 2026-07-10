@@ -6,6 +6,7 @@ git vault with background workers disabled — no live server, fully offline.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 
 from ingest_lib.relations import is_valid_node_id  # type: ignore[import-not-found]
 
+from mcp_server import tools as tools_mod
 from mcp_server.audit import AuditLog
 from mcp_server.safety import (
     SafetyError,
@@ -20,7 +22,7 @@ from mcp_server.safety import (
     resolve_read,
     resolve_write_under_allowlist,
 )
-from mcp_server.config import ServerConfig
+from mcp_server.config import CONCEPT_WRITE_PREFIX, ServerConfig
 from mcp_server.entity_tools import (
     tool_entity_append_fact,
     tool_entity_upsert_relation,
@@ -34,8 +36,10 @@ from mcp_server.runtime import Runtime
 from mcp_server.tools import (
     MAX_QUERY_CHARS,
     ToolError,
+    tool_list,
     tool_related,
     tool_search,
+    tool_update_concept_user_section,
 )
 
 
@@ -289,3 +293,41 @@ def test_resolve_write_under_allowlist_scope(tmp_path):
     # A bare allow-prefix directory is refused (needs a file path).
     with pytest.raises(SafetyError):
         resolve_write_under_allowlist(root, "knowledge/notes")
+
+
+# ------------- concept user-section write can't exceed the note byte cap
+
+def test_update_concept_user_section_refuses_oversized_composed_note(
+    env, monkeypatch
+) -> None:
+    root, cfg, runtime = env
+    # Shrink the cap so the test stays fast: content passes the per-content
+    # check but auto-header + content overflows the composed note.
+    monkeypatch.setattr(tools_mod, "MAX_NOTE_BYTES", 200)
+    slug = "widgets"
+    note_rel = f"{CONCEPT_WRITE_PREFIX}/{slug}.md"
+    auto = "# Widgets\n\nAuto text.\n\n<!-- AUTO-GENERATED-END -->\n"
+    _write(root, note_rel, auto)
+    before = (root / note_rel).read_text(encoding="utf-8")
+
+    content = "x" * tools_mod.MAX_NOTE_BYTES  # 200 bytes: passes _check_note_size
+    with pytest.raises(ToolError, match="composed concept note would exceed"):
+        tool_update_concept_user_section(cfg, runtime, slug=slug, content=content)
+    # The note is left untouched — nothing was grown past the cap.
+    assert (root / note_rel).read_text(encoding="utf-8") == before
+
+
+# ------------------------ tool_list never leaks an unreadable dir's path
+
+def test_list_unreadable_dir_returns_generic_error(env) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    root, cfg, runtime = env
+    locked = root / "knowledge" / "locked"
+    locked.mkdir(parents=True)
+    os.chmod(locked, 0o000)
+    try:
+        with pytest.raises(ToolError, match="not found or not readable"):
+            tool_list(cfg, runtime, path="knowledge/locked")
+    finally:
+        os.chmod(locked, 0o755)  # restore so tmp_path cleanup can recurse

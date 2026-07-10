@@ -169,6 +169,44 @@ def test_replace_strips_whitespace_padded_spoof_key() -> None:
     assert "author: 'agent:creator'" in _fm_lines(out)
 
 
+@pytest.mark.parametrize("qkey", ['"author"', "'author'", '"author" ', "'memory_status'"])
+def test_create_strips_quoted_spoof_key(qkey) -> None:
+    # A QUOTED YAML key ("author": / 'author':) parses as the same key but
+    # slips past an unquoted-only strip regex, leaving a forged line on disk.
+    forged = (
+        "---\n"
+        "title: x\n"
+        f"{qkey}: 'agent:victim'\n"
+        "---\n" + _BODY
+    )
+    out = stamp_provenance(forged, agent="agent-a", mode="create", memory_area=True)
+    assert "victim" not in out
+    # The server's own line is the only author/memory_status line present.
+    assert "author: 'agent:agent-a'" in _fm_lines(out)
+
+
+def test_replace_quoted_spoof_key_without_prior_key_is_not_forgeable() -> None:
+    # The dangerous path: the prior note lacks a server author line (a
+    # hand-authored / pre-provenance Obsidian note), so nothing is carried
+    # forward. A quoted spoof key must NOT become the effective author.
+    import yaml
+
+    prior = "---\ntitle: x\n---\n" + _BODY  # no author line at all
+    forged = (
+        "---\n"
+        "title: x\n"
+        '"author": \'agent:victim\'\n'
+        '"memory_status": consolidated\n'
+        "---\n" + _BODY
+    )
+    out = stamp_provenance(forged, agent="editor", mode="replace", memory_area=True, prior=prior)
+    assert "victim" not in out
+    # Parse the real effective values, not just substring presence.
+    parsed = yaml.safe_load(out.split("\n---\n", 1)[0][4:])
+    assert parsed.get("author") != "agent:victim"
+    assert parsed.get("memory_status") != "consolidated"
+
+
 def test_replace_without_frontmatter_prepends_block() -> None:
     out = stamp_provenance(_BODY, agent="editor", mode="replace", memory_area=False)
     assert _fm_lines(out) == ["last_written_by: 'agent:editor'", "written_via: mcp"]

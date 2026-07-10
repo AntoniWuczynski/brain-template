@@ -6,7 +6,11 @@ caption upsert.
 """
 from __future__ import annotations
 
-from ingest_lib.caption import image_refs, image_sha256, upsert_caption
+import json
+from pathlib import Path
+
+from ingest_lib.caption import _append_caption, image_refs, image_sha256, upsert_caption
+from ingest_lib.config import VaultPaths
 
 _MD = (
     "# Doc\n\nIntro text.\n\n"
@@ -55,3 +59,48 @@ def test_upsert_caption_replaces_caption_for_same_hash():
     assert "Old caption." not in twice
     assert "New caption." in twice
     assert twice.count("<!-- caption: h1 -->") == 1
+
+
+# ---------------------------------------------- _append_caption torn-tail heal
+
+def _vault(root: Path) -> VaultPaths:
+    return VaultPaths(
+        root=root,
+        inbox=root / "inbox",
+        archive_raw=root / "archive" / "raw",
+        archive_processed=root / "archive" / "processed",
+        archive_failed=root / "archive" / "failed",
+        knowledge=root / "knowledge",
+        knowledge_index=root / "knowledge" / "index",
+        metadata=root / "metadata",
+        metadata_index_jsonl=root / "metadata" / "index.jsonl",
+        logs=root / "logs",
+    )
+
+
+def test_append_caption_heals_torn_tail(tmp_path: Path):
+    paths = _vault(tmp_path)
+    (tmp_path / "metadata").mkdir()
+    cap = tmp_path / "metadata" / "captions.jsonl"
+    # A torn last line: a previous write was cut off with no trailing newline.
+    cap.write_text('{"hash": "aaa", "caption": "first", "model": "m"}', encoding="utf-8")
+
+    _append_caption(paths, "bbb", "second", "m")
+
+    rows = [json.loads(ln) for ln in cap.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(rows) == 2
+    assert {r["hash"] for r in rows} == {"aaa", "bbb"}
+
+
+def test_append_caption_torn_multibyte_tail_does_not_crash(tmp_path: Path):
+    paths = _vault(tmp_path)
+    (tmp_path / "metadata").mkdir()
+    cap = tmp_path / "metadata" / "captions.jsonl"
+    # Tail torn mid-multibyte char (é = 0xC3 0xA9, keep only 0xC3): a text-mode
+    # last-byte probe would raise UnicodeDecodeError; the binary probe must not.
+    cap.write_bytes(b'{"hash": "aaa", "caption": "caf\xc3')
+
+    _append_caption(paths, "bbb", "second", "m")  # must not raise
+
+    good = [ln for ln in cap.read_bytes().split(b"\n") if ln.strip()]
+    assert json.loads(good[-1].decode("utf-8"))["hash"] == "bbb"

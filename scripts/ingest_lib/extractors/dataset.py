@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -46,7 +47,10 @@ def extract_parquet_stub(src: Path, _assets_dir: Path) -> ExtractionResult:
 
 def _extract_dsv(src: Path, *, delimiter: str) -> ExtractionResult:
     try:
-        with src.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        # utf-8-sig: Excel's "CSV UTF-8" export prepends a BOM that would
+        # otherwise corrupt the first header cell. Byte-identical to utf-8
+        # when no BOM is present.
+        with src.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:
             reader = csv.reader(fh, delimiter=delimiter)
             try:
                 header = next(reader)
@@ -112,7 +116,9 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
     skipped = 0
     sample: list[dict[str, object]] = []
     try:
-        with src.open("r", encoding="utf-8", errors="replace") as fh:
+        # utf-8-sig: json.loads rejects a BOM-prefixed line, which would
+        # silently drop the first record as "unparseable".
+        with src.open("r", encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -171,7 +177,10 @@ def _extract_jsonl(src: Path) -> ExtractionResult:
 
 
 def _clip(s: str, n: int = 80) -> str:
-    s = s.replace("|", "\\|").replace("\n", " ")
+    # \r\n?|\n: quoted CSV cells keep their CRLFs (newline="" open mode);
+    # a bare CR is a CommonMark line ending and would split the table row.
+    s = s.replace("|", "\\|")
+    s = re.sub(r"\r\n?|\n", " ", s)
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
@@ -179,5 +188,6 @@ def _clip_code(s: str, n: int = 80) -> str:
     """Clip a value destined for a Markdown ``code`` span in a table cell:
     strip backticks (which would break the span) and pipes/newlines (which
     would break the table)."""
-    s = s.replace("`", "").replace("|", "\\|").replace("\n", " ")
+    s = s.replace("`", "").replace("|", "\\|")
+    s = re.sub(r"\r\n?|\n", " ", s)
     return s if len(s) <= n else s[: n - 1] + "…"

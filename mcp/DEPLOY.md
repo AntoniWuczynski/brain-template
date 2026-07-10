@@ -15,7 +15,7 @@ This is the recipe for putting `mcp_server/` on a Linux box behind a Cloudflare 
 The server requires a static bearer token on every request (inner ring of auth — Cloudflare Access is the outer ring). Generate one:
 
 ```bash
-openssl rand -base64 32
+openssl rand -hex 32
 ```
 
 Keep the output safe. You'll paste it into the env file in the next step and into every MCP client config that connects.
@@ -233,7 +233,7 @@ async def main():
 asyncio.run(main())
 ```
 
-For claude.ai or Claude Code: register the URL + bearer header as a remote MCP server in their config. They'll auto-discover the fifteen tools listed in `mcp/README.md`. Give each client its own token via `BRAIN_MCP_TOKENS` so its writes are attributed to it.
+For claude.ai or Claude Code: register the URL + bearer header as a remote MCP server in their config. They'll auto-discover the seventeen tools listed in `mcp/README.md`. Give each client its own token via `BRAIN_MCP_TOKENS` so its writes are attributed to it.
 
 ## 8. Updating the server later
 

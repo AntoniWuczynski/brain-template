@@ -10,6 +10,7 @@ from pathlib import Path
 from .base import ExtractionResult, Extractor
 from . import dataset as _dataset_mod
 from . import docx as _docx_mod
+from . import image as _image_mod
 from . import notebook as _notebook_mod
 from . import pdf as _pdf_mod
 from . import pptx as _pptx_mod
@@ -57,10 +58,35 @@ _REGISTRY: dict[str, Extractor] = {
     ".toml": _text_mod.extract,
     ".json": _text_mod.extract,
     ".log": _text_mod.extract,
+    # Standalone images (photos, whiteboards, screenshots, scans): a vision
+    # LLM transcribes/describes them. Falls back to manual_review with no
+    # vision backend — never a hallucinated caption.
+    **{ext: _image_mod.extract for ext in _image_mod.IMAGE_EXTENSIONS},
 }
 
 
-def dispatch_extractor(path: Path) -> Extractor | None:
+# Source-class registry: a vault-relative path PREFIX (e.g.
+# ``meetings/granola/``) → extractor, consulted BEFORE the suffix map.
+# Connector snapshots (see ``ingest_lib.connectors``) land under a
+# source-class directory and are often ``.json`` — an extension the suffix
+# map already assigns to ``text.py`` — so they need path-based routing.
+# Empty until a connector registers its extractor here.
+_SOURCE_CLASS_REGISTRY: dict[str, Extractor] = {}
+
+
+def dispatch_extractor(path: Path, relative_path: str | None = None) -> Extractor | None:
+    """Pick an extractor for ``path``.
+
+    When ``relative_path`` (the vault-relative logical path) is given, a
+    source-class prefix match wins over the file extension — so a connector's
+    ``.json`` snapshot under ``meetings/granola/`` routes to the Granola
+    extractor rather than the generic text one. Falls back to the suffix map.
+    """
+    if relative_path is not None:
+        rel = relative_path.replace("\\", "/").lstrip("/")
+        for prefix, extractor in _SOURCE_CLASS_REGISTRY.items():
+            if rel.startswith(prefix):
+                return extractor
     return _REGISTRY.get(path.suffix.lower())
 
 

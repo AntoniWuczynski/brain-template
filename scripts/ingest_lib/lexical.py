@@ -7,16 +7,15 @@ error strings — which this vault is saturated with. BM25 over the same chunk
 texts (``metadata/embeddings_meta.jsonl``) covers exactly that gap, and
 fusing the two rankings (see ``semantic.search`` hybrid mode) beats either
 alone. No new files on disk, no model, no network: a pure-Python inverted
-index built lazily and cached by the meta file's mtime.
+index. ``semantic.search`` builds it from the already-loaded meta rows and
+caches it under the same generation key as the vectors, so the two rankings
+never come from different rebuilds.
 """
 from __future__ import annotations
 
-import json
 import math
 import re
-import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _K1 = 1.5
@@ -85,36 +84,3 @@ def ranking(index: LexicalIndex, query: str) -> list[int]:
     for determinism)."""
     scored = score(index, query)
     return [i for i, _s in sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))]
-
-
-# ---------------------------------------------------------------------------
-# mtime-cached load from the semantic index's meta sidecar
-# ---------------------------------------------------------------------------
-
-_CACHE_LOCK = threading.Lock()
-_CACHE: tuple[float, LexicalIndex] | None = None
-
-
-def load_lexical_index(meta_path: Path) -> LexicalIndex | None:
-    """Build (or reuse) the lexical index from ``embeddings_meta.jsonl``.
-
-    Cached by the meta file's mtime — a rebuild of the semantic index (which
-    rewrites this file) invalidates it automatically. Returns None if the
-    file is absent or unreadable."""
-    global _CACHE
-    try:
-        mtime = meta_path.stat().st_mtime
-    except OSError:
-        return None
-    cache = _CACHE
-    if cache is not None and cache[0] == mtime:
-        return cache[1]
-    try:
-        with meta_path.open("r", encoding="utf-8") as fh:
-            texts = [json.loads(ln).get("text", "") for ln in fh if ln.strip()]
-    except (OSError, ValueError):
-        return None
-    index = build_lexical_index(texts)
-    with _CACHE_LOCK:
-        _CACHE = (mtime, index)
-    return index

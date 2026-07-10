@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ingest_lib import rebuild_concepts, rebuild_connections
 from ingest_lib.config import VaultPaths
+from ingest_lib.connections import load_edges
 from ingest_lib.metadata import IndexRecord, append_record
 
 _LOG = logging.getLogger("test")
@@ -83,3 +84,23 @@ def test_graph_and_related_links_render_and_are_deterministic(tmp_path: Path):
     assert connections_path.read_text(encoding="utf-8") == first_graph
     rebuild_concepts(paths, logger=_LOG, related=conn2.related)
     assert (paths.knowledge / "concepts" / "beta.md").read_text(encoding="utf-8") == beta_note
+
+
+def test_load_edges_skips_malformed_lines(tmp_path: Path):
+    # load_edges promises malformed lines are skipped, not fatal. A line that
+    # parses as JSON with all keys but a non-numeric weight must be dropped
+    # (float() would otherwise raise and crash the whole read), same as a line
+    # that isn't JSON at all.
+    paths = _vault(tmp_path)
+    paths.ensure()
+    conn = paths.metadata / "connections.jsonl"
+    conn.write_text(
+        '{"a": "alpha", "b": "beta", "kind": "cooccurrence", "weight": 2.0, "sources": ["a.md"]}\n'
+        '{"a": "x", "b": "y", "kind": "cooccurrence", "weight": "not-a-number"}\n'
+        "totally not json\n",
+        encoding="utf-8",
+    )
+    edges = load_edges(paths)
+    assert len(edges) == 1
+    assert edges[0].a == "alpha" and edges[0].b == "beta"
+    assert edges[0].weight == 2.0

@@ -96,6 +96,29 @@ def test_orphan_removal_reports_removed_paths(tmp_path: Path):
     assert not (paths.knowledge / "concepts" / "beta.md").exists()
 
 
+def test_deleted_end_marker_refuses_rewrite_and_preserves_user_tail(tmp_path: Path):
+    # If the user deletes the AUTO-GENERATED-END marker (but the START marker
+    # remains), the writer can't find the boundary. It must REFUSE to rewrite
+    # rather than silently drop everything below where the marker was — the
+    # MCP reindex would otherwise auto-commit the destruction.
+    paths = _seed(tmp_path)
+    rebuild_concepts(paths, logger=_LOG)
+
+    alpha = paths.knowledge / "concepts" / "alpha.md"
+    text = alpha.read_text(encoding="utf-8")
+    sentinel = "# My irreplaceable notes\n\nYears of hand-written thinking.\n"
+    text = text + "\n" + sentinel
+    # Delete only the END-marker line, leaving START in place.
+    text = text.replace("<!-- AUTO-GENERATED-END -->\n", "")
+    alpha.write_text(text, encoding="utf-8")
+
+    stats = rebuild_concepts(paths, logger=_LOG)
+
+    # Refused: not rewritten, so not committed, and the user text survives.
+    assert "knowledge/concepts/alpha.md" not in stats.written_paths
+    assert sentinel in alpha.read_text(encoding="utf-8")
+
+
 def test_user_tail_edit_survives_and_does_not_trigger_rewrite(tmp_path: Path):
     # The user tail below AUTO-GENERATED-END is part of the canonical
     # render, so a tail-only edit leaves the file equal to what the

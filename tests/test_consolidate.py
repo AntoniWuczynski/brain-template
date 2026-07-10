@@ -200,6 +200,26 @@ def test_unresolved_target_stays_in_inbox(tmp_path: Path) -> None:
     assert any("knowledge/people/ghost.md" in p for p in stats.problems)
 
 
+def test_promote_target_traversal_is_rejected(tmp_path: Path) -> None:
+    # promote.target is agent-controlled; a '..' traversal must never let the
+    # promoter write outside knowledge/. AGENTS.md exists at the repo root, so
+    # this would overwrite it (the .is_file() guard only blocks new files).
+    paths = _vault(tmp_path)
+    sentinel = paths.root / "AGENTS.md"
+    sentinel.write_text("ORIGINAL AGENTS CONTENT\n", encoding="utf-8")
+    original = _fact_note(approved=True, target="../AGENTS")
+    _write(paths, f"{_INBOX}/fact-evil.md", original)
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 0
+    assert stats.unresolved == 1
+    # The out-of-tree file is untouched and the note stays in the inbox.
+    assert sentinel.read_text(encoding="utf-8") == "ORIGINAL AGENTS CONTENT\n"
+    assert _read(paths, f"{_INBOX}/fact-evil.md") == original
+    assert any("not a valid node id" in p for p in stats.problems)
+
+
 # ---------------------------------------------------------------------------
 # digestion + waiting
 # ---------------------------------------------------------------------------
@@ -368,3 +388,33 @@ def test_crashed_promote_rerun_does_not_duplicate_fact_line(tmp_path: Path) -> N
         "([[knowledge/meetings/2026/2026-06-01-call]])"
     )
     assert body.count(line) == 1
+
+
+def test_crashed_promote_rerun_next_day_no_duplicate(tmp_path: Path) -> None:
+    # The crash-rerun guard must survive a rerun on a LATER day. The archived
+    # copy carries a `consolidated: <as_of>` stamp, so a byte-exact match
+    # fails cross-day, minting a '-2' archive dest and (source unset) a
+    # second Log bullet whose fallback source is that '-2' path.
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/people/anna.md", _ENTITY)
+    fact = _fact_note(approved=True, source="")  # source unset -> dest fallback
+    _write(paths, f"{_INBOX}/fact-anna.md", fact)
+
+    day1 = date(2026, 6, 12)
+    s1 = consolidate(paths, logger=_LOG, as_of=day1)
+    assert s1.promoted == 1
+
+    # Simulate the crash: archive write + entity update landed, but the inbox
+    # unlink didn't — so the note is still pending on the next run.
+    _write(paths, f"{_INBOX}/fact-anna.md", fact)
+
+    day2 = date(2026, 6, 13)  # recovery run happens the next day
+    s2 = consolidate(paths, logger=_LOG, as_of=day2)
+    assert s2.promoted == 1
+
+    _, body = _split_frontmatter(_read(paths, "knowledge/people/anna.md"))
+    assert body.count("— Anna works at Acme (") == 1
+    archived = sorted(
+        p.name for p in (paths.root / _ARCHIVE_MONTH).glob("fact-anna*.md")
+    )
+    assert archived == ["fact-anna.md"]  # no 'fact-anna-2.md' duplicate

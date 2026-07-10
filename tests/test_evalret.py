@@ -53,3 +53,31 @@ def test_recall_at_k_respects_cutoff():
 def test_empty_golden_is_zero_not_crash():
     rep = evaluate([], _fixed({}), ks=(5,))
     assert rep.recall_at(5) == 0.0 and rep.mrr() == 0.0
+
+
+def test_retriever_overfetches_chunks_and_returns_n_distinct_sources(monkeypatch):
+    # The retriever de-dupes CHUNKS to SOURCES: a source with many chunks must
+    # not crowd distinct sources out of the top-n it reports to the scorer.
+    import sys
+    sys.path.insert(0, "scripts")
+    import eval_retrieval
+    from ingest_lib.semantic import SearchHit
+
+    def _hit(src: str, idx: int) -> SearchHit:
+        return SearchHit(score=1.0, source_relative_path=src, title=src,
+                         chunk_idx=idx, snippet="s", origin="")
+
+    # First 5 chunks all belong to one source; the 6th is a second source.
+    chunks = [_hit("big.pdf", i) for i in range(5)] + [_hit("other.pdf", 0)]
+    captured: dict[str, int] = {}
+
+    def fake_search(paths, query, *, top_k, **kw):
+        captured["top_k"] = top_k
+        return chunks
+
+    monkeypatch.setattr(eval_retrieval, "semantic_search", fake_search)
+    retrieve = eval_retrieval._retriever(paths=None, top_k=10)
+    got = retrieve("q", 2)
+
+    assert got == ["big.pdf", "other.pdf"]   # 2 distinct sources, not 1
+    assert captured["top_k"] > 2             # over-fetched chunks, not just n

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC
 from pathlib import Path
 from collections.abc import Iterator, Sequence
@@ -90,7 +90,7 @@ def plan_ingest(
                 continue
             seen_relative.add(rel)
 
-            extractor = dispatch_extractor(f)
+            extractor = dispatch_extractor(f, relative_path=rel)
             item = PlannedItem(src=f, relative_path=rel, is_in_archive=from_archive)
             if extractor is None:
                 plan.skipped_unsupported.append(item)
@@ -187,7 +187,8 @@ def run_ingest(
 
     # Refresh concept notes whenever we actually wrote new content (and
     # not on dry-runs). Cheap: just walks the JSONL, no LLM calls.
-    if not dry_run and (stats.processed or stats.partial):
+    wrote_content = stats.processed or stats.partial
+    if not dry_run and wrote_content:
         # Build the semantic index first: concept centroids (and thus the
         # connection graph's semantic edges) read fresh vectors from it.
         # Cheap (~1 chunk/ms on MPS); failure is non-fatal — search just
@@ -226,13 +227,6 @@ def run_ingest(
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("dashboards: rebuild failed (%r) — skipping", exc)
-        # Processing Dashboard + Manual Review: derived from index.jsonl + the
-        # filesystem, non-fatal like the other derived views.
-        try:
-            from .status import rebuild_status
-            rebuild_status(paths, logger=logger)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("status: rebuild failed (%r) — skipping", exc)
         # Opt-in: generate AI concept descriptions inline (costs LLM calls, so
         # off by default). Only stale concepts regenerate. Non-fatal.
         if os.environ.get("BRAIN_AUTO_DESCRIBE") == "1":
@@ -243,6 +237,18 @@ def run_ingest(
                             ds.generated, ds.skipped_uptodate)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("describe: failed (%r) — skipping", exc)
+
+    # Processing Dashboard + Manual Review: derived from index.jsonl + the
+    # filesystem, non-fatal like the other derived views. Refreshed whenever
+    # ANYTHING was recorded — including a failure-only run, whose whole point
+    # is to surface the new manual_review entry (the heavy content rebuilds
+    # above have nothing new to index, so they stay gated on wrote_content).
+    if not dry_run and (wrote_content or stats.manual_review):
+        try:
+            from .status import rebuild_status
+            rebuild_status(paths, logger=logger)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("status: rebuild failed (%r) — skipping", exc)
     return stats
 
 
@@ -256,7 +262,7 @@ def _process_one(
 ) -> str:
     rel = item.relative_path
     src = item.src
-    extractor = dispatch_extractor(src)
+    extractor = dispatch_extractor(src, relative_path=rel)
     if extractor is None:
         # Defensive — planning already filtered these.
         logger.warning("unexpected unsupported file in plan: %s", rel)
@@ -320,14 +326,19 @@ def _process_one(
             raw_target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, raw_target)
 
-    # 2. Run the extractor. Clear any assets from a PREVIOUS extraction of
-    #    this source first: on a re-ingest (changed hash) the old
-    #    content-hash-named images would otherwise linger unreferenced and
-    #    accumulate forever. archive/processed is regenerable by contract.
-    if assets_dir.exists():
-        shutil.rmtree(assets_dir, ignore_errors=True)
+    # 2. Run the extractor into a TEMP assets dir, swapped into place only on
+    #    success. A re-ingest (changed hash) whose extraction fails must not
+    #    destroy the previous good extraction's assets — archive/processed is
+    #    regenerable, but only from a run that succeeded. The temp dir keeps
+    #    the FINAL leaf name (extractors rewrite image links to
+    #    ``assets_dir.name``), just under a sibling temp parent, so the swap
+    #    is a plain rename and the rewritten links already match.
+    tmp_assets_parent = assets_dir.parent / (".tmp-" + assets_dir.name)
+    tmp_assets = tmp_assets_parent / assets_dir.name
+    if tmp_assets_parent.exists():
+        shutil.rmtree(tmp_assets_parent, ignore_errors=True)
     try:
-        result = extractor(src, assets_dir)
+        result = extractor(src, tmp_assets)
     except Exception as exc:  # noqa: BLE001
         logger.exception("extractor crashed for %s", rel)
         result = ExtractionResult(
@@ -336,6 +347,23 @@ def _process_one(
             markdown="",
             error=f"extractor crashed: {exc!r}",
         )
+
+    if result.status == "manual_review":
+        # Failure: discard the temp, leave the previous assets untouched.
+        shutil.rmtree(tmp_assets_parent, ignore_errors=True)
+    else:
+        # Success: replace the old assets with the freshly extracted ones and
+        # remap result.assets from the temp dir onto their final home.
+        if assets_dir.exists():
+            shutil.rmtree(assets_dir, ignore_errors=True)
+        if tmp_assets.exists():
+            assets_dir.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(tmp_assets, assets_dir)
+            result = replace(
+                result,
+                assets=[assets_dir / p.relative_to(tmp_assets) for p in result.assets],
+            )
+        shutil.rmtree(tmp_assets_parent, ignore_errors=True)
 
     # 3. On manual_review move file to archive/failed and update metadata.
     if result.status == "manual_review":
@@ -698,13 +726,26 @@ def _move_to_failed(raw_target: Path, paths: VaultPaths) -> Path | None:
     failed_target = paths.archive_failed / rel
     failed_target.parent.mkdir(parents=True, exist_ok=True)
     if failed_target.exists():
-        # Don't overwrite — append a numeric suffix so we never lose data.
+        # A prior failure already sits here. If it's byte-identical (the same
+        # file failing again on a re-run — inbox sources are never deleted, so
+        # this is the common case), the bytes are already preserved: drop the
+        # duplicate rather than stacking x.docx.1, x.docx.2, ... on every run.
+        raw_hash = sha256_of(raw_target)
+        if sha256_of(failed_target) == raw_hash:
+            raw_target.unlink()
+            return failed_target
+        # Different bytes: don't overwrite — find the next free suffix whose
+        # existing occupant also differs (an identical .N copy is likewise a
+        # no-op we reuse).
         i = 1
         while True:
             cand = failed_target.with_name(failed_target.name + f".{i}")
             if not cand.exists():
                 failed_target = cand
                 break
+            if sha256_of(cand) == raw_hash:
+                raw_target.unlink()
+                return cand
             i += 1
     shutil.move(str(raw_target), str(failed_target))
     return failed_target

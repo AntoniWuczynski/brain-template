@@ -379,3 +379,34 @@ def test_dated_overlap_is_still_flagged(tmp_path: Path) -> None:
     )
     report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
     assert report.counts.get("relation-overlap", 0) == 1
+
+
+def _integrity_vault(tmp_path: Path) -> VaultPaths:
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    good = _write(tmp_path, "archive/raw/good.txt", "the real bytes")
+    bad = _write(tmp_path, "archive/raw/bad.txt", "original bytes")
+    append_record(paths.metadata_index_jsonl, _record("good.txt", sha256_of(good)))
+    # Record bad.txt's ORIGINAL hash, then corrupt the file on disk.
+    orig_hash = sha256_of(bad)
+    append_record(paths.metadata_index_jsonl, _record("bad.txt", orig_hash))
+    _write(tmp_path, "archive/raw/bad.txt", "CORRUPTED bytes")
+    # Give both processed/index artifacts so no missing-artifact noise.
+    for stem in ("good", "bad"):
+        _write(tmp_path, f"archive/processed/{stem}.md", "# x\n")
+        _write(tmp_path, f"knowledge/index/{stem}.md", "# x\n")
+    return paths
+
+
+def test_integrity_check_flags_corrupted_raw_only_when_enabled(tmp_path: Path) -> None:
+    paths = _integrity_vault(tmp_path)
+
+    # Off by default: no re-hash, no archive-corrupt finding.
+    default_run = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+    assert not any(f.category == "archive-corrupt" for f in default_run.findings)
+
+    # Opt-in: the tampered file is flagged, the intact one is not.
+    checked = run_sweep(paths, logger=_LOG, as_of=AS_OF, check_integrity=True)
+    corrupt = [f for f in checked.findings if f.category == "archive-corrupt"]
+    assert [f.path for f in corrupt] == ["bad.txt"]
+    assert "immutable" in corrupt[0].detail

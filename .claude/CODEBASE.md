@@ -62,4 +62,6 @@ for the rules there.
 - `.claude/patterns/` — example snippets / templates referenced from
   prompts (e.g. an "ingest-and-summarise" skeleton). Empty by default.
 - `.claude/hooks/` — optional hooks that **must be non-blocking and
-  must not spam**. None defined yet.
+  must not spam**. The source (private) repo wires one, `remind-template-sync.py`
+  — a PostToolUse nudge to publish framework edits upstream via
+  `scripts/push_to_upstream.sh`; the template itself ships none.

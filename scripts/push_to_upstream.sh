@@ -99,6 +99,10 @@ FRAMEWORK_PATHS=(
     ".obsidian/core-plugins.json"
     ".obsidian/graph.json"
     "knowledge/index/Note Template.md"
+    # Entity/memory-fact templates the synced docs reference (AGENTS.md,
+    # scripts/README.md, the consolidate/entity_tools contracts). Generic
+    # blanks — no personal data.
+    "knowledge/index/templates"
 )
 
 copy_path() {
@@ -120,6 +124,25 @@ echo "copying framework files..."
 for path in "${FRAMEWORK_PATHS[@]}"; do
     copy_path "$path"
 done
+
+# The retrieval eval golden set is real: its `expected` paths are the owner's
+# actual vault inventory (university/COMP…). The framework copy above ships
+# scripts/ wholesale, so replace the golden set with a generic placeholder on
+# the public branch. eval_retrieval.py defaults to this path and the README
+# references it, so replace — never delete — keeping the schema intact.
+GOLDEN_DEST="$WORKTREE/scripts/eval/retrieval_golden.jsonl"
+if [ -f "$GOLDEN_DEST" ]; then
+    echo "sanitising retrieval golden set (placeholder for the public branch)..."
+    mkdir -p "$(dirname "$GOLDEN_DEST")"
+    cat > "$GOLDEN_DEST" <<'EOF'
+{"query": "example query about a topic you have ingested", "expected": ["notes/example-note.md"], "note": "placeholder — replace with queries over your own sources; see scripts/README.md"}
+{"query": "another example retrieval query", "expected": ["research/example-paper.md"], "note": "placeholder — each expected path is a source_relative_path in metadata/index.jsonl"}
+EOF
+fi
+
+# Mined eval candidates hold the owner's real search queries — never publish
+# them (gitignored locally, but the framework copy is a working-tree cp -R).
+rm -f "$WORKTREE/scripts/eval/mined_candidates.jsonl"
 
 # Overlay: public-facing files that live under _template/ on main and
 # get copied into their target locations on the template branch.
@@ -149,7 +172,9 @@ for dir in \
     "archive/raw" "archive/processed" "archive/failed" \
     "knowledge/index" "knowledge/concepts" "knowledge/projects" \
     "knowledge/university" "knowledge/research" "knowledge/people" \
-    "knowledge/organisations" "knowledge/notes" \
+    "knowledge/organisations" "knowledge/notes" "knowledge/meetings" \
+    "knowledge/assistant/inbox" "knowledge/assistant/archive" \
+    "knowledge/assistant/digests" \
     "logs" "metadata" \
     ; do
     mkdir -p "$WORKTREE/$dir"
@@ -177,6 +202,19 @@ for forbidden in \
         exit 1
     fi
 done
+
+# Content scan: catch personal vault inventory smuggled inside synced DATA
+# files (the retrieval golden set is the real vector). Scoped to *.jsonl —
+# inventory lives in data, whereas source/docs/tests legitimately use
+# path-shaped course markers (university/COMP0123/...) as illustrative
+# examples, which must not trip the guard.
+INVENTORY_RE='university/COMP[0-9]+/'
+if grep -rElE "$INVENTORY_RE" "$WORKTREE" --include='*.jsonl' \
+        --exclude-dir=.git >/dev/null 2>&1; then
+    echo "ABORT: personal vault inventory (university/COMP…/) leaked into a template data file:"
+    grep -rElE "$INVENTORY_RE" "$WORKTREE" --include='*.jsonl' --exclude-dir=.git
+    exit 1
+fi
 
 cd "$WORKTREE"
 git add -A

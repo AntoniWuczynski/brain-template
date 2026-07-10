@@ -45,6 +45,7 @@ from .config import VaultPaths
 from .notes import _atomic_write, _split_frontmatter  # private helpers, module-internal
 from .relations import (
     append_fact_to_log,
+    is_valid_node_id,
     normalize_target,
     note_path_for_node,
     parse_relations,
@@ -145,6 +146,15 @@ def _frontmatter_close(lines: list[str]) -> int:
         if lines[i].strip() == "---":
             return i
     return -1
+
+
+def _same_promotion(a: str, b: str) -> bool:
+    """True iff two archived-note texts are the same promotion, ignoring the
+    volatile ``consolidated:`` date stamp. Used so a crash-rerun on a later
+    day still recognises its own already-archived copy."""
+    norm_a = _set_frontmatter_key(a, "consolidated", "''")
+    norm_b = _set_frontmatter_key(b, "consolidated", "''")
+    return norm_a == norm_b
 
 
 def _set_frontmatter_key(text: str, key: str, value: str) -> str:
@@ -311,6 +321,16 @@ def consolidate(
                     f"{rel}: promote-eligible but promote.target is missing — left in inbox"
                 )
                 continue
+            # promote.target is agent-controlled. Gate it exactly like the MCP
+            # server gates every entity target (entity_tools.py) so a '..'
+            # traversal can't escape knowledge/ and overwrite an arbitrary file.
+            if not is_valid_node_id(target):
+                unresolved += 1
+                problems.append(
+                    f"{rel}: promote.target {target!r} is not a valid node id "
+                    "('..'/traversal or malformed) — left in inbox"
+                )
+                continue
             entity_rel = note_path_for_node(target)
             entity_path = paths.root / entity_rel
             if not entity_path.is_file():
@@ -343,7 +363,12 @@ def consolidate(
                     already = None
             else:
                 already = None
-            if already == stamped:
+            # The archived copy differs from `stamped` only in the volatile
+            # `consolidated: <as_of>` date, so a byte-exact match would fail
+            # on any rerun the day AFTER the crash — minting a '-2' dest and
+            # (source unset) double-appending the fact line. Normalise that
+            # one line before comparing so the reuse fires on any day.
+            if already is not None and _same_promotion(already, stamped):
                 dest = plain_dest       # crash-rerun: archive write already done
                 reserved.add(plain_dest)
             else:
