@@ -304,3 +304,93 @@ def test_failed_reextraction_preserves_previous_assets(tmp_path: Path, monkeypat
     # The previous good asset must still exist (failed run preserved it).
     assert asset.is_file()
     assert asset.read_bytes() == b"figure-bytes"
+
+
+def test_index_note_lists_extracted_figures(tmp_path: Path):
+    # 1.a: image assets an extractor produces are listed in the index note's
+    # `figures:` frontmatter for fast visual review in Obsidian.
+    from ingest_lib.notes import NoteContent, write_index_note
+
+    target = tmp_path / "knowledge/index/uni/lec.pdf.md"
+    write_index_note(target=target, content=NoteContent(
+        title="Lec", source_relative_path="uni/lec.pdf", source_hash="h",
+        status="processed", extracted_markdown="body\n", processing_notes=[],
+        extractor="pdf-mineru",
+        figures=("archive/processed/uni/lec.pdf_assets/fig1.jpg",
+                 "archive/processed/uni/lec.pdf_assets/fig2.png"),
+    ))
+    text = target.read_text(encoding="utf-8")
+    assert "figures:" in text
+    assert "archive/processed/uni/lec.pdf_assets/fig1.jpg" in text
+    assert "fig2.png" in text
+
+
+def test_pipeline_records_image_figures_in_index_note(tmp_path: Path, monkeypatch):
+    from ingest_lib import pipeline as pl
+    from ingest_lib.extractors import ExtractionResult
+
+    paths = _vault(tmp_path)
+    raw = paths.archive_raw / "uni/doc.pdf"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"pdf-bytes")
+
+    def fake_dispatch(_src, relative_path=None):
+        def extract(src: Path, assets_dir: Path) -> ExtractionResult:
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            (assets_dir / "fig1.png").write_bytes(b"img")
+            (assets_dir / "table.html").write_text("<table></table>", encoding="utf-8")
+            return ExtractionResult(status="processed", extractor="stub",
+                                    markdown="body\n",
+                                    assets=[assets_dir / "fig1.png", assets_dir / "table.html"])
+        return extract
+
+    monkeypatch.setattr(pl, "dispatch_extractor", fake_dispatch)
+    plan = pl.plan_ingest(paths, sources=[paths.archive_raw], from_archive=True, logger=_LOG)
+    pl.run_ingest(paths, plan, dry_run=False, logger=_LOG)
+
+    note = (paths.knowledge_index / "uni/doc.pdf.md").read_text(encoding="utf-8")
+    # Exact vault-relative path (not a bare basename that an absolute or
+    # pre-swap temp path would also satisfy).
+    assert "- archive/processed/uni/doc.pdf_assets/fig1.png" in note
+    assert "table.html" not in note           # non-image asset not a "figure"
+
+
+def test_figures_refresh_and_drop_on_reingest(tmp_path: Path, monkeypatch):
+    # Managed key: figures refresh when they change, and the key is dropped
+    # entirely when a re-extraction yields none (no stale frontmatter).
+    from ingest_lib import pipeline as pl
+    from ingest_lib.extractors import ExtractionResult
+
+    paths = _vault(tmp_path)
+    raw = paths.archive_raw / "uni/doc.pdf"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    assets = {"n": 0}
+
+    def fake_dispatch(_src, relative_path=None):
+        def extract(src: Path, assets_dir: Path) -> ExtractionResult:
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            names = ([ "fig1.png" ], [ "figA.jpg" ], [])[assets["n"]]
+            for nm in names:
+                (assets_dir / nm).write_bytes(b"img")
+            return ExtractionResult(status="processed", extractor="stub",
+                                    markdown="body\n",
+                                    assets=[assets_dir / nm for nm in names])
+        return extract
+
+    monkeypatch.setattr(pl, "dispatch_extractor", fake_dispatch)
+
+    def ingest(bytes_):
+        raw.write_bytes(bytes_)
+        plan = pl.plan_ingest(paths, sources=[paths.archive_raw], from_archive=True, logger=_LOG)
+        pl.run_ingest(paths, plan, dry_run=False, logger=_LOG)
+        return (paths.knowledge_index / "uni/doc.pdf.md").read_text(encoding="utf-8")
+
+    assets["n"] = 0
+    n1 = ingest(b"v1")
+    assert "fig1.png" in n1
+    assets["n"] = 1
+    n2 = ingest(b"v2")
+    assert "figA.jpg" in n2 and "fig1.png" not in n2   # refreshed
+    assets["n"] = 2
+    n3 = ingest(b"v3")
+    assert "figures:" not in n3                          # dropped, no stale key

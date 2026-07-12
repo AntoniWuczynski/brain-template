@@ -14,12 +14,38 @@ a re-ingest of an archived snapshot is fully offline and deterministic.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from collections.abc import Iterator
 
 if TYPE_CHECKING:
     from .state import ConnectorState
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def meeting_filename(date: str, title: str, native_id: str) -> str:
+    """Collision-safe inbox filename ``<date>-<slug>-<8hex(id)>.json``. The
+    id hash guarantees two distinct meetings never share a filename even with
+    the same date and title (which would otherwise silently overwrite one)."""
+    slug = _SLUG_RE.sub("-", title.strip().lower()).strip("-") or "meeting"
+    sid = hashlib.sha1(native_id.encode("utf-8")).hexdigest()[:8]  # noqa: S324 - filename tag, not security
+    return f"{date or 'undated'}-{slug}-{sid}.json"
+
+
+def normalize_attendees(raw: object) -> list[str]:
+    """Attendee display names from a mixed list of strings / ``{'name': ...}``
+    dicts. Entries without a usable name are dropped (never the string
+    ``'None'``)."""
+    out: list[str] = []
+    if not isinstance(raw, list):
+        return out
+    for a in raw:
+        name = a.get("name") if isinstance(a, dict) else a
+        if isinstance(name, str) and name.strip():
+            out.append(name.strip())
+    return out
 
 
 @dataclass(frozen=True)

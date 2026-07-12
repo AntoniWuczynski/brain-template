@@ -1,0 +1,24 @@
+[Unit]
+Description=brain vault maintenance (consolidate + sweep)
+Documentation=https://github.com/AntoniWuczynski/brain-template/blob/main/scripts/README.md
+# Best-effort: prefer running when the MCP server is up but idle. There is no
+# cross-process write lock, so keep the timer at a quiet hour (see the .timer).
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=brain
+Group=brain
+WorkingDirectory=/srv/brain
+Environment=HF_HOME=/srv/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=/srv/brain/.cache
+# maintain.sh runs the venv interpreter directly; no uv needed at runtime.
+ExecStart=/srv/brain/scripts/maintain.sh
+
+# --- hardening (mirrors brain-mcp.service) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/brain
+UMask=0077

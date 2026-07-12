@@ -35,6 +35,10 @@ from .semantic import build_index as _build_search_index
 from .summarize import is_enabled as _summary_enabled, summarize as _summarize
 
 
+# Asset extensions counted as "figures" for the index note's figures: list.
+_FIGURE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".svg"})
+
+
 @dataclass(frozen=True)
 class PlannedItem:
     """One file scheduled for ingestion."""
@@ -403,6 +407,13 @@ def _process_one(
     full_notes = list(result.notes) + summary_notes
 
     # 5. Write the processed Markdown.
+    # Figures: the image assets this extraction produced (e.g. MinerU's
+    # figures/tables), vault-relative, for the index note's `figures:` list.
+    figures = tuple(
+        str(p.relative_to(paths.root))
+        for p in result.assets
+        if p.suffix.lower() in _FIGURE_EXTS
+    )
     note_payload = NoteContent(
         title=title,
         source_relative_path=rel,
@@ -414,6 +425,7 @@ def _process_one(
         summary=summary_text,
         key_points=tuple(key_points),
         topics=tuple(topics),
+        figures=figures,
     )
     write_processed_note(target=processed_target, content=note_payload)
 
@@ -546,6 +558,7 @@ def backfill_summaries(
             summary=out.summary,
             key_points=tuple(out.key_points),
             topics=tuple(out.topics),
+            figures=tuple(a for a in rec.assets if Path(a).suffix.lower() in _FIGURE_EXTS),
         )
         write_processed_note(target=processed_target, content=payload)
         if index_target is not None:

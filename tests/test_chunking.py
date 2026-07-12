@@ -269,3 +269,81 @@ def test_query_instruction_prepended_and_toggleable(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_QUERY_INSTRUCTION", "0")
     semantic.search(paths, "graphs", top_k=1, mode="dense")
     assert seen[-1] == "graphs"
+
+
+def test_sqlite_vec_tripwire_warns_past_threshold(caplog):
+    # 3.b: warn as the chunk count approaches the ~50k sqlite-vec migration
+    # point, and stay quiet below it.
+    import logging
+    from ingest_lib.semantic import _warn_if_index_large, _SQLITE_VEC_HINT_THRESHOLD
+
+    log = logging.getLogger("test.tripwire")
+    with caplog.at_level(logging.WARNING, logger="test.tripwire"):
+        _warn_if_index_large(_SQLITE_VEC_HINT_THRESHOLD - 1, log)
+    assert not caplog.records                       # below: silent
+
+    with caplog.at_level(logging.WARNING, logger="test.tripwire"):
+        _warn_if_index_large(_SQLITE_VEC_HINT_THRESHOLD, log)
+    assert any("sqlite-vec" in r.message or "sqlite-vec" in r.getMessage() for r in caplog.records)
+
+
+def test_heading_path_tracked_per_chunk():
+    # 9.a: each chunk carries the heading path in force at its start.
+    from ingest_lib.semantic import _pack_blocks_with_headings
+    p1 = "Directed content. " * 130   # > _TARGET_CHARS -> own chunk
+    p2 = "Undirected content. " * 130
+    doc = (
+        "# Graph Theory\n\n"
+        "## Directed Graphs\n\n" + p1 + "\n\n"
+        "## Undirected Graphs\n\n" + p2 + "\n"
+    )
+    pairs = _pack_blocks_with_headings(doc, min_chars=80)
+    kept = {("directed" if "Directed content" in t else "undirected"): h
+            for t, h in pairs if "content" in t}
+    assert kept["directed"] == "Graph Theory > Directed Graphs"
+    assert kept["undirected"] == "Graph Theory > Undirected Graphs"
+
+
+def test_embed_text_flag_off_is_raw_on_prepends_context(monkeypatch):
+    from ingest_lib.semantic import Chunk, _embed_text
+    c = Chunk(source_relative_path="uni/g.pdf", source_hash="h", title="COMP0005",
+              chunk_idx=3, text="a directed graph", origin="pdf-mineru",
+              heading_path="4 Graphs > 4.2 Directed")
+
+    monkeypatch.delenv("BRAIN_EMBED_HEADING_CONTEXT", raising=False)
+    assert _embed_text(c) == "a directed graph"          # default: raw
+
+    monkeypatch.setenv("BRAIN_EMBED_HEADING_CONTEXT", "1")
+    assert _embed_text(c) == "COMP0005 > 4 Graphs > 4.2 Directed\na directed graph"
+
+
+def test_embed_text_flag_on_without_heading_uses_title_only(monkeypatch):
+    from ingest_lib.semantic import Chunk, _embed_text
+    monkeypatch.setenv("BRAIN_EMBED_HEADING_CONTEXT", "1")
+    c = Chunk(source_relative_path="x", source_hash="h", title="Title",
+              chunk_idx=0, text="body", heading_path="")
+    assert _embed_text(c) == "Title\nbody"
+
+
+def test_heading_stack_ignores_fenced_code_comments():
+    # 9.a fence-awareness: a '# comment' inside a ``` code fence must NOT be
+    # treated as a section heading.
+    from ingest_lib.semantic import _pack_blocks_with_headings
+    body = "content " * 20
+    doc = (
+        "# Real Section\n\n"
+        "```python\n\n"
+        "# not a heading — a code comment\n\n"
+        "```\n\n"
+        + body + "\n"
+    )
+    pairs = _pack_blocks_with_headings(doc, min_chars=80)
+    heads = {h for t, h in pairs if "content" in t}
+    assert heads == {"Real Section"}                 # not "Real Section > not a heading..."
+
+
+def test_chunk_markdown_byte_identical_with_fence_tracking():
+    # The fence guard must not change chunk TEXT (only heading_path values).
+    from ingest_lib.semantic import chunk_markdown, _pack_blocks_with_headings
+    doc = "# H\n\n```\n# x\n```\n\n" + ("word " * 60) + "\n"
+    assert chunk_markdown(doc) == [t for t, _h in _pack_blocks_with_headings(doc, 80)]

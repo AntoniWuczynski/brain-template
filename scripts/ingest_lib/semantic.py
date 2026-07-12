@@ -54,6 +54,19 @@ from .notes import _split_frontmatter
 
 
 _MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# Soft tripwire: below ~50k chunks the flat npy + JSONL store is fine; past
+# it a linear matmul per query starts to bite (see TODO.md: migrate to
+# sqlite-vec). Warn at 80% so there's runway before it matters.
+_SQLITE_VEC_HINT_THRESHOLD = 40_000
+
+
+def _warn_if_index_large(chunk_count: int, logger: logging.Logger) -> None:
+    if chunk_count >= _SQLITE_VEC_HINT_THRESHOLD:
+        logger.warning(
+            "semantic: %d chunks indexed — approaching the ~50k point where the "
+            "flat npy+JSONL store gets slow. Consider migrating to sqlite-vec "
+            "(TODO.md).", chunk_count,
+        )
 _TARGET_TOKENS = 400          # rough budget per chunk; English ≈ chars/4
 _TARGET_CHARS = _TARGET_TOKENS * 4
 _MIN_CHARS = 80               # skip tiny chunks (headings on their own line)
@@ -100,6 +113,7 @@ class Chunk:
     chunk_idx: int              # 0-based, within the source
     text: str
     origin: str = ""            # the record's extractor (e.g. "knowledge-note")
+    heading_path: str = ""      # e.g. "4 Graphs > 4.2 Directed" (for context)
 
 
 @dataclass(frozen=True)
@@ -169,6 +183,72 @@ def _split_into_blocks(text: str) -> list[str]:
     return [b.strip() for b in blocks if b.strip()]
 
 
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
+
+
+def _update_heading_stack(stack: list[tuple[int, str]], block: str) -> None:
+    """If ``block`` is a lone ATX heading line, fold it into the running
+    heading stack (`##` closes any `##`/deeper, then pushes)."""
+    if "\n" in block:
+        return
+    m = _HEADING_LINE_RE.match(block.strip())
+    if not m:
+        return
+    level = len(m.group(1))
+    htext = m.group(2).strip()
+    while stack and stack[-1][0] >= level:
+        stack.pop()
+    stack.append((level, htext))
+
+
+def _pack_blocks_with_headings(text: str, min_chars: int) -> list[tuple[str, str]]:
+    """Greedy-pack paragraphs into ~``_TARGET_CHARS`` chunks, tracking the
+    heading path in force at each chunk's start. Returns ``(chunk_text,
+    heading_path)`` pairs; the ``chunk_text`` is byte-identical to what
+    ``chunk_markdown`` produced before heading tracking was added."""
+    blocks = _split_into_blocks(_strip_processed_header(text))
+    stack: list[tuple[int, str]] = []
+    chunks: list[tuple[str, str]] = []
+    buf: list[str] = []
+    buf_len = 0
+    buf_head = ""
+    in_fence = False   # inside a ``` / ~~~ code fence: '# x' lines aren't headings
+    for block in blocks:
+        started_in_fence = in_fence
+        for ln in block.splitlines():
+            s = ln.lstrip()
+            if s.startswith("```") or s.startswith("~~~"):
+                in_fence = not in_fence
+        # Only update the heading stack for a block that is wholly OUTSIDE any
+        # code fence — a '# comment' inside fenced code is not a section head.
+        if not started_in_fence and not in_fence:
+            _update_heading_stack(stack, block)
+        cur_head = " > ".join(h for _lvl, h in stack)
+        block_len = len(block)
+        if buf and buf_len + block_len + 2 > _TARGET_CHARS:
+            chunks.append(("\n\n".join(buf), buf_head))
+            buf = [block]
+            buf_len = block_len
+            buf_head = cur_head
+        elif block_len > _TARGET_CHARS:
+            # Block is bigger than the budget. Flush what we've got and
+            # emit the oversize block on its own. Don't split a paragraph
+            # mid-sentence: things like extracted tables arrive as one
+            # giant block and splitting them hurts retrieval.
+            if buf:
+                chunks.append(("\n\n".join(buf), buf_head))
+                buf, buf_len = [], 0
+            chunks.append((block, cur_head))
+        else:
+            if not buf:
+                buf_head = cur_head
+            buf.append(block)
+            buf_len += block_len + 2
+    if buf:
+        chunks.append(("\n\n".join(buf), buf_head))
+    return [(t, h) for t, h in chunks if len(t) >= min_chars]
+
+
 def chunk_markdown(text: str, *, min_chars: int = _MIN_CHARS) -> list[str]:
     """Greedy-pack paragraphs into ~``_TARGET_CHARS`` chunks.
 
@@ -177,31 +257,7 @@ def chunk_markdown(text: str, *, min_chars: int = _MIN_CHARS) -> list[str]:
     a one-line memory-fact note is legitimately short, and dropping it would
     make the fact permanently unsearchable AND permanently flag it as
     index drift in the sweep."""
-    blocks = _split_into_blocks(_strip_processed_header(text))
-    chunks: list[str] = []
-    buf: list[str] = []
-    buf_len = 0
-    for block in blocks:
-        block_len = len(block)
-        if buf and buf_len + block_len + 2 > _TARGET_CHARS:
-            chunks.append("\n\n".join(buf))
-            buf = [block]
-            buf_len = block_len
-        elif block_len > _TARGET_CHARS:
-            # Block is bigger than the budget. Flush what we've got and
-            # emit the oversize block on its own. Don't split a paragraph
-            # mid-sentence: things like extracted tables arrive as one
-            # giant block and splitting them hurts retrieval.
-            if buf:
-                chunks.append("\n\n".join(buf))
-                buf, buf_len = [], 0
-            chunks.append(block)
-        else:
-            buf.append(block)
-            buf_len += block_len + 2
-    if buf:
-        chunks.append("\n\n".join(buf))
-    return [c for c in chunks if len(c) >= min_chars]
+    return [t for t, _h in _pack_blocks_with_headings(text, min_chars)]
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +416,11 @@ def _chunks_for_record(rec: IndexRecord, paths: VaultPaths) -> list[Chunk]:
             chunk_idx=i,
             text=chunk,
             origin=rec.extractor,
+            heading_path=heading_path,
         )
-        for i, chunk in enumerate(chunk_markdown(text, min_chars=min_chars))
+        for i, (chunk, heading_path) in enumerate(
+            _pack_blocks_with_headings(text, min_chars)
+        )
     ]
 
 
@@ -375,8 +434,26 @@ def _meta_row(c: Chunk) -> dict[str, object]:
         "chunk_idx": c.chunk_idx,
         "text": c.text,
         "origin": c.origin,
+        "heading_path": c.heading_path,
         "model": _MODEL_NAME,
     }
+
+
+def _embed_text(c: Chunk) -> str:
+    """The string actually sent to the embedder for chunk ``c``.
+
+    Default: the raw chunk text (the on-disk ``text`` / BM25 source). With
+    ``BRAIN_EMBED_HEADING_CONTEXT=1`` the chunk's title + heading path is
+    prepended so a lecture-slide paragraph embeds with its section context
+    (e.g. "COMP0005 > 4.2 Directed Graphs\\n<text>"). This changes the
+    passage vectors, so enabling it requires a full ``--rebuild-search-index``;
+    measure the effect with ``scripts/eval_retrieval.py --compare-modes`` /
+    ``--write-report`` before keeping it (see TODO.md / IDEAS.md)."""
+    if os.environ.get("BRAIN_EMBED_HEADING_CONTEXT", "0") != "1":
+        return c.text
+    parts = [p for p in (c.title, c.heading_path) if p]
+    ctx = " > ".join(parts)
+    return f"{ctx}\n{c.text}" if ctx else c.text
 
 
 def _write_index_files(
@@ -453,6 +530,7 @@ def build_index(
             "semantic: encoding %d chunk(s) from %d source(s)",
             len(chunks), len(records),
         )
+        _warn_if_index_large(len(chunks), logger)
 
         try:
             import numpy as np  # type: ignore[import-not-found]
@@ -475,7 +553,7 @@ def build_index(
 
         logger.info("semantic: model %s on %s", _MODEL_NAME, device)
 
-        texts = [c.text for c in chunks]
+        texts = [_embed_text(c) for c in chunks]
         vectors = model.encode(
             texts,
             normalize_embeddings=True,
@@ -653,7 +731,7 @@ def upsert_notes(
 
             new_vecs = None
             if new_chunks:
-                texts = [c.text for c in new_chunks]
+                texts = [_embed_text(c) for c in new_chunks]
                 if encode is not None:
                     new_vecs = np.asarray(encode(texts), dtype=np.float32)
                 else:

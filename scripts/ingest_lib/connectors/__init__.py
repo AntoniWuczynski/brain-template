@@ -17,11 +17,17 @@ from .base import Connector, Snapshot
 from .runner import PullStats, run_connector
 from .state import ConnectorState, load_state, save_state
 
-# name -> factory. Concrete connectors append themselves here (kept a factory,
-# not an instance, so import stays side-effect-free and env is read at run time).
+# name -> factory. Kept factories (not instances) so importing this package
+# stays side-effect-free and each connector reads its env/creds at run time.
 from collections.abc import Callable
 
-CONNECTORS: dict[str, Callable[[], Connector]] = {}
+from .granola import GranolaConnector
+from .justrec import JustrecConnector
+
+CONNECTORS: dict[str, Callable[[], Connector]] = {
+    "granola": GranolaConnector,
+    "justrec": JustrecConnector,
+}
 
 __all__ = [
     "Connector",
