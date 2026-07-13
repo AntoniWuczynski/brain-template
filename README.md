@@ -269,6 +269,10 @@ environment stanza.
 
 ### Skills and human interface
 
+- **The `brain-setup` skill** lets an agent set the whole vault up for a person
+  from a fresh clone or template copy — environment, LLM provider, optional
+  MinerU and MCP server, and an end-to-end smoke test — idempotently, asking
+  before anything slow or paid.
 - **The `brain-project-note` skill** captures the project or session you are
   working in — from any repository — into `knowledge/projects/<slug>/`, keyed by
   git remote so one project maps to one folder. It writes only through MCP and
@@ -312,6 +316,12 @@ environment stanza.
   The summarizer auto-detects from whichever key is present, or you can pin a choice with `BRAIN_LLM_PROVIDER`. Without any provider configured, ingestion still works but the index notes show placeholders instead of summaries.
 
 ## Setup
+
+> **Prefer to let an agent do it?** Open this repo in Claude Code and say
+> *"set up the brain"*. The bundled **`brain-setup`** skill walks the whole
+> flow below for you — environment, LLM provider, the optional MinerU and MCP
+> pieces, and an end-to-end check — asking before anything slow or paid. The
+> manual steps follow if you'd rather do it yourself.
 
 ```bash
 git clone <your-fork-url> brain
@@ -426,6 +436,8 @@ Two patterns work well today:
 **As an oracle in this repo.** Ask Claude Code from `~/brain/` itself: *"What does my vault say about X?"*, *"Quiz me on COMP0023"*, *"Find sources that connect Y and Z"*. The agent has read access to everything; it can grep, read processed Markdown, follow wikilinks, and synthesise across sources with citations.
 
 **Over MCP, from anywhere.** The [Model Context Protocol](https://modelcontextprotocol.io) server in `mcp_server/` (FastAPI + FastMCP) exposes the vault to any MCP client: semantic search, read, directory listing, metadata/concept-graph queries, and bearer-authenticated writes confined to `knowledge/` (every write is committed to git). Run it locally with `mcp_server/run-local.sh` and register it with `claude mcp add` (contract in `mcp/README.md`; remote deploy behind Cloudflare Access in `mcp/DEPLOY.md`). The bundled **`brain-project-note`** skill in `.claude/skills/` builds on it: from *any* repo on your machine, it summarises the project and session you're working on into `knowledge/projects/<slug>/` — a full-rewrite overview note plus dated session logs. Install it globally with `cp -r .claude/skills/brain-project-note ~/.claude/skills/`.
+
+**To set the whole thing up — the way the maintainer runs it.** The bundled **`brain-setup`** skill (also in `.claude/skills/`) drives onboarding: open this repo in Claude Code, say *"set up the brain"*, and it detects what's already done, runs `uv sync`, configures a provider in `.env`, optionally installs MinerU and registers the MCP server, and verifies the pipeline end-to-end. It then wires the **global `~/.claude` integration** so the vault works as cross-session memory in *every* project — installing both skills globally, the `brain_memory_sync.py` hook (loads vault context at session start, nudges a distilled note at session end), its three `settings.json` entries, and a "Brain vault" section for your global `CLAUDE.md`. Those global pieces ship with the skill in its `global/` directory. It is idempotent and asks before anything slow, paid, or touching `~/.claude`.
 
 ## Extending
 

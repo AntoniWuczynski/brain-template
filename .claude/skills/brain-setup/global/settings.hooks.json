@@ -1,0 +1,39 @@
+{
+  "_comment": "Merge these three entries into the `hooks` object of ~/.claude/settings.json (create the file if absent). They wire brain_memory_sync.py — which must sit at ~/.claude/hooks/brain_memory_sync.py — to load vault context at session start (session), flag project/memory edits (mark), and nudge a distilled brain write at session end (check). Merge additively: if the user already has SessionStart/PostToolUse/Stop entries, append to those arrays rather than replacing them.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/brain_memory_sync.py\" session",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/brain_memory_sync.py\" mark",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/brain_memory_sync.py\" check",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
