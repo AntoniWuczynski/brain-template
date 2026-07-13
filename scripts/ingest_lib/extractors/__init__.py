@@ -8,9 +8,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from .base import ExtractionResult, Extractor
+from . import audio as _audio_mod
 from . import dataset as _dataset_mod
 from . import docx as _docx_mod
 from . import image as _image_mod
+from . import meeting as _meeting_mod
 from . import notebook as _notebook_mod
 from . import pdf as _pdf_mod
 from . import pptx as _pptx_mod
@@ -62,6 +64,10 @@ _REGISTRY: dict[str, Extractor] = {
     # LLM transcribes/describes them. Falls back to manual_review with no
     # vision backend — never a hallucinated caption.
     **{ext: _image_mod.extract for ext in _image_mod.IMAGE_EXTENSIONS},
+    # Subtitles/transcripts (deterministic) + audio (local Whisper, else
+    # manual_review with the install command).
+    **{ext: _audio_mod.extract for ext in _audio_mod.SUBTITLE_EXTENSIONS},
+    **{ext: _audio_mod.extract for ext in _audio_mod.AUDIO_EXTENSIONS},
 }
 
 
@@ -70,8 +76,10 @@ _REGISTRY: dict[str, Extractor] = {
 # Connector snapshots (see ``ingest_lib.connectors``) land under a
 # source-class directory and are often ``.json`` — an extension the suffix
 # map already assigns to ``text.py`` — so they need path-based routing.
-# Empty until a connector registers its extractor here.
-_SOURCE_CLASS_REGISTRY: dict[str, Extractor] = {}
+_SOURCE_CLASS_REGISTRY: dict[str, Extractor] = {
+    "meetings/granola/": _meeting_mod.extract,
+    "meetings/justrec/": _meeting_mod.extract,
+}
 
 
 def dispatch_extractor(path: Path, relative_path: str | None = None) -> Extractor | None:

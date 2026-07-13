@@ -25,6 +25,9 @@ class NoteContent:
     summary: str = ""
     key_points: tuple[str, ...] = ()
     topics: tuple[str, ...] = ()
+    # Vault-relative paths to extracted figure images (for the index note's
+    # `figures:` frontmatter — fast visual review in Obsidian).
+    figures: tuple[str, ...] = ()
 
 
 def _utc_now_iso() -> str:
@@ -202,7 +205,14 @@ def write_index_note(
         "updated": now_iso,
         "status": content.status,
     }
+    # figures is a managed key: always set (refreshed each ingest) so a
+    # re-extraction with different figures doesn't leave a stale list.
+    if content.figures:
+        generated_fm["figures"] = list(content.figures)
     merged_fm = _merge_frontmatter(existing_fm, generated=generated_fm)
+    # Drop a stale figures list if this extraction produced none.
+    if not content.figures:
+        merged_fm.pop("figures", None)
     # Topics merge: take the union of auto-extracted and user-edited.
     if content.topics:
         raw_topics = merged_fm.get("topics")

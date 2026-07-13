@@ -459,3 +459,112 @@ def test_image_undecodable_file_is_manual_review(tmp_path: Path, monkeypatch):
     res = image_ex.extract(src, tmp_path / "a")
     assert res.status == "manual_review"
     assert "decode" in (res.error or "").lower()
+
+
+# ------------------------------------------------------------------ audio.py
+
+def test_srt_transcript_extracted(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    srt = (
+        "1\n00:00:01,000 --> 00:00:03,000\nHello and welcome.\n\n"
+        "2\n00:00:03,000 --> 00:00:05,000\nHello and welcome.\n\n"   # duplicate (rolling)
+        "3\n00:01:10,000 --> 00:01:12,000\nNow the second minute.\n"
+    )
+    src = tmp_path / "talk.srt"
+    src.write_text(srt, encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "processed"
+    assert "## Transcript" in res.markdown
+    assert "Now the second minute." in res.markdown
+    assert res.markdown.count("Hello and welcome.") == 1   # dedupe
+    assert "**[0:01]**" in res.markdown and "**[1:10]**" in res.markdown  # segment markers
+
+
+def test_vtt_with_tags_and_dot_times(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    vtt = (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:02.000\n<v Alice>Hi <b>there</b></v>\n\n"
+        "00:00:02.000 --> 00:00:04.000\nSecond line.\n"
+    )
+    src = tmp_path / "call.vtt"
+    src.write_text(vtt, encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "processed"
+    assert "Hi there" in res.markdown        # inline tags stripped
+    assert "<v" not in res.markdown and "<b>" not in res.markdown
+
+
+def test_unparseable_subtitle_is_manual_review(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    src = tmp_path / "bad.srt"
+    src.write_text("this has no timing lines at all\n", encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "manual_review"
+    assert "no parseable subtitle cues" in (res.error or "")
+
+
+def test_audio_without_asr_backend_is_manual_review(tmp_path: Path, monkeypatch):
+    # No faster-whisper installed -> honest manual_review with the install cmd.
+    import builtins
+    from ingest_lib.extractors import audio as audio_ex
+    real_import = builtins.__import__
+
+    def _no_whisper(name, *args, **kw):
+        if name == "faster_whisper":
+            raise ImportError("no faster_whisper")
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_whisper)
+    src = tmp_path / "lecture.m4a"
+    src.write_bytes(b"not really audio")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "manual_review"
+    assert "faster-whisper" in (res.error or "") and "ffmpeg" in (res.error or "")
+
+
+def test_audio_extensions_registered():
+    from ingest_lib.extractors import dispatch_extractor
+    from ingest_lib.extractors import audio as audio_ex
+    from pathlib import Path as P
+    assert dispatch_extractor(P("x.srt")) is audio_ex.extract
+    assert dispatch_extractor(P("x.m4a")) is audio_ex.extract
+    assert dispatch_extractor(P("x.vtt")) is audio_ex.extract
+
+
+def test_vtt_note_and_header_blocks_skipped(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    vtt = (
+        "WEBVTT\n\n"
+        "NOTE this is a comment with a stray --> arrow 00:00:00,000\n\n"
+        "00:00:01.000 --> 00:00:02.000\nReal line.\n"
+    )
+    src = tmp_path / "c.vtt"
+    src.write_text(vtt, encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "processed"
+    assert "Real line." in res.markdown
+    assert "this is a comment" not in res.markdown   # NOTE block not a cue
+
+
+def test_subtitle_unparseable_timing_marks_partial(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    srt = (
+        "1\n00:00:01,000 --> 00:00:02,000\nGood cue.\n\n"
+        "2\nBADTIME --> ALSOBAD\nOrphan cue text.\n"
+    )
+    src = tmp_path / "d.srt"
+    src.write_text(srt, encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert res.status == "partial"                    # honest about the dropped cue
+    assert any("dropped" in n for n in res.notes)
+    assert "Good cue." in res.markdown
+
+
+def test_subtitle_tag_strip_keeps_literal_angle_brackets(tmp_path: Path):
+    from ingest_lib.extractors import audio as audio_ex
+    srt = "1\n00:00:01,000 --> 00:00:02,000\nif x < 3 and y > 2 then done\n"
+    src = tmp_path / "e.srt"
+    src.write_text(srt, encoding="utf-8")
+    res = audio_ex.extract(src, tmp_path / "a")
+    assert "x < 3 and y > 2" in res.markdown           # not eaten as a tag

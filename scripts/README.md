@@ -68,6 +68,12 @@ never synced to the template.
   applied at query time only, needs **no** reindex, and is keyed to the model
   name (a model swap won't apply the wrong prefix). A/B it with the eval
   harness by setting ``BRAIN_QUERY_INSTRUCTION=0`` to disable.
+- **Heading-path context (opt-in).** Set ``BRAIN_EMBED_HEADING_CONTEXT=1`` to
+  embed each chunk with its ``{title} > {heading_path}`` prefix (a lecture
+  slide then carries its section context). This changes the *passage* vectors,
+  so it needs a full ``--rebuild-search-index``; measure with
+  ``eval_retrieval.py --compare-modes`` before keeping it. The on-disk
+  ``text`` (snippet + BM25 source) is unchanged.
 - **Only ``status: processed`` records are indexed.** ``partial`` notes —
   every PDF extracted by the pypdf fallback when MinerU isn't installed —
   are deliberately **not** searchable, so on a MinerU-less machine
@@ -307,6 +313,19 @@ concurrent MCP write could race the same note or the git index.
 | `--dry-run` | off | Plan but write nothing (still creates a log file) |
 | `--no-reindex` | off | Skip the post-run enrichment refresh (semantic upsert + connection graph + concept notes) |
 
+### Scheduling
+
+`scripts/maintain.sh` is the single entry point that runs `consolidate` then
+`sweep --write-report` — deterministic, exit 0, safe to run by hand or on a
+schedule (`scripts/maintain.sh --dry-run` to plan only). It prefers the repo
+`.venv` interpreter so a scheduler needs no `uv` on PATH. Schedule it for a
+quiet hour (no cross-process lock vs a running MCP server):
+
+- **macOS** — `mcp_server/launchd/com.brain.maintenance.plist` (edit
+  `REPO_ROOT`, `cp` to `~/Library/LaunchAgents/`, `launchctl load` it).
+- **Linux** — `mcp_server/systemd/brain-maintenance.{service,timer}`
+  (`systemctl enable --now brain-maintenance.timer`).
+
 ## Connectors (pull external sources)
 
 `scripts/pull.py` pulls an external source into the vault as archivable
@@ -334,9 +353,18 @@ map, so a `.json` snapshot under `meetings/granola/` routes to the right
 extractor instead of the generic text one). Exits 0, so it is cron/launchd-
 safe like `sweep`/`consolidate`. Secrets come from `.env` — never a flag.
 
-No concrete connectors ship yet (the contract landed first); adding one is a
-`pull()` + an extractor + an `.env` stanza. See `IDEAS.md` §4 (meeting
-connector) for the first planned plugin.
+**Shipped connectors** (both meeting sources normalise to one snapshot schema
+routed to `extractors/meeting.py` — title, date, attendees as `people/`
+wikilinks, summary, transcript):
+
+- **`granola`** — pulls meetings from the Granola API (`GRANOLA_API_KEY`).
+- **`justrec`** — reads justREC's local export folder (`BRAIN_JUSTREC_DIR`),
+  no API/auth.
+
+Adding another connector is a `pull()` + an extractor + an `.env` stanza.
+Follow-up for meetings: promote each into a first-class `knowledge/meetings/`
+note with typed `attended` relations (needs the attendee people notes to
+exist first). See `IDEAS.md` §4.
 
 ## Source-grounded concept descriptions
 
@@ -451,6 +479,15 @@ whiteboard, screenshot or scan is transcribed/described by the same vision
 model (reusing the handwriting extractor's dispatch and honest
 `[illegible]`/never-invent rules); with no vision backend configured the
 image is marked `manual_review`, never captioned from nothing.
+
+**Audio & subtitles** (`extractors/audio.py`): `.vtt`/`.srt` transcripts parse
+deterministically into a timestamped Markdown transcript (no model, no system
+deps). Audio (`.m4a` `.mp3` `.wav` `.ogg` `.flac` `.m4b` `.aac`) is transcribed
+with a local Whisper model when installed — activate with
+`uv pip install faster-whisper` (it bundles audio decoding via PyAV; a system
+`ffmpeg` is only needed for exotic codecs). Model via `BRAIN_WHISPER_MODEL`
+(default `base`). Without the ASR backend the audio is marked `manual_review`
+with the install command — never a fabricated transcript.
 
 MinerU is deliberately *not* in `pyproject.toml`'s lockfile because
 some of its transitive deps are pre-releases. The ingestion script

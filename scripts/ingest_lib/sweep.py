@@ -14,6 +14,8 @@ Finding categories (exact strings):
 - ``archive-corrupt``            raw file whose bytes no longer match its
                                  recorded source_hash (opt-in; re-hashes
                                  archive/raw)
+- ``archive-processed-large``    processed tree past the git-vs-git-lfs
+                                 decision size (a few hundred MB)
 - ``missing-artifact``           record's processed/index note missing
 - ``dangling-wikilink``          ``[[target]]`` that resolves to nothing
 - ``relation-problem``           parse_relations problems, verbatim
@@ -99,6 +101,7 @@ def run_sweep(
 
     findings: list[Finding] = []
     findings += _check_archive(paths, latest, check_integrity=check_integrity)
+    findings += _check_archive_processed_size(paths)
     findings += _check_wikilinks(paths)
     findings += _check_relations(paths)
     findings += _check_fragmentation(list(latest.values()) + knowledge_recs)
@@ -215,6 +218,42 @@ def _check_archive(
                     f"{label} missing on disk: {artifact}",
                 ))
     return findings
+
+
+# Tripwire for the "keep archive/processed under git vs git-lfs" decision
+# (TODO.md): once the regenerable processed tree passes a few hundred MB it
+# starts to bloat the git pack, at which point git-lfs (or dropping it from
+# git, since it is regenerable) is worth deciding.
+_PROCESSED_SIZE_THRESHOLD_BYTES = 300 * 1024 * 1024
+
+
+def _check_archive_processed_size(
+    paths: VaultPaths, *, threshold_bytes: int | None = None
+) -> list[Finding]:
+    """archive-processed-large: flag when archive/processed grows past the
+    git-vs-git-lfs decision point. Cheap: sums file sizes, reads nothing.
+
+    The threshold is read at call time (not bound as a default) so the module
+    constant can be monkeypatched in tests."""
+    if threshold_bytes is None:
+        threshold_bytes = _PROCESSED_SIZE_THRESHOLD_BYTES
+    if not paths.archive_processed.is_dir():
+        return []
+    total = 0
+    for f in paths.archive_processed.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue
+    if total < threshold_bytes:
+        return []
+    mb = total / (1024 * 1024)
+    return [Finding(
+        "archive-processed-large", "archive/processed",
+        f"regenerable processed tree is {mb:.0f} MB (>= {threshold_bytes // (1024*1024)} MB) "
+        "— decide git-lfs vs dropping it from git (it's regenerable)",
+    )]
 
 
 def _has_stem_sibling(candidate: Path) -> bool:

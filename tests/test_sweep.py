@@ -410,3 +410,33 @@ def test_integrity_check_flags_corrupted_raw_only_when_enabled(tmp_path: Path) -
     corrupt = [f for f in checked.findings if f.category == "archive-corrupt"]
     assert [f.path for f in corrupt] == ["bad.txt"]
     assert "immutable" in corrupt[0].detail
+
+
+def test_archive_processed_size_tripwire(tmp_path: Path) -> None:
+    from ingest_lib.sweep import _check_archive_processed_size
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    (paths.archive_processed / "a.md").parent.mkdir(parents=True, exist_ok=True)
+    (paths.archive_processed / "a.md").write_bytes(b"x" * 2048)
+
+    # Below a high threshold: silent.
+    assert _check_archive_processed_size(paths, threshold_bytes=10**9) == []
+    # Above a tiny threshold: one finding.
+    findings = _check_archive_processed_size(paths, threshold_bytes=1024)
+    assert [f.category for f in findings] == ["archive-processed-large"]
+    assert "git-lfs" in findings[0].detail
+
+
+def test_run_sweep_wires_archive_processed_size(tmp_path: Path, monkeypatch):
+    # Pin the wiring in run_sweep (not just the helper): a big processed tree
+    # produces the finding through the full sweep.
+    import ingest_lib.sweep as sweep_mod
+    monkeypatch.setattr(sweep_mod, "_PROCESSED_SIZE_THRESHOLD_BYTES", 1024)
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    (paths.archive_processed / "big.md").parent.mkdir(parents=True, exist_ok=True)
+    (paths.archive_processed / "big.md").write_bytes(b"x" * 4096)
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+    cats = {f.category for f in report.findings}
+    assert "archive-processed-large" in cats

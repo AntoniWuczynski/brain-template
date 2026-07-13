@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: run the vault maintenance pass daily.
+  Install:  cp this to ~/Library/LaunchAgents/ (edit the paths first),
+            then: launchctl load ~/Library/LaunchAgents/com.brain.maintenance.plist
+  Edit REPO_ROOT to your vault path. Runs at 04:00 local; RunAtLoad off so it
+  won't fire the moment you load it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brain.maintenance</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_ROOT/scripts/maintain.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/maintain.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/maintain.err.log</string>
+</dict>
+</plist>
