@@ -49,6 +49,254 @@ brain/
 
 Four layers, four concerns: **archive** is ground truth, **processed** is regenerable extraction, **knowledge** is the curated face, **metadata** is machine state. Agents are expected to read everywhere and write only under `knowledge/`.
 
+## Features — everything the brain can do
+
+A complete catalogue of what the vault ingests, produces, answers and
+remembers, and how you drive it. Read it as a menu rather than a tutorial — the
+sections below (Setup, Daily use, How agents use it) show how to run each piece.
+
+### Ingest almost any file
+
+Drop a file in `inbox/`, run one command, and it is copied to immutable
+ground truth, extracted to Markdown, indexed and cross-linked. Supported
+sources and their extractors:
+
+- **PDFs** — full extraction with MinerU (PaddleOCR layout, optical character
+  recognition and UniMerNet formulas) into Markdown plus separate
+  figure/table/formula image assets. Falls back to text-only `pypdf` when
+  MinerU isn't installed, and to a page-by-page vision transcription
+  (`BRAIN_PDF_EXTRACTOR=vlm`) for handwriting and scans.
+- **Office documents** — `.docx` (paragraphs, tables, text boxes and content
+  controls) and `.pptx` (per-slide text, tables and speaker notes).
+- **Notebooks** — `.ipynb` markdown, code and raw cells, fenced by kernel
+  language.
+- **Datasets** — `.csv`, `.tsv`, `.jsonl` and a `.parquet` stub, extracted as
+  schema plus a short preview, never a full row dump.
+- **Plain text and source code** — `.md`, `.txt`, `.rst` and about twenty
+  code extensions, fenced with the right language tag (5 MiB cap).
+- **Images** — `.jpg`, `.png`, `.webp`, `.gif`, `.bmp`, `.tiff`, plus
+  `.heic`/`.heif`, each transcribed or described by a vision model.
+- **Audio and subtitles** — `.vtt`/`.srt` parsed deterministically into a
+  timestamped transcript, and `.m4a`/`.mp3`/`.wav`/`.ogg`/`.flac`/`.m4b`/`.aac`
+  transcribed locally with faster-whisper.
+- **Meeting snapshots** — Granola and justREC exports routed to a dedicated
+  meeting extractor by path prefix, so a `.json` snapshot never lands as
+  generic text.
+
+New file types are a single `extract(src, assets_dir) -> ExtractionResult`
+function plus a registry line — the command-line interface picks it up
+automatically.
+
+### Honest, deterministic, idempotent processing
+
+- **Idempotent by SHA-256.** A file whose hash already sits in
+  `metadata/index.jsonl` as `processed` is skipped. Change the file and it
+  re-processes, appending a fresh record.
+- **Immutable ground truth.** `archive/raw/` is never modified. An inbox file
+  that clashes with an existing raw file by content is refused, not
+  overwritten.
+- **Atomic everything.** Metadata lines, notes and side-assets are written to a
+  temp file, fsynced and renamed. A crash can lose at most one record, never
+  merge two. Extraction runs in a temp assets directory swapped in only on
+  success, so a failed re-ingest leaves the previous good extraction intact.
+- **Honest extraction.** A PDF that fails is marked `partial` (text-only) or
+  `manual_review` (moved to `archive/failed/` with the error kept verbatim). No
+  summary is ever invented from a filename.
+- **Frontmatter merge on re-ingest.** Generated keys are refreshed while your
+  hand-added `topics`, `aliases` and other keys are preserved, and `created` is
+  immutable once set.
+- **Everything logged.** Every run, including a dry run, writes a timestamped
+  log to `logs/`, and a non-fatal enrichment failure never aborts a run whose
+  files were already recorded.
+- **Preview first.** `--dry-run` reports the plan (counts, sizes, extractor,
+  model-download warnings) and writes nothing.
+
+### Search and ask
+
+- **Semantic search** over every processed source and every curated note,
+  using a local `bge-small-en-v1.5` model (no API calls, no cost).
+- **Lexical search** (a BM25 ranking) for exact identifiers — course codes,
+  project slugs, error strings — that a small embedding model ranks poorly. It
+  needs no model weights at all.
+- **Hybrid search** (the default) fuses the two with reciprocal-rank fusion,
+  and falls back to lexical automatically if the embedding model won't load.
+- **Ask the vault** — `scripts/ask.py "question"` retrieves the top chunks and
+  answers with inline citations through your configured provider, writing
+  nothing to disk. Works fully offline against a local model.
+- **Expand a hit** into its neighbouring chunks without reading the whole file.
+- **Memory-flavoured search** re-ranks the same index by recency and status, so
+  "what do I currently know about X" surfaces fresh notes over stale ones.
+- **Retrieval evaluation** — score the live search path (recall@k and mean
+  reciprocal rank) against a golden query set, compare dense/lexical/hybrid side
+  by side, and mine real queries out of the access log to grow the golden set.
+
+### Automatic organisation: concepts and the connection graph
+
+- **Concept notes.** Every topic tag becomes one `knowledge/concepts/<slug>.md`
+  note listing every source and curated note that mentions it, with a snippet
+  per source. Case and punctuation drift collapses to a single note, and your
+  hand-written thoughts below the marker survive every rebuild.
+- **A connection graph** derived with no database from three signals:
+  co-occurrence (topics tagged on the same document), semantic similarity
+  (cosine between anisotropy-corrected concept centroids, as a k-nearest-
+  neighbour graph) and typed entity relations. All three ride in one
+  `metadata/connections.jsonl` file.
+- **Related-concepts blocks** rendered into each concept note, and a
+  `vault_related` query for ranked neighbours.
+- **Entity dashboards** — one auto-generated table per group (people,
+  organisations, projects, meetings) under `knowledge/index/entities/`.
+- **Status dashboards** — a processing overview, a manual-review queue with
+  retry commands, and a "Now" view of recent and needs-attention sources.
+- **Curated notes count as sources.** Your hand-written notes feed concepts,
+  the graph and search exactly like ingested documents, without touching the
+  ingest metadata.
+
+### Optional AI enrichment (all cached, all opt-in)
+
+- **Document summaries** — a faithful summary, key points and 3–8 canonical
+  topic tags per source, through one of four interchangeable providers
+  (Anthropic, OpenAI, Gemini or any local OpenAI-compatible server). The same
+  schema across all four, cached by source hash so unchanged files cost nothing.
+- **Source-grounded concept descriptions** — an encyclopedia-style write-up
+  generated by retrieval-augmented generation strictly over a concept's own
+  sources. A concept with no retrievable context is skipped, never
+  hallucinated. Cached by source set plus model plus prompt version.
+- **Figure and table captions** — a vision model captions extracted figures
+  inline, so they show up in Obsidian and become searchable. Cached by image
+  content hash, durable even if the processed tree is regenerated.
+
+Every enrichment step is idempotent, bounded by `--limit`, and left off the
+default ingest path so it only spends tokens when you ask.
+
+### Entity memory: people, organisations, projects, meetings
+
+- **Entities are graph nodes**, not prose — one note each under
+  `knowledge/people/`, `organisations/`, `projects/` and `meetings/`.
+- **Typed, dated relations** from a closed vocabulary of seven
+  (`works_at`, `member_of`, `attended`, `stakeholder_in`, `collaborator_on`,
+  `met_at`, `related_to`). Unknown relations are reported and excluded, never
+  silently stored.
+- **Supersede, never delete.** Ending a relation sets `valid_until` on the open
+  entry — the closed intervals are the queryable history.
+- **A dated `## Log`** on each entity note, newest last, never rewritten.
+- **Meetings join entities** — one atomic operation writes the meeting note and
+  an `attended` relation for every attendee, with an optional project link.
+- **Time-travel queries.** `relations_query` with `as_of` returns the relations
+  that held on a given date ("where did X work last spring?"), plus reverse
+  lookups ("who works here?").
+
+### Assistant memory: the fact lifecycle
+
+- **A fact inbox.** An assistant proposes typed fact notes into
+  `knowledge/assistant/inbox/` — it never promotes its own facts.
+- **A deterministic consolidation pass** ("the dream pass", no large language
+  model) promotes a fact once it is approved or confirmed enough times: its
+  relations merge into the target entity, its line lands in the `## Log`, and
+  the original moves — never deleted — to a dated archive.
+- **Monthly digests.** Facts that linger past the staleness window are swept
+  into a monthly digest rather than piling up.
+- **A byte-budgeted profile.** `knowledge/assistant/PROFILE.md` holds standing
+  preferences and current focus under a hard size cap, writable only through
+  the dedicated tool so the budget can't be bypassed.
+- **Two separate lifecycles.** `status` (ingest) and `memory_status` (memory)
+  never mix.
+
+### The MCP server: the vault as agent memory
+
+A FastAPI and FastMCP server exposes the vault over the Model Context Protocol
+(MCP), so Claude, Codex and other agents can use it without knowing where it
+lives on disk. Seventeen typed tools:
+
+- **Read (7)** — search, read, chunk-context, list, metadata query, related
+  concepts, relation query.
+- **Write (5)** — create, replace and append notes, update a concept's user
+  section, drop an inbox file.
+- **Entity (3)** — upsert a typed relation, append a dated fact, create a
+  meeting.
+- **Memory (2)** — recency-weighted memory search, byte-budgeted profile
+  update.
+
+Around those tools:
+
+- **Writes are confined** to a small `knowledge/` allowlist plus inbox uploads.
+  `archive/raw/`, metadata, logs and the server's own code are never writable.
+- **Server-asserted provenance.** The server stamps author and write-path
+  frontmatter and overrides anything the client claims, so authorship can't be
+  spoofed.
+- **Attributed commits.** Every write is a clean single-author git commit,
+  `mcp(<agent>): <action>`, with the message sanitised against injection.
+- **Per-agent identity.** Each bearer token maps to a named agent that shows up
+  in commits, provenance and the audit logs.
+- **Background push and reindex.** The commit lands before the tool returns,
+  while a worker pushes and another re-embeds the note. Notes written over MCP
+  are searchable within seconds with no manual rebuild.
+- **Dual audit trail.** Append-only logs record every write and every read with
+  the paths an agent actually saw, and telemetry loss never breaks a call.
+- **Layered safety** — constant-time bearer auth, path-traversal and symlink
+  guards, per-minute rate limits, bounded concurrency and a Host-header guard,
+  with Cloudflare Access as the intended outer ring for remote use.
+- **Runs anywhere** — a one-command local launcher that mints its own token, a
+  hardened systemd unit behind a Cloudflare Tunnel, and a live-checked smoke
+  test that drives all seventeen tools.
+
+### Health and maintenance
+
+- **A vault linter** (`sweep.py`) that finds archive orphans in both
+  directions, dangling wikilinks, malformed or dangling or overlapping
+  relations, near-duplicate concept slugs, search-index drift and stale
+  unconsolidated memory. Optionally it re-hashes the whole raw archive to catch
+  bit-rot. Read-only by default, always exits 0 so it is safe in cron.
+- **The consolidation pass** (`consolidate.py`) described above, with dry-run
+  and tunable thresholds.
+- **One scheduler entry point** (`maintain.sh`) that runs both, ready for
+  launchd on macOS or a systemd timer on Linux.
+
+All of it is deterministic and free — no model calls.
+
+### Connectors: pull external sources
+
+- **A connector framework** (`pull.py`) fetches new or changed items from an
+  external source and writes each as a snapshot into `inbox/`, before the
+  immutable-archive boundary, so idempotency and honesty hold downstream exactly
+  as for a hand-dropped file. Connectors are idempotent by native id plus
+  content hash, take secrets only from the environment, and exit 0 for
+  scheduling.
+- **Granola** pulls meetings from the Granola API.
+- **justREC** reads a local justREC export folder, no network needed.
+
+Adding another source is a `pull()` function, a matching extractor and an
+environment stanza.
+
+### Skills and human interface
+
+- **The `brain-project-note` skill** captures the project or session you are
+  working in — from any repository — into `knowledge/projects/<slug>/`, keyed by
+  git remote so one project maps to one folder. It writes only through MCP and
+  grounds every claim in real repository facts.
+- **A real Obsidian vault.** Committed `.obsidian` config makes the human
+  interface reproducible — wikilinks, backlinks, the properties panel and a
+  tuned graph view. The Copilot plugin gives in-vault AI chat.
+- **Model-agnostic and multi-agent by design.** Plain Markdown, one rulebook
+  (`AGENTS.md`) every operator follows, and no assumption that any one agent is
+  the only one. A human in Obsidian, Claude Code, Codex and future MCP agents
+  all read and write the same vault.
+
+### Developer and operations surface
+
+- **A local MCP launcher** (`run-local.sh`) that binds localhost, mints a
+  persistent token and prints the registration command.
+- **An end-to-end smoke test** that drives every tool and every security
+  boundary through the official MCP client.
+- **Lean continuous integration** — ruff, mypy and pytest on one runner, path-
+  filtered so the constant vault-note commits never burn Actions minutes.
+- **A test suite** that doubles as the executable spec, from extractors and
+  chunking through every MCP concern.
+- **Fail-loud configuration** — the server validates its whole environment
+  surface at boot and refuses to start broken.
+- **Public-template sync** — `push_to_upstream.sh` and `pull_from_upstream.sh`
+  keep a downstream vault in step with this template, with safety scans that
+  abort on any leaked personal content.
+
 ## Requirements
 
 - **Python 3.12** (PaddlePaddle, which MinerU uses, doesn't yet ship wheels for 3.13+)
