@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: run the dream pass daily at 05:00 local — one hour
+  after com.brain.maintenance (04:00) so the deterministic consolidate and
+  sweep passes have finished before the LLM dreams over their output.
+  Install:  cp this to ~/Library/LaunchAgents/ (edit the paths first),
+            then: launchctl load ~/Library/LaunchAgents/com.brain.dream.plist
+  Edit REPO_ROOT to your vault path. RunAtLoad off so it won't fire the
+  moment you load it. The gate makes quiet days free: no LLM session is
+  launched unless enough new information has landed.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brain.dream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_ROOT/scripts/dream.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/dream.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/dream.err.log</string>
+</dict>
+</plist>

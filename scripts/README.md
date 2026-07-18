@@ -326,6 +326,70 @@ quiet hour (no cross-process lock vs a running MCP server):
 - **Linux** — `mcp_server/systemd/brain-maintenance.{service,timer}`
   (`systemctl enable --now brain-maintenance.timer`).
 
+## Dream pass
+
+The LLM layer on top of the deterministic maintenance above: `consolidate.py`
+and `sweep.py` promote and lint by counters and rules, but neither can read
+two notes and say why they relate, write a digest, or ask a question. The
+dream pass runs a headless coding-agent session — Claude Code or Codex, on
+subscription auth, never API credits — that does. It only runs when a
+deterministic gate decides enough new information has landed, so a quiet day
+costs nothing. Design: `docs/superpowers/specs/2026-07-18-dream-pass-design.md`.
+The pass itself is `.claude/skills/dream-pass/SKILL.md` — four jobs
+(connections, digests, consolidation, questions), written so any agent, not
+just Claude, can run it.
+
+`scripts/dream_gate.py` is the deterministic half — pure Python, no LLM,
+read-only except its own state file:
+
+```bash
+uv run python scripts/dream_gate.py                 # gate check: exit 0 dream / 1 skip / 2 git error
+uv run python scripts/dream_gate.py --dry-run        # check only, no pending marker written
+uv run python scripts/dream_gate.py --emit-packet    # print the session's worklist as JSON
+uv run python scripts/dream_gate.py --mark-done      # after a successful dream session
+```
+
+State lives in `metadata/dream.json` (`last_run`, `last_commit`, advanced only
+by `--mark-done`) and `metadata/dream.pending` (stamped the moment the gate
+fires, cleared by `--mark-done`) — both gitignored, machine-local scheduler
+state, unlike the committed `index.jsonl`. A pending marker two or more days
+old means the dream keeps failing to complete: `sweep.py`'s `dream-stalled`
+check flags it.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `BRAIN_DREAM_THRESHOLD` | 5 | Changed notes/sources needed to dream |
+| `BRAIN_DREAM_STALE_DAYS` | 7 | Dream on any change once this many days have passed since the last dream |
+| `BRAIN_DREAM_PAIRS` | 10 | Candidate connection pairs included in the packet |
+| `BRAIN_DREAM_MAX_TURNS` | 50 | Turn cap passed to the headless session |
+| `BRAIN_DREAM_RUNNER` | `claude` | `claude` \| `codex` \| `noop` — which runner `dream.sh` launches |
+
+### Scheduling
+
+`scripts/dream.sh` is the entry point: gate, then — if warranted — launch the
+headless session, capturing everything to `logs/dream-<UTC>.log`. It prefers
+the repo `.venv` interpreter, same as `maintain.sh`. Always exits 0: a
+skipped or failed dream must not look like a scheduler failure to
+cron/launchd; the log and the `dream-stalled` sweep check are the signal.
+
+- **macOS** — `mcp_server/launchd/com.brain.dream.plist` (edit `REPO_ROOT`,
+  `cp` to `~/Library/LaunchAgents/`, `launchctl load` it).
+  `StartCalendarInterval` 05:00 — a full hour after `com.brain.maintenance`'s
+  04:00, so consolidate and sweep have finished before the LLM dreams over
+  their output.
+
+Codex is a first-class alternate runner (`codex exec` reading the same skill
+document, no Claude-only constructs in the procedure):
+
+```bash
+BRAIN_DREAM_RUNNER=codex scripts/dream.sh
+```
+
+Codex needs the brain MCP server configured in its own config (every skill
+write goes through `mcp__brain__*` tools, same as the Claude runner), and —
+unlike the `claude` runner — carries no turn cap or tool allowlist; the
+skill's own tripwires are the only bound on a Codex session.
+
 ## Connectors (pull external sources)
 
 `scripts/pull.py` pulls an external source into the vault as archivable

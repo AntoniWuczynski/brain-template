@@ -29,6 +29,10 @@ See [`README.md`](README.md) for the full layer breakdown.
   supersede-never-delete; see `AGENTS.md`), the `knowledge/assistant/`
   memory lifecycle, and the `scripts/sweep.py` / `scripts/consolidate.py`
   maintenance CLIs.
+- **Dream pass** — the LLM consolidation layer: gate + packet in
+  `scripts/ingest_lib/dream.py` (`scripts/dream_gate.py` CLI), the pass
+  itself in `.claude/skills/dream-pass/SKILL.md`, scheduled via
+  `scripts/dream.sh` at 05:00 (after the 04:00 deterministic maintenance).
 - **Agent rules** — `AGENTS.md`. Don't drift from them.
 
 You should **not** spend time on:

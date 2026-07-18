@@ -15,7 +15,10 @@ agents, or any human-driven script. If you cannot satisfy these rules,
    *or* `archive/raw/`). If you think one needs to move, ask the user.
 3. **Always link outputs to their source.** Every generated Markdown note
    carries `source_file:` in its frontmatter and a "Links → Source:"
-   wikilink in the body. No exceptions.
+   wikilink in the body. No exceptions. The one carve-out: dream-pass notes
+   (`knowledge/notes/dreams/`, `generated_by: dream-pass`) have no single
+   source, so their provenance is the `generated_by` key plus a mandatory
+   `## Links` section wikilinking every note they derive from instead.
 4. **Update `metadata/index.jsonl` for every processed file.** One JSON
    object per line; never rewrite the whole file.
 5. **Log every operation.** Append to `logs/ingest-YYYYMMDDTHHMMSS.log`
@@ -27,7 +30,9 @@ agents, or any human-driven script. If you cannot satisfy these rules,
    missing content.
 7. **Be deterministic.** The same input must produce the same output.
    Avoid timestamps and random IDs in note bodies; restrict them to
-   frontmatter and logs.
+   frontmatter and logs. This binds the dream pass's gate/packet/state
+   layer (`scripts/ingest_lib/dream.py`), not the LLM-written bodies of
+   dream notes — those are audited via the per-run dream report instead.
 8. **Operate statelessly.** Do not assume any prior conversation context
    exists. Everything you need must be readable from files, logs, and
    `metadata/index.jsonl`.
@@ -49,6 +54,9 @@ agents, or any human-driven script. If you cannot satisfy these rules,
   formatting, ASCII where possible.
 - Wikilinks (`[[relative/path/without/extension]]`) over absolute paths;
   this keeps the vault portable.
+- Any agent (not just Claude) may execute the dream pass by following
+  `.claude/skills/dream-pass/SKILL.md` literally — it is written to be
+  runner-agnostic. Its hard limits are binding.
 
 ---
 
