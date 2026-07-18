@@ -16,6 +16,14 @@ from .connections import (
 from .consolidate import ConsolidateStats, consolidate
 from .dashboards import DashboardStats, rebuild_dashboards
 from .describe import DescribeStats, rebuild_descriptions
+from .dream import (
+    DreamPacket,
+    DreamState,
+    GateVerdict,
+    build_packet,
+    evaluate_gate,
+    mark_done,
+)
 from .extractors import ExtractionResult, dispatch_extractor, registered_extensions
 from .metadata import IndexRecord, append_record, iter_records, latest_records_by_path
 from .notes import write_index_note, write_processed_note
@@ -39,8 +47,11 @@ __all__ = [
     "ConsolidateStats",
     "DashboardStats",
     "DescribeStats",
+    "DreamPacket",
+    "DreamState",
     "EntityInfo",
     "ExtractionResult",
+    "GateVerdict",
     "IndexRecord",
     "IngestPlan",
     "IngestStats",
@@ -53,14 +64,17 @@ __all__ = [
     "append_record",
     "ask",
     "backfill_summaries",
+    "build_packet",
     "build_search_index",
     "consolidate",
     "default_paths",
     "paths_for_root",
     "dispatch_extractor",
     "entity_notes",
+    "evaluate_gate",
     "iter_records",
     "latest_records_by_path",
+    "mark_done",
     "memory_search",
     "parse_relations",
     "plan_ingest",

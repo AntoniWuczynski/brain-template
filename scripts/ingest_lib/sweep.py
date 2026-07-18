@@ -18,6 +18,8 @@ Finding categories (exact strings):
                                  decision size (a few hundred MB)
 - ``missing-artifact``           record's processed/index note missing
 - ``dangling-wikilink``          ``[[target]]`` that resolves to nothing
+- ``dream-stalled``              the dream gate fired but no dream run
+                                 completed within 2 days
 - ``relation-problem``           parse_relations problems, verbatim
 - ``relation-dangling-target``   relation target note missing on disk
 - ``relation-bad-date``          valid_from/valid_until not YYYY-MM-DD
@@ -41,6 +43,7 @@ from pathlib import Path
 
 from .concepts import slugify
 from .config import VaultPaths
+from .dream import load_pending_since
 from .hashing import sha256_of
 from .knowledge import KNOWLEDGE_EXTRACTOR, KNOWLEDGE_NOTE_DIRS, scan_knowledge
 from .metadata import IndexRecord, latest_records_by_path
@@ -107,6 +110,7 @@ def run_sweep(
     findings += _check_fragmentation(list(latest.values()) + knowledge_recs)
     findings += _check_index_drift(paths, latest, knowledge_recs)
     findings += _check_stale_memory(paths, as_of=as_of, stale_days=stale_days)
+    findings += _check_dream_stalled(paths, as_of=as_of)
 
     findings.sort(key=lambda f: (f.category, f.path, f.detail))
     report = SweepReport(findings=tuple(findings))
@@ -616,6 +620,26 @@ def _check_stale_memory(
                 f"(created {created.isoformat()}, threshold {stale_days})",
             ))
     return findings
+
+
+def _check_dream_stalled(paths: VaultPaths, *, as_of: date) -> list[Finding]:
+    """The dream gate records ``metadata/dream.pending`` when it fires; a
+    completed run clears it via ``dream_gate.py --mark-done``. A marker
+    two or more days old means dream runs keep failing or never launch."""
+    since = load_pending_since(paths)
+    if since is None:
+        return []
+    age_days = (as_of - since.date()).days
+    if age_days < 2:
+        return []
+    return [
+        Finding(
+            "dream-stalled",
+            "metadata/dream.pending",
+            f"dream gate fired {age_days} days ago but no run completed "
+            "(dream_gate.py --mark-done never ran) — check logs/dream-*.log",
+        )
+    ]
 
 
 __all__ = ["Finding", "SweepReport", "render_report", "run_sweep"]

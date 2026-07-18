@@ -57,6 +57,11 @@ metadata/.connections-*.jsonl
 metadata/captions.jsonl
 metadata/.captions-*.jsonl
 
+# Dream-pass state — machine-local scheduler state (each machine dreams on
+# its own cadence), unlike the committed metadata/index.jsonl.
+metadata/dream.json
+metadata/dream.pending
+
 # Obsidian workspace state (per-machine; keep config + plugins)
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json

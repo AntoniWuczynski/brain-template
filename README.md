@@ -189,10 +189,10 @@ default ingest path so it only spends tokens when you ask.
 
 - **A fact inbox.** An assistant proposes typed fact notes into
   `knowledge/assistant/inbox/` — it never promotes its own facts.
-- **A deterministic consolidation pass** ("the dream pass", no large language
-  model) promotes a fact once it is approved or confirmed enough times: its
-  relations merge into the target entity, its line lands in the `## Log`, and
-  the original moves — never deleted — to a dated archive.
+- **A deterministic consolidation pass** (no large language model) promotes
+  a fact once it is approved or confirmed enough times: its relations merge
+  into the target entity, its line lands in the `## Log`, and the original
+  moves — never deleted — to a dated archive.
 - **Monthly digests.** Facts that linger past the staleness window are swept
   into a monthly digest rather than piling up.
 - **A byte-budgeted profile.** `knowledge/assistant/PROFILE.md` holds standing
@@ -250,8 +250,14 @@ Around those tools:
   and tunable thresholds.
 - **One scheduler entry point** (`maintain.sh`) that runs both, ready for
   launchd on macOS or a systemd timer on Linux.
+- **Dream pass** — a nightly LLM session (Claude Code or Codex on
+  subscription auth, gated by a deterministic change-volume check so quiet
+  days cost nothing) that writes connection notes, digests, memory merges
+  and open questions into `knowledge/notes/dreams/`.
 
-All of it is deterministic and free — no model calls.
+The linter and consolidation pass are deterministic and free — no model
+calls; the dream pass is the one LLM step, and its gate keeps a quiet day
+free too.
 
 ### Connectors: pull external sources
 

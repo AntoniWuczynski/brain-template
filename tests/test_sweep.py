@@ -21,6 +21,7 @@ EXPECTED_CATEGORIES = (
     "archive-orphan-record",
     "concept-fragmentation",
     "dangling-wikilink",
+    "dream-stalled",
     "index-drift-missing",
     "index-drift-stale",
     "index-drift-unindexed",
@@ -165,6 +166,11 @@ def _seed(tmp_path: Path) -> VaultPaths:
     # stale-unconsolidated.
     fact = _write(tmp_path, "knowledge/assistant/inbox/fact-old.md", STALE_FACT)
 
+    # dream-stalled: the gate fired 11 days before AS_OF and nothing completed
+    (paths.metadata / "dream.pending").write_text(
+        json.dumps({"since": "2026-06-01T05:00:00Z"}) + "\n", encoding="utf-8"
+    )
+
     # Embeddings meta: every source indexed with its current hash EXCEPT
     # links.md (wrong hash -> stale), vanished.txt (no backing -> missing),
     # and acme.md (no rows -> unindexed).
@@ -218,6 +224,8 @@ def test_each_category_fires_exactly_once(tmp_path: Path) -> None:
         "knowledge/assistant/inbox/fact-old.md"
     )
     assert "72 day(s)" in by_category["stale-unconsolidated"].detail
+    assert by_category["dream-stalled"].path == "metadata/dream.pending"
+    assert "11 days ago" in by_category["dream-stalled"].detail
 
 
 def test_extensionless_link_to_binary_is_not_dangling(tmp_path: Path) -> None:
@@ -440,3 +448,14 @@ def test_run_sweep_wires_archive_processed_size(tmp_path: Path, monkeypatch):
     report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
     cats = {f.category for f in report.findings}
     assert "archive-processed-large" in cats
+
+
+def test_dream_pending_fresh_marker_not_flagged(tmp_path: Path) -> None:
+    """A pending marker under 2 days old is a normal in-flight run."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    (paths.metadata / "dream.pending").write_text(
+        json.dumps({"since": "2026-06-11T05:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+    assert "dream-stalled" not in report.counts
