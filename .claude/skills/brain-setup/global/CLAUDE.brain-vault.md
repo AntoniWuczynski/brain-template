@@ -18,7 +18,11 @@ memory.
   SessionStart hook will usually remind you; do it even if it doesn't.
 - **End of a session in which decisions were made, features shipped, plans
   changed, or research concluded:** capture it with the `brain-project-note`
-  skill so the next session starts informed.
+  skill so the next session starts informed. A project isn't only its
+  `<slug>.md` overview and dated log — when a durable decision, design or
+  artefact deserves its own home, also create a focused curated note under
+  `knowledge/projects/<slug>/` (or `knowledge/projects/shared/` for a
+  cross-project topic, linked to each project with a `related_to` relation).
 - **MCP-only:** never read, write, or guess the vault's on-disk location — go
   through the MCP tools. If they aren't connected, say so and continue — don't
   write vault files directly.

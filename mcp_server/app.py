@@ -181,7 +181,17 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         Refuses to overwrite an existing note — vault_append_to_note
         extends one, vault_replace_note rewrites one in full.
         knowledge/assistant/PROFILE.md is excluded — it is byte-budgeted,
-        write it through profile_update."""
+        write it through profile_update.
+
+        A project is not limited to its knowledge/projects/<slug>/<slug>.md
+        overview and log/<date>.md entries: when a durable decision, design,
+        artefact or sub-topic deserves its own home, create a focused curated
+        note flat beside the overview
+        (knowledge/projects/<slug>/<descriptive-kebab-name>.md). Put notes that
+        span several projects under knowledge/projects/shared/ and link each
+        project with a related_to relation. Give such notes topics: and
+        relations: frontmatter so they join the concept and relation graph. Do
+        not write into a project's notes/ subdir — that is the human's area."""
         return await _offload(_tools.tool_create_note, cfg, runtime, path=path, content=content)
 
     @mcp.tool()
