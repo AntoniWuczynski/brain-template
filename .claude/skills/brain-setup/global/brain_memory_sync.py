@@ -91,9 +91,15 @@ _PROJECT_NUDGE = (
     "distilled entry to this project's brain log via the brain MCP tools: "
     "mcp__brain__vault_append_to_note on knowledge/projects/{slug}/log/{date}.md "
     "(or mcp__brain__vault_create_note if it does not exist yet), and ensure a "
-    "knowledge/projects/{slug}/{slug}.md overview note exists. Use pointers to repo "
-    "files, not copies; skip purely operational or trivial edits. If nothing durable "
-    "happened, just stop without writing."
+    "knowledge/projects/{slug}/{slug}.md overview note exists. When a specific "
+    "decision, design, artefact or sub-topic deserves its own home rather than a log "
+    "line, ALSO create a focused curated note beside the overview at "
+    "knowledge/projects/{slug}/<descriptive-kebab-name>.md — or under "
+    "knowledge/projects/shared/ if it spans several projects, each linked with a "
+    "related_to relation — carrying topics:/relations: frontmatter so it joins the "
+    "concept and relation graph. Use pointers to repo files, not copies; skip purely "
+    "operational or trivial edits. If nothing durable happened, just stop without "
+    "writing."
 )
 
 # SessionStart context-load nudge. Deterministic firing (the hook), model-driven

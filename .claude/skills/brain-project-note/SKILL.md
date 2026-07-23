@@ -35,9 +35,26 @@ files anywhere as a fallback. Tell the user:
 ```
 knowledge/projects/<slug>/
 ├── <slug>.md          # overview — you own this, full-rewrite each run
-├── notes/             # human + related notes — NEVER write here
+├── <topic>.md         # focused curated notes — create these when warranted
+├── notes/             # the human's own notes — NEVER write here
 └── log/<YYYY-MM-DD>.md # one session-update note per day — you create/append
+
+knowledge/projects/shared/
+└── <topic>.md         # notes spanning several projects, related_to each
 ```
+
+A project is more than its overview and log. Beyond `<slug>.md` and
+`log/<date>.md`, you MAY (and should, when it earns its place) create **focused
+curated notes** — a durable decision, a design, a transcribed artefact, a
+sub-topic — flat under `knowledge/projects/<slug>/` with a descriptive
+kebab-case filename (e.g. `mnemosyne-capabilities.md`), distinct from the
+`<slug>.md` overview. A note that spans several projects goes under
+`knowledge/projects/shared/`, linked to each project with a `related_to`
+relation. Give curated notes `topics:` and `relations:` frontmatter so they
+join the concept and relation graph. This is additive — the overview + log
+remain the session-snapshot baseline; curated notes are for knowledge that
+deserves its own home rather than a log line. The `notes/` subdir stays the
+human's area — never write there.
 
 - `<slug>` = the project's **git remote name**: take `git remote get-url origin`,
   drop a trailing `.git`, keep the last path segment, lowercase,
@@ -153,7 +170,8 @@ aliases: []
 ## Links
 - Repo: <remote URL or path>
 - Session log: see `log/` in this folder
-- Notes: see `notes/` in this folder
+- Curated notes: `<topic>.md` files beside this overview (and `projects/shared/`)
+- Notes: see `notes/` in this folder (the human's area)
 ```
 
 **Session log** `log/<YYYY-MM-DD>.md`:
@@ -190,7 +208,8 @@ topics: []
 |---|---|
 | Slugging the directory name | Slug the git remote; dirs `fyp-old/` and `randeval/` with one remote are ONE project |
 | Creating a new folder without the identity check | Compare the remote against existing notes' `source_repo` first; ask on a match |
-| Flat `projects/<slug>.md` | Folder `projects/<slug>/` with `<slug>.md`, `notes/`, `log/` |
+| Flattening the whole project to `projects/<slug>.md` | The *overview* is `projects/<slug>/<slug>.md` inside the folder (curated `<topic>.md` notes beside it are fine) |
+| Cramming every artefact into the log | Give a durable decision / design / artefact its own curated `<topic>.md` under `projects/<slug>/` (or `projects/shared/`) |
 | Appending updates to the overview | Overview is a full rewrite via `vault_replace_note` |
 | Resetting `created:` on a rewrite | Read the old note first; preserve `created:` |
 | Hardcoding "today" | Real `date -u`; timestamps only in frontmatter + log filename |
