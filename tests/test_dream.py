@@ -416,7 +416,15 @@ def test_skill_gate_step_records_no_pending_marker() -> None:
 
 def test_skill_copies_agree_outside_the_sync_note() -> None:
     texts = _skill_texts()
-    assert len(texts) >= 2
+    if len(texts) < 2:
+        # Private-repo check. push_to_upstream.sh publishes exactly one copy
+        # (from _template/.claude/skills/); .agents/ and _template/ itself are
+        # never synced, so there is nothing to compare on the template branch.
+        pytest.skip(
+            "private-repo check: only one dream-pass SKILL.md copy is present "
+            f"({[str(p) for p, _ in texts]}); the other copies live in "
+            "_template/ and .agents/, which do not sync to the template"
+        )
     stripped = [
         [ln for ln in text.splitlines() if "skills/dream-pass/SKILL.md` in the private" not in ln]
         for _path, text in texts

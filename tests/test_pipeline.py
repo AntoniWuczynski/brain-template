@@ -11,6 +11,7 @@ Summarization is disabled (BRAIN_SKIP_SUMMARY) so nothing hits an LLM.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -873,3 +874,43 @@ def test_odd_interior_whitespace_survives_sanitising(tmp_path: Path) -> None:
 ])
 def test_sanitise_derived_name(name: str, expected: str) -> None:
     assert sanitise_derived_name(name) == expected
+
+
+# ------------------------------------------------- meeting promotion hook
+
+def test_ingesting_a_meeting_snapshot_promotes_it(tmp_path: Path) -> None:
+    """A connector snapshot must not stop at its source note: the same run
+    derives the knowledge/meetings/ node and proposes the attendee's
+    ``attended`` edge into the inbox (never onto the person)."""
+    paths = _vault(tmp_path)
+    person = paths.knowledge / "people" / "alice-smith.md"
+    person.parent.mkdir(parents=True, exist_ok=True)
+    person.write_text("---\ntitle: Alice Smith\ntype: person\n---\n\n## Log\n",
+                      encoding="utf-8")
+    _drop(paths, "meetings/granola/2026-07-12-kern-weekly-abcd1234.json", json.dumps({
+        "connector": "granola", "id": "g1", "title": "Kern weekly",
+        "date": "2026-07-12", "attendees": ["Alice Smith", "Nobody Known"],
+        "summary": "Agreed to ship it.", "transcript": "Alice: hello",
+    }))
+    assert _ingest(paths).processed == 1
+
+    note = paths.knowledge / "meetings" / "2026" / "2026-07-12-kern-weekly.md"
+    assert note.is_file()
+    text = note.read_text(encoding="utf-8")
+    assert "attendees: ['people/alice-smith']" in text
+    # An attendee with no note mints nothing; it is named in the note instead.
+    assert not (paths.knowledge / "people" / "nobody-known.md").exists()
+    assert "- Nobody Known" in text
+
+    proposals = sorted((paths.knowledge / "assistant" / "inbox").glob("*.md"))
+    assert len(proposals) == 1
+    assert "approved: false" in proposals[0].read_text(encoding="utf-8")
+    assert "attended" not in person.read_text(encoding="utf-8")
+
+
+def test_a_run_with_no_meeting_snapshot_promotes_nothing(tmp_path: Path) -> None:
+    paths = _vault(tmp_path)
+    _drop(paths, "notes/a.txt", "hello world\n")
+    assert _ingest(paths).processed == 1
+    assert not (paths.knowledge / "meetings").exists()
+    assert not (paths.knowledge / "assistant" / "inbox").exists()

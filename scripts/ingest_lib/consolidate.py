@@ -6,12 +6,15 @@ The lifecycle (the "dream pass", minus the mysticism):
    ``knowledge/assistant/inbox/`` over MCP. Each note carries
    ``memory_status: unconsolidated``, ``confirmations: N``,
    ``approved: bool`` and a ``promote:`` mapping
-   (``{target, relations: [...], fact, source}``) — the contract is
+   (``{target, relations: [...], fact, source}``, plus an optional
+   ``merge: {duplicate, survivor}``) — the contract is
    ``knowledge/index/templates/memory-fact.md``.
 2. THIS pass — counters and thresholds, NO LLM — promotes confirmed
    facts into their target entity notes (relations merged into
-   frontmatter, the fact line appended to ``## Log``), stamps the fact
-   note ``memory_status: consolidated``, and MOVES it to
+   frontmatter, the fact line appended to ``## Log``), performs an
+   approved ``promote.merge`` as AGENTS.md's "Merging a duplicate
+   entity" spells it out, stamps the fact note ``memory_status:
+   consolidated``, and MOVES it to
    ``knowledge/assistant/archive/<YYYY-MM>/``. Moved, never deleted:
    the original wording stays reviewable forever.
 3. Facts that linger unconsolidated past ``stale_days`` are swept into
@@ -43,14 +46,22 @@ solving in code.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
+from .concepts import slugify
 from .config import VaultPaths
-from .notes import _atomic_write, _split_frontmatter  # private helpers, module-internal
+from .notes import (  # _-prefixed helpers are private but module-internal
+    _atomic_write,
+    _split_frontmatter,
+    fm_list,
+)
 from .relations import (
+    Relation,
     append_fact_to_log,
+    canonical_entity_id,
     folder_overview_id,
     is_valid_node_id,
     normalize_target,
@@ -254,6 +265,312 @@ def _digest_skeleton(month: str, as_of: date) -> str:
 
 
 # ---------------------------------------------------------------------------
+# duplicate-entity merge (AGENTS.md, "Merging a duplicate entity")
+#
+# A merge is not a typed relation, so it rides its own ``promote.merge:
+# {duplicate, survivor}`` key rather than ``promote.relations``. On an
+# approved fact this pass performs exactly the four documented steps and
+# nothing else: copy the duplicate's relations onto the survivor, close
+# every open relation on the duplicate with ``valid_until``, stamp
+# ``superseded_by`` on the duplicate, keep its title as an alias on the
+# survivor. Supersede, never delete — the duplicate note stays on disk.
+#
+# ATOMICITY. Two notes change, and no filesystem gives us one rename for
+# both. Everything is COMPUTED first, so any refusal (bad ids, missing or
+# unparseable notes) happens before a single byte is written. Of the two
+# orderings FOUNDER_DECISIONS.md IMP-021 allowed, this takes the second:
+# write the survivor, then the duplicate, and if the duplicate write fails
+# leave the fact in the inbox with a problem line naming the half-applied
+# state. Rolling the survivor back is not actually available — a crash
+# between two renames rolls nothing back either — whereas both halves are
+# idempotent (an already-copied relation upserts to a noop, an
+# already-present alias is not re-added), so the next run finishes the
+# merge instead of doubling it. The survivor goes first because it is the
+# half that PRESERVES information: superseding the duplicate before its
+# relations exist anywhere else would, for the window between the writes,
+# leave the graph believing a live edge had ended.
+# ---------------------------------------------------------------------------
+
+_MERGE_KEYS: tuple[str, str] = ("duplicate", "survivor")
+
+
+@dataclass(frozen=True)
+class _MergePlan:
+    """Both halves of one merge, fully computed before anything is written.
+
+    ``duplicate_text`` is None when the duplicate already carries
+    ``superseded_by`` — the merge has already happened, so this run writes
+    nothing and simply lets the fact archive (idempotent re-run)."""
+
+    duplicate_rel: str            # vault-relative path incl. .md
+    duplicate_text: str | None
+    survivor_text: str
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _MergeRefusal:
+    """Why this merge will NOT be performed. The fact stays in the inbox."""
+
+    problem: str
+
+
+def _existing_aliases(frontmatter: dict[str, object]) -> list[str]:
+    """``aliases:`` as a list of non-empty strings. A bare string counts as
+    a one-element list; anything else as none — the same tolerance
+    ``relations._coerce_aliases`` applies."""
+    raw = frontmatter.get("aliases")
+    if isinstance(raw, str):
+        return [raw.strip()] if raw.strip() else []
+    if isinstance(raw, list):
+        return [_coerce_str(a) for a in raw if _coerce_str(a)]
+    return []
+
+
+def _frontmatter_key_re(key: str) -> re.Pattern[str]:
+    """Quote-tolerant match for one top-level frontmatter key.
+
+    PyYAML round-trips ``"aliases": [Dan]`` as an ordinary ``aliases`` key,
+    so a bare ``startswith(f"{key}:")`` test misses it and appends a SECOND
+    key of the same name — the note then carries two, and which one wins is
+    PyYAML's business, not the caller's. Same tolerance, and the same
+    reason, as ``relations._RELATIONS_KEY_RE``.
+    """
+    return re.compile(rf"""^["']?{re.escape(key)}["']?\s*:""")
+
+
+def _set_frontmatter_seq(text: str, key: str, values: list[str]) -> str:
+    """Set one TOP-LEVEL sequence-valued frontmatter key to ``values``.
+
+    ``_set_frontmatter_key`` replaces a single line, which would orphan the
+    ``- item`` lines of a block-style list under the key. This replaces the
+    whole block — the key line plus every following indented or ``-`` line,
+    exactly the extent ``relations._splice_relations`` uses — with one
+    inline line (``aliases: [a, b]``, the form the templates and the live
+    vault already use). Every other frontmatter line and the whole body
+    keep their bytes."""
+    line = f"{key}: {fm_list(values)}"
+    lines = text.split("\n")
+    close = _frontmatter_close(lines)
+    if close < 0:
+        return f"---\n{line}\n---\n{text}"
+    start = next(
+        (i for i in range(1, close) if _frontmatter_key_re(key).match(lines[i])), -1
+    )
+    if start < 0:
+        lines.insert(close, line)
+        return "\n".join(lines)
+    end = start + 1
+    for j in range(start + 1, close):
+        stripped = lines[j].strip()
+        if not stripped:
+            continue
+        if not (lines[j][0].isspace() or stripped.startswith("-")):
+            break
+        end = j + 1
+    return "\n".join(lines[:start] + [line] + lines[end:])
+
+
+# A value that is nothing but an email address — the same test
+# ``sweep._EMAIL_TITLE_RE`` applies when it detects a duplicate entity.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def _email_slug_forms(address: str) -> set[str]:
+    """The slugs an email address becomes as the last segment of a node id:
+    ``concepts.slugify`` (punctuation to ``-``) and the punctuation-stripped
+    form the MCP write path produced for the nodes in the live vault
+    (``dana@example.com`` -> ``danaexamplecom``)."""
+    lowered = address.casefold()
+    return {slugify(lowered), re.sub(r"[^a-z0-9]", "", lowered)}
+
+
+def _email_node_address(frontmatter: dict[str, object], node_id: str) -> str:
+    """The bare email address this node is NAMED FOR, or ``""``.
+
+    Two shapes count, and both come off the note itself rather than a guess
+    about what a slug might once have been: a ``title:`` that is nothing but
+    an address, and a node id whose last segment is the slug of an address
+    the note keeps as an alias.
+    """
+    title = " ".join(_coerce_str(frontmatter.get("title")).split())
+    if _EMAIL_RE.match(title):
+        return title
+    slug = node_id.rsplit("/", 1)[-1]
+    for alias in _existing_aliases(frontmatter):
+        if _EMAIL_RE.match(alias) and slug in _email_slug_forms(alias):
+            return alias
+    return ""
+
+
+def _plan_merge(
+    raw: object,
+    *,
+    root: Path,
+    target: str,
+    survivor_text: str,
+    as_of: date,
+) -> _MergePlan | _MergeRefusal:
+    """Validate ``promote.merge`` and compute both notes' new text.
+
+    Refuses (nothing is written, the fact stays in the inbox) when the
+    mapping is malformed, the two ids name one node, the survivor is not
+    ``promote.target``, either id is not a graph node by
+    ``relations.canonical_entity_id`` — never a path-prefix test — the
+    duplicate note is missing or unreadable, or the survivor is itself
+    already superseded (merging into a dead node would strand the
+    relations one hop further from the live entity).
+    """
+    if not isinstance(raw, dict):
+        return _MergeRefusal(
+            f"promote.merge is a {type(raw).__name__}, not a mapping"
+        )
+    unknown = sorted(str(k) for k in raw if str(k) not in _MERGE_KEYS)
+    if unknown:
+        return _MergeRefusal(
+            f"promote.merge has unknown key(s) {', '.join(unknown)} "
+            f"(allowed: {', '.join(_MERGE_KEYS)})"
+        )
+    duplicate = normalize_target(_coerce_str(raw.get("duplicate")), vault_root=root)
+    survivor = normalize_target(_coerce_str(raw.get("survivor")), vault_root=root)
+    if not duplicate or not survivor:
+        return _MergeRefusal(
+            "promote.merge needs both a duplicate: and a survivor: node id"
+        )
+    if duplicate == survivor:
+        return _MergeRefusal(
+            f"promote.merge names {survivor} as both duplicate and survivor"
+        )
+    if survivor != target:
+        return _MergeRefusal(
+            f"promote.merge survivor {survivor!r} is not promote.target "
+            f"{target!r} — the survivor is the note the fact promotes into"
+        )
+    for role, node in (("duplicate", duplicate), ("survivor", survivor)):
+        if canonical_entity_id(note_path_for_node(node), vault_root=root) != node:
+            return _MergeRefusal(
+                f"promote.merge {role} {node!r} is not an entity node"
+            )
+
+    duplicate_rel = note_path_for_node(duplicate)
+    duplicate_path = root / duplicate_rel
+    if not duplicate_path.is_file():
+        return _MergeRefusal(
+            f"promote.merge duplicate {duplicate!r} resolves to no note "
+            f"({duplicate_rel})"
+        )
+    try:
+        duplicate_text = duplicate_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return _MergeRefusal(
+            f"promote.merge duplicate note {duplicate_rel} unreadable ({exc})"
+        )
+
+    survivor_fm, _survivor_body = _split_frontmatter(survivor_text)
+    survivor_superseded = _coerce_str(survivor_fm.get("superseded_by"))
+    if survivor_superseded:
+        return _MergeRefusal(
+            f"promote.merge survivor {survivor} is itself superseded "
+            f"(superseded_by: {survivor_superseded}) — merge into the "
+            "survivor of that merge instead"
+        )
+
+    address = _email_node_address(survivor_fm, survivor)
+    if address:
+        # The one shape a duplicate-entity merge must never take. An
+        # email-slugged node exists because a calendar payload carried an
+        # address instead of a display name; naming it the SURVIVOR buries
+        # the named entity under the address, closes the named node's live
+        # relations, and leaves the graph pointing at the accident.
+        return _MergeRefusal(
+            f"promote.merge survivor {survivor} is the email-slugged node "
+            f"for {address!r} — the merge is the other way round: write "
+            f"duplicate: {survivor}, survivor: {duplicate}"
+        )
+
+    duplicate_fm, _duplicate_body = _split_frontmatter(duplicate_text)
+    already = _coerce_str(duplicate_fm.get("superseded_by"))
+    if already:
+        if normalize_target(already, vault_root=root) != survivor:
+            # Merged into a DIFFERENT node already. Not an idempotent
+            # re-run: nothing here can be applied (the duplicate's
+            # relations now live on that other survivor, and this note's
+            # promote.fact is phrased as a completed merge), so performing
+            # the rest would write a false record into this survivor's Log
+            # while the duplicate still points elsewhere. Refuse, and name
+            # the node the merge would have to be re-aimed at.
+            return _MergeRefusal(
+                f"promote.merge duplicate {duplicate} is already superseded by "
+                f"{already}, not {survivor} — merge into that survivor instead"
+            )
+        # Already merged into THIS survivor: a genuine idempotent no-op.
+        return _MergePlan(
+            duplicate_rel=duplicate_rel,
+            duplicate_text=None,
+            survivor_text=survivor_text,
+            problems=(),
+        )
+
+    relations, relation_problems = parse_relations(duplicate_fm)
+    problems: list[str] = [
+        f"promote.merge duplicate {duplicate}: {p}" for p in relation_problems
+    ]
+
+    new_survivor = survivor_text
+    try:
+        for relation in relations:
+            new_survivor, _action = upsert_relation_in_text(new_survivor, relation)
+    except ValueError as exc:
+        return _MergeRefusal(
+            f"promote.merge survivor note has unparseable frontmatter ({exc})"
+        )
+
+    new_duplicate = duplicate_text
+    closing = as_of.isoformat()
+    try:
+        for relation in relations:
+            if relation.valid_until:
+                continue        # already closed: its span is history already
+            new_duplicate, _action = upsert_relation_in_text(
+                new_duplicate,
+                Relation(
+                    rel=relation.rel,
+                    target=relation.target,
+                    valid_from=relation.valid_from,
+                    valid_until=closing,
+                    source=relation.source,
+                ),
+            )
+    except ValueError as exc:
+        return _MergeRefusal(
+            f"promote.merge duplicate note {duplicate_rel} has unparseable "
+            f"frontmatter ({exc})"
+        )
+
+    alias = " ".join(_coerce_str(duplicate_fm.get("title")).split())
+    if alias:
+        aliases = _existing_aliases(survivor_fm)
+        if alias.casefold() not in {a.casefold() for a in aliases}:
+            new_survivor = _set_frontmatter_seq(
+                new_survivor, "aliases", [*aliases, alias]
+            )
+    else:
+        problems.append(
+            f"promote.merge duplicate {duplicate} has no title — no alias "
+            f"kept on {survivor}"
+        )
+    new_duplicate = _set_frontmatter_key(
+        new_duplicate, "superseded_by", f"knowledge/{survivor}"
+    )
+    return _MergePlan(
+        duplicate_rel=duplicate_rel,
+        duplicate_text=new_duplicate,
+        survivor_text=new_survivor,
+        problems=tuple(problems),
+    )
+
+
+# ---------------------------------------------------------------------------
 # the pass itself
 # ---------------------------------------------------------------------------
 
@@ -394,6 +711,31 @@ def consolidate(
                 dest = _archive_destination(archive_dir, md.name, reserved)
             dest_rel = dest.relative_to(paths.root).as_posix()
 
+            # promote.merge (optional): a duplicate-entity merge, executed
+            # here rather than left to a human (FOUNDER_DECISIONS.md
+            # IMP-021). Planned BEFORE anything is written, so a refusal
+            # leaves both notes and the fact exactly as they were.
+            merge: _MergePlan | None = None
+            if "merge" in promote:
+                # Presence, not truthiness: `merge:` with no value parses as
+                # None, and treating that as "no merge asked for" would
+                # promote a note whose whole point is the merge as a plain
+                # fact line — recording a merge in the Log that never
+                # happened. _plan_merge refuses it by type.
+                planned = _plan_merge(
+                    promote.get("merge"),
+                    root=paths.root,
+                    target=target,
+                    survivor_text=entity_text,
+                    as_of=as_of,
+                )
+                if isinstance(planned, _MergeRefusal):
+                    unresolved += 1
+                    problems.append(f"{rel}: {planned.problem} — left in inbox")
+                    continue
+                merge = planned
+                problems.extend(f"{rel}: {p}" for p in merge.problems)
+
             # promote.relations share the entity-relations shape, so the
             # same tolerant parser applies: bad entries become problems,
             # good ones land.
@@ -403,7 +745,7 @@ def consolidate(
             for p in rel_problems:
                 problems.append(f"{rel}: promote.{p}")
 
-            new_text = entity_text
+            new_text = merge.survivor_text if merge is not None else entity_text
             try:
                 for relation in relations:
                     new_text, _action = upsert_relation_in_text(new_text, relation)
@@ -440,11 +782,45 @@ def consolidate(
             if not dry_run:
                 if new_text != entity_text:
                     _atomic_write(entity_path, new_text)
+                if merge is not None and merge.duplicate_text is not None:
+                    try:
+                        _atomic_write(
+                            paths.root / merge.duplicate_rel, merge.duplicate_text
+                        )
+                    except OSError as exc:
+                        # The survivor IS on disk with the copied relations,
+                        # the alias and (below) the fact line: record it as
+                        # touched BEFORE bailing out, or scripts/consolidate.py
+                        # never reindexes a note this run rewrote.
+                        if new_text != entity_text:
+                            touched.append(entity_rel)
+                        # Half-applied, and deliberately so (see the merge
+                        # section's ATOMICITY note): the fact stays in the
+                        # inbox and both halves are idempotent, so the next
+                        # run finishes the merge rather than doubling it.
+                        unresolved += 1
+                        problems.append(
+                            f"{rel}: merge HALF-APPLIED — survivor {entity_rel} "
+                            f"written but duplicate {merge.duplicate_rel} could "
+                            f"not be ({exc}); fact left in inbox, re-run to finish"
+                        )
+                        logger.error(
+                            "consolidate: merge half-applied for %s (duplicate %s: %s)",
+                            rel, merge.duplicate_rel, exc,
+                        )
+                        continue
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 _atomic_write(dest, stamped)
                 md.unlink()
             if new_text != entity_text:
                 touched.append(entity_rel)
+            if merge is not None and merge.duplicate_text is not None:
+                touched.append(merge.duplicate_rel)
+                logger.info(
+                    "consolidate: merged %s into %s (superseded, relations copied)%s",
+                    merge.duplicate_rel, entity_rel,
+                    " [dry-run]" if dry_run else "",
+                )
             moved.append((rel, dest_rel))
             promoted += 1
             logger.info(

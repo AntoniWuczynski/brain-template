@@ -5,8 +5,11 @@ injects ``as_of`` and asserts purely on file contents and stats."""
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.consolidate import consolidate
@@ -568,3 +571,414 @@ def test_promote_into_unparseable_entity_note_is_left_unresolved(tmp_path: Path)
     assert (paths.root / _INBOX / "fact-anna.md").exists()
     assert _read(paths, "knowledge/people/anna.md") == broken
     assert any("unparseable frontmatter" in p for p in stats.problems)
+
+
+# ---------------------------------------------------------------------------
+# duplicate-entity merge (promote.merge) — FOUNDER_DECISIONS.md IMP-021
+# Fixtures are the three live pairs (alicia/nate/peter beside their
+# @focaldata.com twins), anonymised: same frontmatter key order, quoting and
+# meeting_create-minted ``attended`` relation, because those exact bytes are
+# what the merge has to survive.
+# ---------------------------------------------------------------------------
+
+_MEETING = "meetings/2026/2026-07-02-offsite"
+
+_LIVE_PAIRS = (
+    ("dana-scott", "Dana Scott", "danaexamplecom", "dana@example.com"),
+    ("milo-frey", "Milo Frey", "miloexamplecom", "milo@example.com"),
+    ("ravi-patel", "Ravi Patel", "raviexamplecom", "ravi@example.com"),
+)
+
+
+def _named_note(name: str) -> str:
+    return (
+        f'---\ntitle: "{name}"\ntype: person\naliases: []\ntopics: []\n'
+        "relations: []\nauthor: 'agent:default'\nwritten_via: mcp\n"
+        "---\n\n## Log\n"
+    )
+
+
+def _email_note(email: str) -> str:
+    return (
+        f"---\ntitle: {email}\ntype: person\naliases: []\ntopics: []\n"
+        f"relations:\n- rel: attended\n  target: {_MEETING}\n"
+        f"  valid_from: '2026-07-02'\n  source: knowledge/{_MEETING}\n"
+        "last_written_by: 'agent:default'\nwritten_via: mcp\n"
+        "author: 'agent:default'\n---\n\n## Log\n"
+    )
+
+
+def _merge_fact(
+    *,
+    duplicate: str,
+    survivor: str,
+    target: str | None = None,
+    merge_block: str | None = None,
+    fact: str = "",
+    created: str = "2026-06-10",
+) -> str:
+    """A memory fact carrying ``promote.merge``, the shape
+    ``ingest_lib.duplicates`` proposes; ``merge_block`` overrides the
+    mapping verbatim so a malformed one can be tested."""
+    block = merge_block if merge_block is not None else (
+        "  merge:\n"
+        f"    duplicate: {duplicate}\n"
+        f"    survivor: {survivor}\n"
+    )
+    return (
+        "---\n"
+        'title: "merge candidate"\n'
+        "type: memory_fact\n"
+        f"created: '{created}'\n"
+        "memory_status: unconsolidated\n"
+        "confirmations: 0\n"
+        "approved: false\n"
+        "promote:\n"
+        + block
+        + f"  target: {target if target is not None else survivor}\n"
+        + "  relations: []\n"
+        + f'  fact: "{fact}"\n'
+        + f"  source: knowledge/{duplicate}\n"
+        + "---\n"
+        + "\n"
+        + "Proposed by the deterministic duplicate-entity pass.\n"
+    )
+
+
+def _seed_pair(paths: VaultPaths, slug: str, name: str, email_slug: str, email: str) -> None:
+    _write(paths, f"knowledge/people/{slug}.md", _named_note(name))
+    _write(paths, f"knowledge/people/{email_slug}.md", _email_note(email))
+
+
+# The two notes after the merge, byte for byte. Written out rather than
+# derived, so a change in how either half is spliced fails loudly.
+_MERGED_SURVIVOR = """---
+title: "Dana Scott"
+type: person
+aliases: [dana@example.com]
+topics: []
+relations:
+- rel: attended
+  target: meetings/2026/2026-07-02-offsite
+  valid_from: '2026-07-02'
+  source: knowledge/meetings/2026/2026-07-02-offsite
+author: 'agent:default'
+written_via: mcp
+---
+
+## Log
+
+- 2026-06-10 — merged dana@example.com ([[knowledge/people/danaexamplecom]])
+"""
+
+_MERGED_DUPLICATE = """---
+title: dana@example.com
+type: person
+aliases: []
+topics: []
+relations:
+- rel: attended
+  target: meetings/2026/2026-07-02-offsite
+  valid_from: '2026-07-02'
+  source: knowledge/meetings/2026/2026-07-02-offsite
+  valid_until: '2026-06-12'
+last_written_by: 'agent:default'
+written_via: mcp
+author: 'agent:default'
+superseded_by: knowledge/people/dana-scott
+---
+
+## Log
+"""
+
+
+def test_approved_merge_performs_the_four_agents_md_steps(tmp_path: Path) -> None:
+    """Relations copied over, open spans closed at the run date,
+    superseded_by stamped, address kept as an alias."""
+    paths = _vault(tmp_path)
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(
+        paths, f"{_INBOX}/merge-dana.md",
+        _merge_fact(
+            duplicate="people/danaexamplecom",
+            survivor="people/dana-scott",
+            fact="merged dana@example.com",
+        ),
+    )
+    _approve(paths, "merge-dana.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 1
+    assert stats.unresolved == 0
+    assert stats.problems == ()
+    assert _read(paths, "knowledge/people/dana-scott.md") == _MERGED_SURVIVOR
+    assert _read(paths, "knowledge/people/danaexamplecom.md") == _MERGED_DUPLICATE
+    # Both halves are reindexed, so search stops resolving the dead node.
+    assert stats.touched_entity_paths == (
+        "knowledge/people/dana-scott.md", "knowledge/people/danaexamplecom.md",
+    )
+    assert not (paths.root / _INBOX / "merge-dana.md").exists()
+
+
+def test_approved_merge_over_the_three_live_shaped_pairs(tmp_path: Path) -> None:
+    """The live distribution: three email twins minted by meeting_create,
+    all three merged in one pass."""
+    paths = _vault(tmp_path)
+    for pair in _LIVE_PAIRS:
+        _seed_pair(paths, *pair)
+    for slug, _name, email_slug, _email in _LIVE_PAIRS:
+        _write(
+            paths, f"{_INBOX}/merge-{slug}.md",
+            _merge_fact(
+                duplicate=f"people/{email_slug}", survivor=f"people/{slug}"
+            ),
+        )
+        _approve(paths, f"merge-{slug}.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 3
+    assert stats.problems == ()
+    for slug, _name, email_slug, email in _LIVE_PAIRS:
+        survivor_fm, _ = _split_frontmatter(_read(paths, f"knowledge/people/{slug}.md"))
+        assert survivor_fm["aliases"] == [email]
+        assert survivor_fm["relations"] == [{
+            "rel": "attended",
+            "target": _MEETING,
+            "valid_from": "2026-07-02",
+            "source": f"knowledge/{_MEETING}",
+        }]
+        dup_fm, _ = _split_frontmatter(
+            _read(paths, f"knowledge/people/{email_slug}.md")
+        )
+        assert dup_fm["superseded_by"] == f"knowledge/people/{slug}"
+        assert dup_fm["relations"] == [{
+            "rel": "attended",
+            "target": _MEETING,
+            "valid_from": "2026-07-02",
+            "source": f"knowledge/{_MEETING}",
+            "valid_until": "2026-06-12",
+        }]
+
+
+def test_merge_rerun_is_idempotent(tmp_path: Path) -> None:
+    """A second approved fact for an already-merged pair changes neither
+    note (the duplicate carries superseded_by) but still archives."""
+    paths = _vault(tmp_path)
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(
+        paths, f"{_INBOX}/merge-dana.md",
+        _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott"),
+    )
+    _approve(paths, "merge-dana.md")
+    consolidate(paths, logger=_LOG, as_of=AS_OF)
+    after_first = {
+        rel: _read(paths, rel)
+        for rel in ("knowledge/people/dana-scott.md", "knowledge/people/danaexamplecom.md")
+    }
+
+    _write(
+        paths, f"{_INBOX}/merge-dana-again.md",
+        _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott"),
+    )
+    _approve(paths, "merge-dana-again.md")
+    stats = consolidate(paths, logger=_LOG, as_of=date(2026, 6, 20))
+
+    assert stats.promoted == 1
+    assert stats.unresolved == 0
+    assert stats.touched_entity_paths == ()
+    assert {rel: _read(paths, rel) for rel in after_first} == after_first
+    assert not (paths.root / _INBOX / "merge-dana-again.md").exists()
+
+
+def test_merge_dry_run_writes_nothing(tmp_path: Path) -> None:
+    paths = _vault(tmp_path)
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(
+        paths, f"{_INBOX}/merge-dana.md",
+        _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott"),
+    )
+    _approve(paths, "merge-dana.md")
+    before = _snapshot(paths.root)
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF, dry_run=True)
+
+    assert stats.promoted == 1
+    assert _snapshot(paths.root) == before
+
+
+def test_merge_closes_only_still_open_relations(tmp_path: Path) -> None:
+    """An already-closed span keeps its own valid_until."""
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/people/dana-scott.md", _named_note("Dana Scott"))
+    _write(
+        paths, "knowledge/people/danaexamplecom.md",
+        "---\n"
+        "title: dana@example.com\n"
+        "type: person\n"
+        "relations:\n"
+        "- rel: works_at\n"
+        "  target: organisations/acme\n"
+        "  valid_from: '2025-01-01'\n"
+        "  valid_until: '2025-12-31'\n"
+        "- rel: attended\n"
+        f"  target: {_MEETING}\n"
+        "  valid_from: '2026-07-02'\n"
+        "---\n\n## Log\n",
+    )
+    _write(
+        paths, f"{_INBOX}/merge-dana.md",
+        _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott"),
+    )
+    _approve(paths, "merge-dana.md")
+
+    consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    dup_fm, _ = _split_frontmatter(_read(paths, "knowledge/people/danaexamplecom.md"))
+    assert dup_fm["relations"] == [
+        {
+            "rel": "works_at", "target": "organisations/acme",
+            "valid_from": "2025-01-01", "valid_until": "2025-12-31",
+        },
+        {
+            "rel": "attended", "target": _MEETING,
+            "valid_from": "2026-07-02", "valid_until": "2026-06-12",
+        },
+    ]
+    # Both spans copied to the survivor; the closed one keeps its own date
+    # and the open one arrives still open.
+    survivor_fm, _ = _split_frontmatter(_read(paths, "knowledge/people/dana-scott.md"))
+    assert survivor_fm["relations"] == [
+        {
+            "rel": "works_at", "target": "organisations/acme",
+            "valid_from": "2025-01-01", "valid_until": "2025-12-31",
+        },
+        {"rel": "attended", "target": _MEETING, "valid_from": "2026-07-02"},
+    ]
+
+
+def test_merge_appends_alias_beside_existing_ones(tmp_path: Path) -> None:
+    """A survivor that already has aliases keeps them, and a re-merge does
+    not add the address twice."""
+    paths = _vault(tmp_path)
+    _write(
+        paths, "knowledge/people/dana-scott.md",
+        "---\ntitle: Dana Scott\ntype: person\naliases:\n- D. Scott\n---\n\n## Log\n",
+    )
+    _write(paths, "knowledge/people/danaexamplecom.md", _email_note("dana@example.com"))
+    _write(
+        paths, f"{_INBOX}/merge-dana.md",
+        _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott"),
+    )
+    _approve(paths, "merge-dana.md")
+
+    consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    fm, _ = _split_frontmatter(_read(paths, "knowledge/people/dana-scott.md"))
+    assert fm["aliases"] == ["D. Scott", "dana@example.com"]
+
+
+# -- refusals ---------------------------------------------------------------
+# Each case seeds a vault and returns the fact note text; the assertions are
+# shared, because a refused merge must leave both entity notes AND the fact
+# byte-for-byte as it found them.
+
+def _refuse_survivor_missing(paths: VaultPaths) -> str:
+    _write(paths, "knowledge/people/danaexamplecom.md", _email_note("dana@example.com"))
+    return _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott")
+
+
+def _refuse_survivor_superseded(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(
+        paths, "knowledge/people/dana-scott.md",
+        "---\ntitle: Dana Scott\ntype: person\n"
+        "superseded_by: knowledge/people/dana-scott-2\n---\n\n## Log\n",
+    )
+    return _merge_fact(duplicate="people/danaexamplecom", survivor="people/dana-scott")
+
+
+def _refuse_same_node(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    return _merge_fact(duplicate="people/dana-scott", survivor="people/dana-scott")
+
+
+def _refuse_duplicate_not_a_node(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(paths, "knowledge/concepts/graphs.md", "---\ntitle: Graphs\n---\n\n## Log\n")
+    return _merge_fact(duplicate="concepts/graphs", survivor="people/dana-scott")
+
+
+def _refuse_survivor_not_a_node(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _write(paths, "knowledge/concepts/graphs.md", "---\ntitle: Graphs\n---\n\n## Log\n")
+    return _merge_fact(duplicate="people/danaexamplecom", survivor="concepts/graphs")
+
+
+def _refuse_survivor_is_not_the_target(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    _seed_pair(paths, *_LIVE_PAIRS[1])
+    return _merge_fact(
+        duplicate="people/danaexamplecom", survivor="people/dana-scott",
+        target="people/milo-frey",
+    )
+
+
+def _refuse_duplicate_note_missing(paths: VaultPaths) -> str:
+    _write(paths, "knowledge/people/dana-scott.md", _named_note("Dana Scott"))
+    return _merge_fact(duplicate="people/ghostexamplecom", survivor="people/dana-scott")
+
+
+def _refuse_merge_not_a_mapping(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    return _merge_fact(
+        duplicate="people/danaexamplecom", survivor="people/dana-scott",
+        merge_block="  merge: people/danaexamplecom\n",
+    )
+
+
+def _refuse_merge_unknown_key(paths: VaultPaths) -> str:
+    _seed_pair(paths, *_LIVE_PAIRS[0])
+    return _merge_fact(
+        duplicate="people/danaexamplecom", survivor="people/dana-scott",
+        merge_block=(
+            "  merge:\n    duplicat: people/danaexamplecom\n"
+            "    survivor: people/dana-scott\n"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        (_refuse_survivor_missing, "resolves to no note"),
+        (_refuse_survivor_superseded, "is itself superseded"),
+        (_refuse_same_node, "as both duplicate and survivor"),
+        (_refuse_duplicate_not_a_node, "duplicate 'concepts/graphs' is not an entity node"),
+        (_refuse_survivor_not_a_node, "survivor 'concepts/graphs' is not an entity node"),
+        (_refuse_survivor_is_not_the_target, "is not promote.target"),
+        (_refuse_duplicate_note_missing, "duplicate 'people/ghostexamplecom' resolves to no note"),
+        (_refuse_merge_not_a_mapping, "promote.merge is a str, not a mapping"),
+        (_refuse_merge_unknown_key, "unknown key(s) duplicat"),
+    ],
+    ids=[
+        "survivor-missing", "survivor-superseded", "duplicate-is-survivor",
+        "duplicate-not-a-node", "survivor-not-a-node", "survivor-is-not-target",
+        "duplicate-note-missing", "merge-not-a-mapping", "merge-unknown-key",
+    ],
+)
+def test_merge_refusal_leaves_everything_untouched(
+    setup: Callable[[VaultPaths], str], expected: str, tmp_path: Path
+) -> None:
+    paths = _vault(tmp_path)
+    _write(paths, f"{_INBOX}/merge-dana.md", setup(paths))
+    _approve(paths, "merge-dana.md")
+    before = _snapshot(paths.root)
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 0
+    assert stats.unresolved == 1
+    assert _snapshot(paths.root) == before
+    assert any(expected in problem for problem in stats.problems), stats.problems

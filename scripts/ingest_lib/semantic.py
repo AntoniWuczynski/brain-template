@@ -59,7 +59,8 @@ if TYPE_CHECKING:
     import numpy as np
     from .lexical import LexicalIndex
 
-from .config import VaultPaths
+from . import rank as rank_lib
+from .config import RankingConfig, VaultPaths, ranking_config
 from .knowledge import KNOWLEDGE_EXTRACTOR, _record_for_note, knowledge_records
 from .metadata import IndexRecord, latest_records_by_path
 from .notes import _split_frontmatter
@@ -1253,6 +1254,12 @@ def search(
     # truncated to 100. Behaviour-preserving for the MCP callers (top_k<=50).
     cand = min(n, max(_CANDIDATES, top_k))
 
+    # Optional ranking layers, all OFF unless the environment switches them
+    # on (config.ranking_config) and all hybrid-only: dense and lexical
+    # return raw cosine / BM25 scores, whose meaning an additive boost or a
+    # cross-encoder reorder would silently change.
+    cfg = ranking_config() if mode == "hybrid" else RankingConfig()
+
     # --- dense ranking (skipped for lexical mode -> no model load) ----------
     dense_rank: list[int] = []
     dense_scores = None
@@ -1278,6 +1285,17 @@ def search(
             dense_scores = (vectors @ q_vec.T).ravel()
             top = np.argpartition(-dense_scores, cand - 1)[:cand]
             dense_rank = [int(i) for i in top[np.argsort(-dense_scores[top])]]
+
+    # AFTER the model load: a degraded (lexical-only) search returns below
+    # without ever fusing the paraphrases, so asking for them first paid an
+    # LLM call for work that was thrown away, and logged it as a success.
+    variants: list[str] = []
+    if cfg.query_expansion and not degraded:
+        from . import rank as _rank
+
+        variants = _rank.expand_query(paths, query, cfg, log)
+        if variants:
+            log.info("semantic: query expanded with %d paraphrase(s)", len(variants))
 
     # --- lexical ranking ----------------------------------------------------
     lex_scores: dict[int, float] = {}
@@ -1307,9 +1325,33 @@ def search(
 
     # hybrid: reciprocal-rank fusion of the two candidate lists.
     rrf: dict[int, float] = {}
-    for rank, i in enumerate(dense_rank, start=1):
-        rrf[i] = rrf.get(i, 0.0) + 1.0 / (_RRF_K + rank)
-    for rank, i in enumerate(lex_rank, start=1):
-        rrf[i] = rrf.get(i, 0.0) + 1.0 / (_RRF_K + rank)
-    fused = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
-    return [_hit_from_row(meta, i, s) for i, s in fused]
+
+    def _fuse(order: list[int], weight: float) -> None:
+        for rank, i in enumerate(order, start=1):
+            rrf[i] = rrf.get(i, 0.0) + weight / (_RRF_K + rank)
+
+    _fuse(dense_rank, 1.0)
+    _fuse(lex_rank, 1.0)
+    # Query expansion: each paraphrase contributes its own dense and lexical
+    # rankings at a discount, so a paraphrase can lift a source the original
+    # wording missed without being able to outvote the query actually asked.
+    for variant in variants:
+        v_vec = encode_query(model, variant)
+        v_scores = (vectors @ v_vec.T).ravel()
+        v_top = np.argpartition(-v_scores, cand - 1)[:cand]
+        _fuse(
+            [int(i) for i in v_top[np.argsort(-v_scores[v_top])]],
+            cfg.query_expansion_weight,
+        )
+        v_lex = _lex.score(lidx, variant)
+        _fuse(
+            [i for i, _s in sorted(v_lex.items(), key=lambda kv: (-kv[1], kv[0]))][:cand],
+            cfg.query_expansion_weight,
+        )
+
+    fused_all = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))
+    if cfg.graph_boost or cfg.salience or cfg.rerank:
+        fused_all = rank_lib.apply_layers(
+            paths, query, fused_all, meta, cfg=cfg, log=log, unit=1.0 / (_RRF_K + 1)
+        )
+    return [_hit_from_row(meta, i, s) for i, s in fused_all[:top_k]]

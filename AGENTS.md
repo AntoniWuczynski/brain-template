@@ -182,6 +182,31 @@ prose. Blank starting points for people, organisations and meetings live in
   when. `sweep`'s `entity-duplicate` check recognises exactly this shape and
   stops reporting the pair once any part of it is present.
 
+  Those four steps are also EXECUTABLE, so a merge is a deterministic write
+  rather than a careful hand-edit across two notes (`FOUNDER_DECISIONS.md`
+  IMP-021). A memory fact may carry an optional `promote.merge` naming the
+  pair — the contract is `knowledge/index/templates/memory-fact.md`:
+
+  ```yaml
+  promote:
+    target: people/anna-kowalska        # the survivor, always
+    merge:
+      duplicate: people/annakowalskaexamplecom
+      survivor: people/anna-kowalska
+  ```
+
+  `scripts/consolidate.py` performs exactly those four steps on
+  `approved: true` and nothing else, closing the duplicate's open spans with
+  `valid_until` set to the run's date. Both note writes go through
+  `scripts/ingest_lib/atomic.py`; everything is validated and computed before
+  the first byte is written, so a refusal (no survivor note, a survivor that
+  is itself superseded, one node named as both halves, an id that is no graph
+  node by `relations.canonical_entity_id`) changes nothing and leaves the
+  fact in the inbox with the reason logged. A duplicate that already carries
+  `superseded_by` is a no-op, so re-running is safe. Nothing here bypasses
+  the gate: without a human's `approved: true` the fact just waits.
+  `python -m ingest_lib.duplicates` proposes these facts; it never merges.
+
 - **Meetings are first-class notes** at
   `knowledge/meetings/<YYYY>/<YYYY-MM-DD>-<slug>.md`, joining people,
   organisations and projects: every attendee gets an `attended` relation,

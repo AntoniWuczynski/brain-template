@@ -191,6 +191,57 @@ def test_propose_different_content_gets_a_different_file(tmp_path: Path) -> None
     assert len(_inbox_notes(paths)) == 2
 
 
+def test_declared_identity_pins_the_filename_across_rewordings(
+    tmp_path: Path,
+) -> None:
+    """A pass that GENERATES its ``fact``/``source`` prose declares what
+    actually identifies its candidate. Editing the wording then re-proposes
+    the same file — it does not mint a second note beside the one already
+    waiting in the human's inbox (which is what a scheduled pass would do on
+    the night after its prose was edited)."""
+    paths = _vault(tmp_path)
+    first = propose_fact(
+        paths, kind="entity-duplicate-merge", title="candidate",
+        target="people/dana-scott", source="people/danaexamplecom",
+        reason="first wording", fact="dana@example.com appears to be the same",
+        identity=("people/danaexamplecom", "people/dana-scott"), now=NOW,
+    )
+    second = propose_fact(
+        paths, kind="entity-duplicate-merge", title="candidate (reworded)",
+        target="people/dana-scott", source="knowledge/people/danaexamplecom",
+        reason="second wording", fact="dana@example.com is the same entity",
+        identity=("people/danaexamplecom", "people/dana-scott"), now=NOW,
+    )
+
+    assert first.action == "proposed"
+    assert second.action == "exists"
+    assert second.path == first.path
+    assert len(_inbox_notes(paths)) == 1
+
+
+def test_declared_identity_still_separates_different_candidates(
+    tmp_path: Path,
+) -> None:
+    """Identity narrows the key; it does not collapse it. Two different
+    merge pairs onto the same survivor are still two proposals."""
+    paths = _vault(tmp_path)
+    a = propose_fact(
+        paths, kind="entity-duplicate-merge", title="candidate",
+        target="people/dana-scott", source="knowledge/people/danaexamplecom",
+        reason="r", identity=("people/danaexamplecom", "people/dana-scott"),
+        now=NOW,
+    )
+    b = propose_fact(
+        paths, kind="entity-duplicate-merge", title="candidate",
+        target="people/dana-scott", source="knowledge/people/danaoldmailcom",
+        reason="r", identity=("people/danaoldmailcom", "people/dana-scott"),
+        now=NOW,
+    )
+
+    assert a.path != b.path
+    assert len(_inbox_notes(paths)) == 2
+
+
 def test_propose_dry_run_writes_nothing(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     result = propose_fact(

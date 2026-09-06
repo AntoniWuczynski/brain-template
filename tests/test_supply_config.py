@@ -27,6 +27,17 @@ def _read(rel: str) -> str:
     return (_ROOT / rel).read_text(encoding="utf-8")
 
 
+def _skip_if_private_only(rel: str) -> None:
+    """Skip a guard over a file that push_to_upstream.sh does not publish.
+
+    tests/ is copied verbatim to the public template branch, so a test that
+    reads a private-repo-only file fails there for a reason nobody on that
+    branch can fix. Skipping names the file instead.
+    """
+    if not (_ROOT / rel).is_file():
+        pytest.skip(f"private-repo check: {rel} is not synced to the template")
+
+
 # --------------------------------------------------------------------------
 # CI install step
 # --------------------------------------------------------------------------
@@ -65,6 +76,7 @@ def test_ci_excludes_every_torch_only_cuda_package() -> None:
 def test_dependabot_feeds_python_dependencies_too() -> None:
     """Actions-only coverage leaves uv.lock with no update or vulnerability
     feed, and every pyproject bound is an open-ended lower bound."""
+    _skip_if_private_only(".github/dependabot.yml")
     cfg = _read(".github/dependabot.yml")
     ecosystems = set(re.findall(r"package-ecosystem:\s*\"?([\w-]+)", cfg))
     assert ecosystems == {"github-actions", "uv"}
@@ -208,6 +220,7 @@ def test_push_script_prints_the_pull_request_flow() -> None:
 def test_template_reminder_hook_covers_every_framework_path() -> None:
     """The hook is the only nudge that a change here needs publishing, so its
     path list must not drift from what push_to_upstream.sh actually syncs."""
+    _skip_if_private_only(".claude/hooks/remind-template-sync.py")
     hook = _read(".claude/hooks/remind-template-sync.py")
     prefixes = tuple(re.findall(r'^\s+"([^"]+/)",$', hook, re.M))
     files = set(re.findall(r'^\s+"([^"]+[^/])",$', hook, re.M))

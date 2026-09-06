@@ -12,6 +12,9 @@ promote:
   relations: []
   fact: ""
   source: ""
+  # merge:                       # optional; see "Merging a duplicate entity"
+  #   duplicate: people/<slug>
+  #   survivor: people/<slug>
 ---
 
 _(Free-form context: why the assistant believes this fact, quotes,
@@ -33,8 +36,8 @@ Lifecycle:
    approved: true OR confirmations >= threshold: `promote.fact` is
    appended to the target entity note's Log
    ("- YYYY-MM-DD — fact ([[source]])"), `promote.relations` are merged
-   into its frontmatter, and the fact note is moved to
-   knowledge/assistant/archive/.
+   into its frontmatter, an optional `promote.merge` is performed, and
+   the fact note is moved to knowledge/assistant/archive/.
 3. Facts that stay unconsolidated are swept into a monthly digest under
    knowledge/assistant/digests/ instead of accumulating forever.
 
@@ -50,7 +53,32 @@ Shapes:
   met_at, related_to; targets are knowledge/-relative no-extension paths.
 - promote.fact: a single line — it lands verbatim in the target's Log.
 - promote.source: vault-relative no-extension path of the note the fact
-  came from.
+  came from. It lands verbatim inside the [[…]] of the Log line, so it
+  keeps its knowledge/ prefix — a bare node id there dangles.
+- promote.merge: OPTIONAL, and the only shape that changes a note other
+  than promote.target. Two node ids:
+
+      promote:
+        target: people/anna-kowalska        # == merge.survivor
+        merge:
+          duplicate: people/annakowalskaexamplecom
+          survivor: people/anna-kowalska
+
+  On approval, consolidate.py performs the four steps AGENTS.md's
+  "Merging a duplicate entity" paragraph defines, and nothing else: copy
+  the duplicate's relations onto the survivor, close every open relation
+  on the duplicate with valid_until set to the run's date, add
+  superseded_by: knowledge/<survivor> to the duplicate's frontmatter, and
+  keep the duplicate's title as an aliases: entry on the survivor. The
+  duplicate note stays on disk — supersede, never delete.
+
+  The survivor MUST be promote.target (it is the note the fact promotes
+  into). The merge is refused outright, with the fact left in the inbox
+  and the reason logged, when the survivor note does not exist, the
+  survivor is itself superseded, the two ids name one node, or either id
+  is not a graph node. A duplicate that already carries superseded_by is
+  an already-merged pair: the merge is a no-op and the fact still
+  archives, so re-running is safe.
 
 This directory (knowledge/index/templates/) sits OUTSIDE the enrichment
 scan — templates are never embedded, indexed, or surfaced in search.

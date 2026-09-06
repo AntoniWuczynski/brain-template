@@ -68,6 +68,11 @@ class IngestStats:
 # Planning
 # ---------------------------------------------------------------------------
 
+# The extractor name a connector snapshot records; the meeting-promotion
+# pass below is gated on one of these having been processed this run.
+_MEETING_EXTRACTOR = "meeting"
+
+
 def plan_ingest(
     paths: VaultPaths,
     *,
@@ -236,6 +241,30 @@ def run_ingest(
     # not on dry-runs). Cheap: just walks the JSONL, no LLM calls.
     wrote_content = stats.processed or stats.partial
     if not dry_run and wrote_content:
+        # Promote meeting snapshots BEFORE the index/concept/dashboard
+        # rebuilds below, so a meeting note this run derives is embedded and
+        # linked by the same run rather than waiting for the next one. Gated
+        # on a snapshot actually having been processed: the pass is a whole
+        # extra scan of knowledge/, and a run that ingested only PDFs has
+        # nothing new for it to find. Non-fatal, like every other derived
+        # rebuild — the nightly `python -m ingest_lib.meetings` picks up
+        # whatever a failure here left behind.
+        if any(
+            (rec := known.get(item.relative_path)) is not None
+            and rec.extractor == _MEETING_EXTRACTOR
+            for item in plan.items
+        ):
+            try:
+                from .meetings import promote_meetings
+                report = promote_meetings(paths)
+                logger.info(
+                    "meetings: notes written=%d proposals=%d skipped=%d",
+                    sum(1 for pr in report.promotions if pr.note_action == "written"),
+                    sum(len(pr.proposals) for pr in report.promotions),
+                    len(report.skipped),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("meetings: promotion failed (%r) — skipping", exc)
         # Build the semantic index first: concept centroids (and thus the
         # connection graph's semantic edges) read fresh vectors from it.
         # Cheap (~1 chunk/ms on MPS); failure is non-fatal — search just

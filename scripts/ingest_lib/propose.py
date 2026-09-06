@@ -76,8 +76,11 @@ _SLUG_MAX_CHARS = 60
 
 
 # What one propose_fact call did. Closed set, so a caller branching on it
-# cannot compare against a typo'd string.
-ProposeAction = Literal["proposed", "exists", "archived"]
+# cannot compare against a typo'd string. "reconciled" is not produced by
+# :func:`propose_fact` itself — it belongs to a pass that found an earlier
+# note for the same candidate and brought it up to the current contract in
+# place instead of proposing a second one (see ``ingest_lib.duplicates``).
+ProposeAction = Literal["proposed", "exists", "archived", "reconciled"]
 
 
 @dataclass(frozen=True)
@@ -98,7 +101,13 @@ class ProposeResult:
 
 
 def _content_key(
-    *, kind: str, target: str, relations: Sequence[Relation], fact: str, source: str
+    *,
+    kind: str,
+    target: str,
+    relations: Sequence[Relation],
+    fact: str,
+    source: str,
+    identity: Sequence[str] | None = None,
 ) -> str:
     """Canonical string identifying one proposal's content.
 
@@ -108,7 +117,20 @@ def _content_key(
     so a caller that wants order-independence sorts before calling. \x1f
     (unit separator) can't appear in any field's normal content, so the
     join can't collide two different tuples onto one key.
+
+    ``identity`` lets a proposer declare WHICH fields identify its
+    candidate, when the default (every promote field, wording included) is
+    too wide. A pass whose ``fact``/``source`` prose is generated — and so
+    changes whenever the pass's wording is edited — would otherwise re-hash
+    to a fresh filename on the next run and mint a SECOND note beside the
+    one already awaiting the human, both about the same candidate. Declaring
+    the identity fields (for the duplicate-entity pass: the merge pair)
+    keeps the filename pinned to what the proposal is ABOUT, so a re-wording
+    is not a new proposal. ``kind`` and ``target`` are always part of the
+    key, so they are not repeated in ``identity``.
     """
+    if identity is not None:
+        return "\x1f".join([kind, target, *identity])
     rel_parts = "\x1e".join(
         f"{r.rel}\x1f{r.target}\x1f{r.valid_from}\x1f{r.valid_until}\x1f{r.source}"
         for r in relations
@@ -230,6 +252,7 @@ def propose_fact(
     reason: str,
     relations: Sequence[Relation] = (),
     fact: str = "",
+    identity: Sequence[str] | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
 ) -> ProposeResult:
@@ -254,6 +277,11 @@ def propose_fact(
     what makes a scheduled pass idempotent: re-running it over an
     unchanged vault proposes nothing new.
 
+    ``identity`` narrows that filename to the fields the CALLER says
+    identify its candidate (see :func:`_content_key`), so editing the
+    generated ``fact``/``reason`` wording of a scheduled pass does not
+    re-hash every one of its live proposals into a second copy.
+
     "Already proposed" is a vault-wide fact, not an inbox-directory one:
     ``knowledge/assistant/archive/`` is checked too (see
     :func:`_archived_path`), because ``consolidate.py`` moves a fact
@@ -276,7 +304,10 @@ def propose_fact(
     ``dry_run`` computes the destination and the content but never writes,
     still distinguishing ``"exists"`` from what would be ``"proposed"``.
     """
-    key = _content_key(kind=kind, target=target, relations=relations, fact=fact, source=source)
+    key = _content_key(
+        kind=kind, target=target, relations=relations, fact=fact,
+        source=source, identity=identity,
+    )
     filename = _proposal_filename(kind=kind, target=target, key=key)
     rel_path = f"{_INBOX_REL}/{filename}"
     dest = paths.root / rel_path

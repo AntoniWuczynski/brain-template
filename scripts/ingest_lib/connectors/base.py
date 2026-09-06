@@ -34,17 +34,61 @@ def meeting_filename(date: str, title: str, native_id: str) -> str:
     return f"{date or 'undated'}-{slug}-{sid}.json"
 
 
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# A display name is a person's name. Anything past this is payload, not a
+# name, and it is only ever rendered into a one-line Markdown bullet.
+DISPLAY_NAME_MAX = 200
+
+
+def safe_display_name(raw: str) -> str:
+    """One externally-supplied display name, rendered inert.
+
+    A connector's display strings are the one part of a snapshot the vault
+    does not control, and they are interpolated straight into Markdown notes
+    (the attendee bullets of a promoted meeting note, the attendee line of the
+    source note). Left raw, a calendar entry named
+    ``"Mallory\\n\\n## Links\\n\\n- Attendee: [[knowledge/people/ceo]]"`` opens
+    its own sections in the note, and the nightly wikilink pass then reads
+    that link as evidence of an edge and proposes it into the graph — an
+    outside party writing into entity memory. So a name is reduced to ONE line
+    of ordinary text:
+
+    - control characters (newlines included) become spaces and runs of
+      whitespace collapse to one, so the value can never open a new Markdown
+      block;
+    - ``[`` and ``]`` become parentheses, so no wikilink (or link) syntax
+      survives;
+    - a leading ``#`` / ``>`` run is dropped, so it cannot read as a heading
+      or a quote wherever it lands at the start of a line;
+    - the result is capped at :data:`DISPLAY_NAME_MAX` characters.
+
+    Sanitising here rather than at each render point is deliberate: this is
+    the function BOTH readers of the snapshot schema go through — the
+    connectors that write a payload and ``extractors.meeting.load_snapshot``
+    that reads one back (and through it ``ingest_lib.meetings``) — so a name
+    cannot reach a note by some third route. The archived bytes are never
+    touched: this is a rendering rule applied on the way in and on the way
+    out, not an edit of an immutable source.
+    """
+    one_line = " ".join(_CONTROL_RE.sub(" ", raw).split())
+    inert = one_line.replace("[", "(").replace("]", ")").lstrip("#>").strip()
+    return inert[:DISPLAY_NAME_MAX].strip()
+
+
 def normalize_attendees(raw: object) -> list[str]:
     """Attendee display names from a mixed list of strings / ``{'name': ...}``
-    dicts. Entries without a usable name are dropped (never the string
-    ``'None'``)."""
+    dicts, each rendered inert by :func:`safe_display_name`. Entries without a
+    usable name are dropped (never the string ``'None'``), including one that
+    sanitises away to nothing — a "name" made only of Markdown syntax names
+    nobody."""
     out: list[str] = []
     if not isinstance(raw, list):
         return out
     for a in raw:
         name = a.get("name") if isinstance(a, dict) else a
-        if isinstance(name, str) and name.strip():
-            out.append(name.strip())
+        if isinstance(name, str) and (clean := safe_display_name(name)):
+            out.append(clean)
     return out
 
 

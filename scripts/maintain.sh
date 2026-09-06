@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # Deterministic vault maintenance: propose wikilink-derived relations,
-# consolidate assistant memory, rebuild the search index, lint the vault,
-# rotate telemetry, then commit whatever the run wrote. Every step is
+# promote meeting snapshots, consolidate assistant memory, rebuild the search
+# index, lint the vault, rotate telemetry, then commit whatever the run wrote.
+# Every step is
 # cron/launchd-safe (deterministic, exit 0, no interactive git), so this is
 # the single entry point for a scheduler AND for running by hand.
 #
@@ -82,6 +83,17 @@ echo "[maintain $(ts)] propose duplicate-entity merge candidates"
 # knowledge/assistant/inbox/ for consolidate (below) to surface for a human
 # to approve — the merge itself still has to be performed per AGENTS.md.
 run_py -m ingest_lib.duplicates $DRY || echo "[maintain] duplicate-entity pass failed (non-fatal)"
+
+echo "[maintain $(ts)] promote meeting snapshots"
+# Zero-LLM, deterministic (scripts/ingest_lib/meetings.py): turns processed
+# Granola/justREC snapshots into first-class knowledge/meetings/<YYYY>/
+# notes (derived output, written only when absent) and proposes one
+# `attended` relation per resolved attendee into knowledge/assistant/inbox/.
+# An attendee matching no existing people/ note mints NOTHING — it is listed
+# by display name in the note and in this run's output. Same ordering
+# argument as the two passes above: the inbox must be complete before
+# consolidate reads it, and tonight's proposals can only ever be waited on.
+run_py -m ingest_lib.meetings $DRY || echo "[maintain] meeting promotion failed (non-fatal)"
 
 echo "[maintain $(ts)] consolidate assistant memory"
 # $DRY is unquoted so an empty value expands to nothing (no phantom "" arg).

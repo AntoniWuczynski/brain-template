@@ -52,7 +52,17 @@ weights). BM25 runs over the chunk text already in
 ``metadata/embeddings_meta.jsonl`` (``ingest_lib/lexical.py``, an mtime-cached
 in-memory inverted index) — no new files on disk. Measure changes with
 ``scripts/eval_retrieval.py`` (recall@k / MRR over
-``scripts/eval/retrieval_golden.jsonl``). Two extra modes: ``--compare-modes``
+``scripts/eval/retrieval_golden.jsonl``, 87 hand-labelled queries). Every
+query that did not retrieve all of its expected sources gets a per-query
+breakdown naming the absent path, its true rank, what outranked it and the
+label's own justification (``--no-miss-breakdown`` suppresses it). Three extra
+modes: ``--compare A --compare B`` A/Bs two configurations over the same set
+and prints the per-query rank delta plus improved/regressed counts — each
+argument is comma-separated ``key=value`` (``mode=dense|lexical|hybrid`` plus
+any ``ENV_VAR=value`` the ranker reads, e.g.
+``--compare mode=hybrid --compare mode=hybrid,BRAIN_QUERY_INSTRUCTION=0``), so
+a ranking change gated behind an env var can be scored against the baseline in
+one process; ``--compare-modes``
 scores dense / lexical / hybrid side by side over the golden set, and
 ``--mine-log`` harvests the real query distribution from
 ``logs/mcp-access.jsonl`` into ``scripts/eval/mined_candidates.jsonl`` (with a
@@ -61,6 +71,18 @@ carry ``expected: []`` — a human confirms relevance before promoting a line
 into the golden set; the file is gitignored (it holds real query strings) and
 never synced to the template. ``--golden PATH`` points ``eval_retrieval.py``
 at a different query set (default ``scripts/eval/retrieval_golden.jsonl``).
+**Golden-set contract.** A line is ``{"query", "expected": [source_paths],
+"note"}``; ``expected`` paths are the retrieval layer's own source ids
+(``university/<module>/<file>.pdf`` for archive sources,
+``knowledge/<...>.md`` for curated notes), and ``note`` records *why* each
+expected path is the right answer — labelled by reading the source, never by
+trusting what the ranker returned. A query whose right answer the current
+ranker misses is the valuable kind and belongs in the set. The set is only a
+gate while it has headroom: at 87 queries the live baseline is recall@5 0.920,
+recall@10 0.971, MRR 0.803, so a ranking change has something to win. The file
+syncs to the public template, so queries and notes may name course codes and
+topics but never private individuals or contact details
+(``tests/test_eval_retrieval.py`` enforces the shape and that floor).
 
 - First run downloads ~100 MB of model weights to ``~/.cache/huggingface/``.
 - **Query instruction.** ``bge-small-en-v1.5`` is trained to prepend
@@ -101,6 +123,124 @@ at a different query set (default ``scripts/eval/retrieval_golden.jsonl``).
   (half-life decay on each note's ``updated`` date; ``memory_status:
   superseded`` notes down-weighted ×0.2). No extra storage, nothing to
   rebuild.
+
+### Optional ranking layers (all OFF by default)
+
+``ingest_lib/rank.py`` adds four independent layers on top of the hybrid
+fusion, each switched by an environment variable read at call time
+(``config.ranking_config``). **With no environment set nothing runs and the
+ranking is unchanged**, so the live MCP server behaves exactly as it did until
+the owner flips a flag. All four apply to ``mode="hybrid"`` only — ``dense``
+and ``lexical`` return raw cosine / BM25 scores, whose meaning an RRF-scale
+boost or a cross-encoder reorder would silently change. Nothing here is
+random: every ordering breaks ties on the candidate's row index.
+
+| variable | default | what it does |
+| --- | --- | --- |
+| ``BRAIN_RANK_GRAPH`` | off | graph-adjacency boost from ``metadata/connections.jsonl`` |
+| ``BRAIN_RANK_GRAPH_WEIGHT`` | ``0.5`` | boost ceiling, in units of the top RRF contribution ``1/(k+1)`` |
+| ``BRAIN_RANK_SALIENCE`` | off | per-note salience (curated-vs-archive + typed-relation degree) |
+| ``BRAIN_RANK_SALIENCE_WEIGHT`` | ``0.5`` | same units |
+| ``BRAIN_RANK_RERANK`` | off | cross-encoder rerank of the top fused hits |
+| ``BRAIN_RANK_RERANK_TOP_N`` | ``30`` | size of the reranked window |
+| ``BRAIN_RANK_RERANK_MODEL`` | ``cross-encoder/ms-marco-MiniLM-L-6-v2`` | 22.7M params, ~88 MB, Apache-2.0 |
+| ``BRAIN_QUERY_EXPANSION`` | off | union LLM paraphrases of the query into the fusion |
+| ``BRAIN_QUERY_EXPANSION_VARIANTS`` | ``3`` | paraphrases requested (clamped to 1-5) |
+| ``BRAIN_QUERY_EXPANSION_WEIGHT`` | ``0.5`` | a paraphrase ranking's weight in the fusion |
+
+- **Graph adjacency** reads the connection graph the concept pass already
+  writes. Co-occurrence edges carry their backing sources, which gives a
+  source→concept map for free; a hit is boosted when its source's concepts
+  overlap the profile of the query's own top hits (one hop of expansion, never
+  two) and when it is corroborated by several distinct other top sources.
+  Typed entity edges are a separate signal, used only to relate a
+  knowledge-note hit to entity nodes the top hits already name — a hit's node
+  is resolved through ``relations.canonical_entity_id``, never a path prefix.
+  Leave-one-out: a seed never scores its own concepts back, so the boost
+  cannot merely re-state the rank a hit already had. Cost is
+  O(hits × concepts-per-source × 8), and the file is parsed once per
+  generation and cached by mtime.
+  The boost is a function of the QUERY, not of how many hits were asked for.
+  Two things enforce that, and both matter because ``recency.memory_search``
+  fetches 500 candidates on a filtered query while the eval measures at 10:
+  the profile is seeded only from the top 10 fused rows (collecting ten
+  distinct sources without that bound reached fused rank 34 on this index,
+  where the order moves as soon as the pool widens), and the affinity is
+  normalised against the seeds themselves rather than against the maximum
+  over the candidate pool. Measured over 30 golden queries, the top ten now
+  differs between ``top_k`` 10, 50 and 500 for 2 queries with the boost on,
+  which is the baseline's own pool-widening variation.
+- **Salience** adds ``0.5 × curated + 0.5 × log-saturated typed degree``. It
+  only ever ADDS, and only to curated notes, so an archive chunk's score is
+  untouched (measured: it still moves the mix, see below).
+- **Rerank** scores ``(query, chunk)`` pairs with the cross-encoder and
+  permutes the window. The window's own fused scores are re-assigned in the
+  new order, so ``SearchHit.score`` stays the documented RRF-scale rank score
+  and ``recency.memory_search``'s ``score × recency`` keeps its meaning.
+  ``sentence_transformers`` is imported lazily behind ``try/except`` (CI
+  installs neither it nor torch); an unavailable model logs and leaves the
+  fused order untouched. No new dependency — ``CrossEncoder`` ships in the
+  ``sentence-transformers`` package the embedder already needs. First use
+  downloads ~88 MB to ``~/.cache/huggingface/`` and costs a ~20 s one-off
+  model load (inside the MCP server that is paid once per process, on the
+  first search after the flag is set).
+- **Query expansion** asks the configured LLM router for 2-3 paraphrases and
+  fuses each one's dense and lexical rankings at ``query_expansion_weight``.
+  It costs one LLM call per uncached query, so paraphrases are cached in
+  ``metadata/.cache/query-expansion.json`` (gitignored, regenerable). The key
+  is the query prefixed by a digest of everything else that decides the
+  answer — the prompt text, the number of paraphrases asked for, and the
+  resolved provider and model — so editing the prompt, raising
+  ``BRAIN_QUERY_EXPANSION_VARIANTS`` or switching provider re-asks instead of
+  serving the previous prompt's answer forever. Entries are evicted oldest
+  first by an insertion counter, not by position in the file, which is sorted
+  by key. It needs an LLM key in the *process* environment —
+  ``eval_retrieval.py`` does not load ``.env``.
+
+**A/B results on the 87-query golden set** (live index, 2026-09-06 21:00,
+re-measured after the graph boost was made pool-invariant; each feature
+measured alone against the same baseline with ``eval_retrieval.py --compare``,
+latency from 87 warm queries at ``top_k=10`` on an M-series laptop, ±1 ms run
+to run):
+
+| config | recall@5 | recall@10 | MRR | ms/query | archive share of top-10 |
+| --- | --- | --- | --- | --- | --- |
+| baseline (all off) | 0.937 | 0.971 | 0.817 | 19 | 0.814 |
+| ``BRAIN_RANK_GRAPH=1`` | 0.960 | 0.971 | 0.700 | 18 | 0.817 |
+| ``BRAIN_RANK_SALIENCE=1`` | 0.914 | 0.971 | 0.745 | 18 | 0.760 |
+| ``BRAIN_RANK_RERANK=1`` | 0.954 | 0.960 | 0.822 | 133 | 0.806 |
+| ``BRAIN_QUERY_EXPANSION=1``† | 0.902 | 0.971 | 0.749 | 73 (cached) | 0.803 |
+| ``GRAPH=1`` + ``RERANK=1`` | 0.954 | 0.977 | 0.819 | 134 | 0.808 |
+
+† Carried over from the 2026-09-06 03:20 run, where the baseline was 0.920 /
+0.971 / 0.803, so read it as -0.017 / +0.000 / -0.054 against that baseline
+rather than against the one above. It is the one row that cannot be re-run
+without spending real LLM calls and writing the vault's paraphrase cache.
+Absolute numbers move as the vault grows — the baseline was 0.920 in the
+morning and 0.937 that evening on an unchanged code path — so only
+same-run comparisons mean anything.
+
+Verdicts, on the evidence above: **the reranker is the only layer that pays
+for itself on its own** (+0.017 recall@5 at +0.005 MRR, for 7x the latency),
+and **graph + rerank is the best combination measured** (+0.017 / +0.006 /
++0.002): the reranker repairs the MRR the graph boost costs. The graph boost
+**alone trades MRR for recall**, and at the default weight of 0.5 it now
+trades a lot more of it (+0.023 recall@5 for -0.117 MRR) than the pre-fix
+code did on this same index (+0.017 / -0.041). That is not a regression,
+it is the layer at its stated strength: dividing by the pool maximum used to
+damp every boost by whatever the best-connected candidate in the pool happened
+to be, so the effective weight fell as the fetch widened. At
+``BRAIN_RANK_GRAPH_WEIGHT=0.25`` the same fix gives +0.017 recall@5 for -0.015
+MRR, which beats the old default on both metrics — if the boost is ever
+switched on, set the weight to 0.25 rather than leaving it at 0.5. It rewards
+hub notes, and in this vault the hubs are dream digests, so e.g. "which phone
+hardware refused to boot the generic system image" loses its exact answer note
+from rank 1 to a project digest. **Salience is a clear loss** at every weight
+tried (0.25/0.5/1.0 → MRR -0.034 / -0.072 / -0.147): curated notes are already
+well ranked, and lifting them further costs 6% of the archive's share of the
+top 10. **Query expansion** loses MRR at both weights tried (0.25 → -0.035,
+0.5 → -0.054) even though its paraphrases read well. All four therefore stay
+off; re-measure before enabling one, and A/B a single flag at a time.
 
 ## Curated knowledge notes as enrichment sources
 
@@ -305,6 +445,57 @@ live in `ingest_lib/sweep.py`.
 | `--write-report` | off | Also write findings to `knowledge/index/sweep-report.md` (atomic write) |
 | `--check-integrity` | off | Also re-hash every `archive/raw` file vs its recorded `source_hash` (`archive-corrupt`). Reads the whole archive, so opt-in |
 
+## Meeting promotion (snapshots -> graph nodes)
+
+`python -m ingest_lib.meetings [--dry-run]`
+(`scripts/ingest_lib/meetings.py`, run by `maintain.sh` after the
+duplicate pass, and called by `run_ingest` whenever a run processed a
+snapshot) turns a processed Granola/justREC snapshot into the first-class
+meeting note AGENTS.md describes — `knowledge/meetings/<YYYY>/<YYYY-MM-DD>-<slug>.md`,
+the same shape and slug (`concepts.slugify`) the MCP `meeting_create` tool
+writes — plus one proposed `attended` relation per attendee. Deterministic,
+zero-LLM, driven by `metadata/index.jsonl` (the records whose `extractor` is
+`meeting`), never by walking `archive/raw/`.
+
+The write is split along the vault's defining line:
+
+- **The meeting note is derived output**, so the pass writes it — but only
+  when it is ABSENT. An existing note is never rewritten (a human or an
+  agent may have filled in Agenda/Decisions/Actions). It carries
+  `source_file:` and a `Links -> Source:` wikilink back to the snapshot per
+  AGENTS.md rule 3, and `written_via: script` / `author: script:meeting-promotion`
+  — the same honest third provenance value `ingest_lib/propose.py` stamps.
+- **The `attended` edges on PEOPLE are graph writes**, so each one is
+  PROPOSED through `ingest_lib/propose.py` as its own `approved: false`
+  fact note in `knowledge/assistant/inbox/`. Only `consolidate.py` (a
+  human's approval, or enough confirmations) ever puts one on a person.
+
+**An unresolved attendee mints nothing.** Minting a node per attendee id is
+how a calendar payload carrying an email address split one person into two
+nodes, each collecting its own `attended` history — the `entity-duplicate`
+pairs `sweep`/`duplicates` now report. A name is resolved only against the
+`people/` notes that already exist, by the union of three matches, each
+followed through `superseded_by` to the live survivor: the accent-folded
+slug (`Antoni Wuczyński` -> `people/antoni-wuczynski`), the exact note title
+(which is what catches an attendee named by their address, whose node is
+slugged `people/alexasymmetricsecuritycom`), and an exact `aliases:` entry
+(what AGENTS.md's merge leaves behind). The union must come out at exactly
+one node: two people sharing a name is reported `ambiguous` and resolves to
+nothing. Anything unresolved is listed by display name in the note's
+`## Unresolved attendees` section and in the run's output, for a human to
+create the person note and re-run.
+
+Idempotent by construction: the note is written only when absent, a
+proposal's filename is content-derived, and an attendee whose note already
+declares the edge is not proposed at all — so a re-run over an unchanged
+vault writes nothing and proposes nothing new. A snapshot with no canonical
+`YYYY-MM-DD` date or no sluggable title names no node and is reported as
+skipped rather than guessed at. Two DIFFERENT snapshots landing on one
+`<date>-<slug>` id is reported as a conflict, with nothing written and
+nothing proposed; a note carrying no `source_file` at all (every meeting
+note `meeting_create` wrote) is treated as this same meeting and left
+untouched, with the attendee proposals still run.
+
 ## Memory consolidation
 
 `scripts/consolidate.py` is the deterministic "dream pass" over
@@ -318,6 +509,24 @@ staleness window are swept into monthly digests under
 `knowledge/assistant/digests/`. The fact-note contract is
 `knowledge/index/templates/memory-fact.md`; the pass itself lives in
 `ingest_lib/consolidate.py`.
+
+A fact may also carry an optional `promote.merge: {duplicate, survivor}`,
+and on `approved: true` the pass EXECUTES the duplicate-entity merge
+(`FOUNDER_DECISIONS.md` IMP-021) rather than just recording that one was
+recommended: it copies the duplicate's relations onto the survivor, closes
+every open relation on the duplicate with `valid_until` set to the run's
+date, stamps `superseded_by` on the duplicate, and keeps the duplicate's
+title as an alias on the survivor — the four steps AGENTS.md's "Merging a
+duplicate entity" paragraph defines, and nothing else. The duplicate note
+stays on disk (supersede, never delete), and `sweep`'s `entity-duplicate`
+check goes quiet on the pair afterwards. Everything is validated and
+computed before the first write, so a refusal — no survivor note, a
+survivor that is itself superseded, one node named as both halves, an id
+that is no graph node — changes nothing and leaves the fact in the inbox
+with the reason in the run's problems. An already-superseded duplicate is
+a no-op, so re-running is safe. `python -m ingest_lib.duplicates` (run by
+`maintain.sh`) proposes these facts for email-slugged twins; it never
+merges, and nothing merges without the human's `approved: true`.
 
 Once consolidated or digested, those notes are historical: only
 `knowledge/assistant/archive/` is excluded from the semantic index, so
@@ -341,8 +550,9 @@ concurrent MCP write could race the same note or the git index.
 
 ### Scheduling
 
-`scripts/maintain.sh` is the single entry point that runs `consolidate`,
-`sweep --write-report`, then `rotate_logs` — deterministic, exit 0, safe to
+`scripts/maintain.sh` is the single entry point that runs the wikilink,
+duplicate-entity and meeting-promotion passes, then `consolidate`,
+`sweep --write-report` and `rotate_logs` — deterministic, exit 0, safe to
 run by hand or on a schedule (`scripts/maintain.sh --dry-run` to plan only).
 It prefers the repo `.venv` interpreter so a scheduler needs no `uv` on PATH.
 Schedule it for a quiet hour (no cross-process lock vs a running MCP
@@ -461,7 +671,8 @@ safe like `sweep`/`consolidate`. Secrets come from `.env` — never a flag.
 
 **Shipped connectors** (both meeting sources normalise to one snapshot schema
 routed to `extractors/meeting.py` — title, date, attendees as `people/`
-wikilinks, summary, transcript):
+wikilinks, summary, transcript — and from there to the meeting-promotion
+pass above, which makes the meeting a graph node):
 
 - **`granola`** — pulls meetings from the Granola API (`GRANOLA_API_KEY`).
 - **`justrec`** — reads justREC's local export folder (`BRAIN_JUSTREC_DIR`),
