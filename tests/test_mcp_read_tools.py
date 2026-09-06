@@ -307,24 +307,24 @@ def test_tool_search_evidence_hint_superseded_note_resolves_to_survivor(env: _En
     # branch) must both resolve through live_entity_id to the survivor —
     # the dead node is never handed back as the entity to link.
     root, cfg, runtime = env
-    _write_entity_note(root, "knowledge/people/antoni-wuczynski.md", title="Antoni Wuczynski")
-    dead = root / "knowledge/people/antoniwuczynskigmailcom.md"
+    _write_entity_note(root, "knowledge/people/anna-kowalska.md", title="Anna Kowalska")
+    dead = root / "knowledge/people/annakowalskaexamplecom.md"
     dead.parent.mkdir(parents=True, exist_ok=True)
     dead.write_text(
-        "---\ntitle: antoni.wuczynski@gmail.com\n"
-        "superseded_by: people/antoni-wuczynski\n---\nbody\n",
+        "---\ntitle: anna.kowalska@example.com\n"
+        "superseded_by: people/anna-kowalska\n---\nbody\n",
         encoding="utf-8",
     )
     _write_note(root, "knowledge/notes/mentions.md")
     _seed_search_index(root, [
         {
-            "source_relative_path": "knowledge/people/antoniwuczynskigmailcom.md",
-            "source_hash": "h0", "title": "antoni.wuczynski@gmail.com", "chunk_idx": 0,
+            "source_relative_path": "knowledge/people/annakowalskaexamplecom.md",
+            "source_hash": "h0", "title": "anna.kowalska@example.com", "chunk_idx": 0,
             "text": "congestion note", "origin": "knowledge-note",
         },
         {
             "source_relative_path": "knowledge/notes/mentions.md",
-            "source_hash": "h1", "title": "antoni.wuczynski@gmail.com", "chunk_idx": 0,
+            "source_hash": "h1", "title": "anna.kowalska@example.com", "chunk_idx": 0,
             "text": "congestion mention", "origin": "knowledge-note",
         },
     ])
@@ -333,12 +333,12 @@ def test_tool_search_evidence_hint_superseded_note_resolves_to_survivor(env: _En
     by_path = {h.source_relative_path: h for h in out.hits}
 
     for path in (
-        "knowledge/people/antoniwuczynskigmailcom.md",
+        "knowledge/people/annakowalskaexamplecom.md",
         "knowledge/notes/mentions.md",
     ):
         hit = by_path[path]
         assert hit.evidence.status == "exists"
-        assert hit.evidence.node_id == "people/antoni-wuczynski"
+        assert hit.evidence.node_id == "people/anna-kowalska"
 
 
 def test_tool_search_skips_entity_index_build_when_no_hits(
