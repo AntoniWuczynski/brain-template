@@ -26,13 +26,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 from collections.abc import Mapping, Sequence
 
+from .atomic import atomic_write_text
 from .concepts import slugify
 from .config import VaultPaths
 from .knowledge import knowledge_records
@@ -302,7 +301,7 @@ def concept_vectors_from_embeddings(
     if not vectors_path.exists() or not meta_path.exists():
         return {}
     try:
-        import numpy as np  # type: ignore[import-not-found]
+        import numpy as np
     except ImportError:
         return {}
 
@@ -541,30 +540,22 @@ def _write_connections_jsonl(paths: VaultPaths, edges: list[Edge]) -> None:
     # history); both are "" on the undirected kinds, so their order — and
     # their serialised lines — stay byte-identical to the pre-typed format.
     ordered = sorted(edges, key=lambda e: (e.a, e.b, e.kind, e.rel, e.valid_from, e.valid_until))
-    fd, tmp = tempfile.mkstemp(prefix=".connections-", suffix=".jsonl", dir=str(paths.metadata))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            for e in ordered:
-                row: dict[str, object] = {
-                    "a": e.a,
-                    "b": e.b,
-                    "kind": e.kind,
-                    "weight": e.weight,
-                    "sources": list(e.sources),
-                }
-                if e.kind == _KIND_TYPED:
-                    # Only typed lines carry these keys, so existing
-                    # cooccurrence/semantic lines remain byte-identical.
-                    row["rel"] = e.rel
-                    row["valid_from"] = e.valid_from
-                    row["valid_until"] = e.valid_until
-                fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, target)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+    lines: list[str] = []
+    for e in ordered:
+        row: dict[str, object] = {
+            "a": e.a,
+            "b": e.b,
+            "kind": e.kind,
+            "weight": e.weight,
+            "sources": list(e.sources),
+        }
+        if e.kind == _KIND_TYPED:
+            # Only typed lines carry these keys, so existing
+            # cooccurrence/semantic lines remain byte-identical.
+            row["rel"] = e.rel
+            row["valid_from"] = e.valid_from
+            row["valid_until"] = e.valid_until
+        lines.append(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    # Derived, gitignored metadata rebuilt by every ingest — nothing edits it
+    # by hand, so it keeps mkstemp's 0600 like the other metadata writers.
+    atomic_write_text(target, "".join(lines), prefix=".connections-", suffix=".jsonl")

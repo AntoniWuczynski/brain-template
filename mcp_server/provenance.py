@@ -26,14 +26,25 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+import yaml
+
 # Make the ingest_lib package importable. Same shim the CLI scripts use.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from ingest_lib.concepts import slugify as _slugify  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib.notes import _split_frontmatter  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib.relations import parse_relations  # type: ignore[import-not-found]  # noqa: E402
+from ingest_lib.concepts import slugify as _slugify  # noqa: E402
+from ingest_lib.notes import _split_frontmatter  # noqa: E402
+from ingest_lib.relations import parse_relations  # noqa: E402
+
+from .errors import ToolError  # noqa: E402
+
+
+class ProvenanceError(ToolError):
+    """Raised when client frontmatter cannot be stamped: the fence is
+    present but does not parse as a YAML mapping, or the stamped result
+    would not."""
+
 
 # The four keys this module owns. Asserted lines matching ^<key>: are
 # replaced wholesale; everything else in the fence is untouched.
@@ -131,6 +142,43 @@ def _asserted_lines(
     return lines
 
 
+def _asserted_values(asserted: list[tuple[str, str]]) -> dict[str, object]:
+    """Resolved value for each ``(key, line)`` the server asserted, by
+    parsing each ``line`` (e.g. ``"author: 'agent:creator'"``) as its own
+    one-key YAML mapping. This is what a YAML reader will actually see for
+    that key, independent of the line's quoting."""
+    values: dict[str, object] = {}
+    for key, line in asserted:
+        loaded = yaml.safe_load(line)
+        if isinstance(loaded, dict) and key in loaded:
+            values[key] = loaded[key]
+    return values
+
+
+def _frontmatter_parse_error(text: str) -> str:
+    """Describe why ``text``'s leading frontmatter fence doesn't parse as a
+    YAML mapping. Mirrors ``notes._split_frontmatter``'s fence-finding
+    exactly, but keeps the ``yaml.safe_load`` error instead of swallowing
+    it, so the caller gets an actionable message."""
+    lines = text.splitlines(keepends=True)
+    close_idx = -1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            close_idx = i
+            break
+    if close_idx < 0:
+        return "no closing '---' fence found"
+    yaml_block = "".join(lines[1:close_idx])
+    try:
+        loaded = yaml.safe_load(yaml_block)
+    except yaml.YAMLError as exc:
+        return str(exc)
+    if not isinstance(loaded, dict):
+        kind = "null" if loaded is None else type(loaded).__name__
+        return f"frontmatter parses as {kind}, not a mapping"
+    return "frontmatter does not parse as a YAML mapping"
+
+
 def stamp_provenance(
     content: str,
     *,
@@ -149,49 +197,107 @@ def stamp_provenance(
     ``memory_status: consolidated`` past the consolidation gate. On
     replace/append the server-owned ``author``/``memory_status`` are
     re-derived from ``prior`` (the existing on-disk note), not from the
-    client's body. Content without parseable frontmatter gets a minimal
+    client's body. Content with no frontmatter fence at all gets a minimal
     block prepended containing only the provenance keys.
+
+    Content that DOES start with a ``---`` fence but that
+    ``notes._split_frontmatter`` can't read as a YAML mapping (invalid
+    YAML, an unterminated fence, or YAML that isn't a mapping) is refused
+    with ``ProvenanceError`` rather than silently buried under a second,
+    server-authored fence — and the stamped result is itself re-parsed
+    before being returned, so unusual-but-valid client YAML that stamping
+    would otherwise turn unparseable (e.g. an indented or flow mapping) is
+    refused instead of committed.
     """
     asserted = _asserted_lines(
         agent=agent, mode=mode, memory_area=memory_area, prior=prior
     )
 
+    has_fence = content.startswith("---\n") or content.startswith("---\r\n")
+
     # Agreement with notes._split_frontmatter is the contract: if the
     # downstream parsers would not see a frontmatter mapping here (no
     # fence, unterminated fence, non-mapping YAML), don't pretend one
-    # exists — prepend a fresh minimal block instead. The parser returns
-    # the INPUT object itself as the body in every no-frontmatter path,
-    # so an identity check is the exact "was a fence parsed" signal.
+    # exists. Content with no fence at all gets a fresh minimal block
+    # prepended; content WITH a fence that doesn't parse is refused — the
+    # parser returns the INPUT object itself as the body in every
+    # no-mapping path, so an identity check is the exact "was a fence
+    # parsed" signal.
     _parsed, body = _split_frontmatter(content)
     if body is content:
+        if has_fence:
+            raise ProvenanceError(
+                "frontmatter fence is present but does not parse as a YAML "
+                f"mapping: {_frontmatter_parse_error(content)}"
+            )
         block = "\n".join(line for _key, line in asserted)
-        return f"---\n{block}\n---\n{content}"
+        result = f"---\n{block}\n---\n{content}"
+    else:
+        lines = content.splitlines(keepends=True)
+        close_idx = -1
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                close_idx = i
+                break
+        if close_idx < 0:  # unreachable after the parse check; fail safe anyway
+            block = "\n".join(line for _key, line in asserted)
+            result = f"---\n{block}\n---\n{content}"
+        else:
+            # Strip EVERY server-owned key the client may have supplied (not
+            # just the ones re-asserted this mode) so nothing forged
+            # survives. Quote-tolerant: a quoted key is still an effective
+            # YAML key.
+            strip_res = [_strip_key_line_re(k) for k in _PROVENANCE_KEYS]
+            kept: list[str] = []
+            for line in lines[1:close_idx]:
+                if any(r.match(line) for r in strip_res):
+                    continue  # client-supplied server-owned key: dropped
+                kept.append(line)
+            # New keys land just before the closing fence, after the
+            # user's keys.
+            inserted = [line + "\n" for _key, line in asserted]
+            result = (
+                lines[0] + "".join(kept) + "".join(inserted) + "".join(lines[close_idx:])
+            )
 
-    lines = content.splitlines(keepends=True)
-    close_idx = -1
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            close_idx = i
-            break
-    if close_idx < 0:  # unreachable after the parse check; fail safe anyway
-        block = "\n".join(line for _key, line in asserted)
-        return f"---\n{block}\n---\n{content}"
+    # Post-condition: the frontmatter we just produced must itself parse as
+    # a YAML mapping containing every key we asserted. This is a no-op for
+    # well-formed input; it exists to catch unusual-but-valid client YAML
+    # (an indented or flow-style mapping) that textual line surgery can
+    # turn unparseable.
+    result_fm, result_body = _split_frontmatter(result)
+    if result_body is result:
+        raise ProvenanceError(
+            "provenance stamping produced frontmatter that does not parse: "
+            + _frontmatter_parse_error(result)
+        )
+    # Value-level check, not line-presence: the strip loop above is a
+    # textual first pass over lines and is blind to YAML syntax that
+    # resolves a server-owned key without ever writing a matching
+    # ``<key>:`` line — a complex key (``? author`` / ``: agent:evil``) or
+    # a merge key (``z: &a {author: ..}`` + ``<<: *a``). What matters is
+    # what a YAML reader (every downstream consumer) resolves, so re-parse
+    # the stamped fence and compare RESOLVED VALUES: every key we asserted
+    # this call must equal what we asserted, and every provenance key we
+    # did NOT assert this call (e.g. ``author`` on replace/append when the
+    # prior note has no server ``author:`` line to carry forward) must be
+    # entirely absent from the parsed mapping.
+    asserted_values = _asserted_values(asserted)
+    _unset = object()
+    for key in _PROVENANCE_KEYS:
+        expected = asserted_values.get(key, _unset)
+        actual = result_fm.get(key, _unset)
+        if actual != expected:
+            raise ProvenanceError(
+                f"client-supplied {key} survives stamping "
+                "(YAML alias/complex key?)"
+            )
+    return result
 
-    # Strip EVERY server-owned key the client may have supplied (not just
-    # the ones re-asserted this mode) so nothing forged survives. Quote-
-    # tolerant: a quoted key is still an effective YAML key.
-    strip_res = [_strip_key_line_re(k) for k in _PROVENANCE_KEYS]
-    kept: list[str] = []
-    for line in lines[1:close_idx]:
-        if any(r.match(line) for r in strip_res):
-            continue  # client-supplied server-owned key: dropped
-        kept.append(line)
-    # New keys land just before the closing fence, after the user's keys.
-    inserted = [line + "\n" for _key, line in asserted]
-    return lines[0] + "".join(kept) + "".join(inserted) + "".join(lines[close_idx:])
 
-
-def frontmatter_signature(content: str) -> tuple:
+def frontmatter_signature(
+    content: str,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str, str, str], ...]]:
     """Normalised (topics, relations) from a note's frontmatter.
 
     This is the answer to "did this write change the concept/graph

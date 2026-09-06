@@ -10,6 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Callable, Sequence
+from typing import NotRequired, TypedDict
+
+
+class GoldenQuery(TypedDict):
+    """One golden-set line: ``{"query": str, "expected": [paths], "note"?: str}``."""
+    query: str
+    expected: NotRequired[list[str]]
+    note: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -72,7 +80,7 @@ def _score_one(
 
 
 def evaluate(
-    golden: Sequence[dict],
+    golden: Sequence[GoldenQuery],
     retrieve: Callable[[str, int], list[str]],
     *,
     ks: Sequence[int] = (5, 10),

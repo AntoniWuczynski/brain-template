@@ -21,12 +21,16 @@ from .state import ConnectorState, load_state, save_state
 # stays side-effect-free and each connector reads its env/creds at run time.
 from collections.abc import Callable
 
+from .chat_export import ChatExportConnector
+from .claude_code import ClaudeCodeConnector
 from .granola import GranolaConnector
 from .justrec import JustrecConnector
 
 CONNECTORS: dict[str, Callable[[], Connector]] = {
     "granola": GranolaConnector,
     "justrec": JustrecConnector,
+    "claude_code": ClaudeCodeConnector,
+    "chat_export": ChatExportConnector,
 }
 
 __all__ = [

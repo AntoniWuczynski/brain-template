@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from collections.abc import Sequence
 from datetime import datetime, UTC
@@ -92,7 +93,11 @@ class AuditLog:
             with self._lock:
                 # logs/ exists in a real vault; tolerate fresh test roots.
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as fh:
+                # os.open with an explicit mode so a freshly created log is
+                # 0600, not whatever the ambient umask leaves it at (an
+                # existing file's mode is left alone).
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
         except OSError as exc:
             # Fail-open: telemetry loss is acceptable, a broken tool call

@@ -2,6 +2,10 @@
 notes (unlike processed notes) start with a ``---`` fenced YAML block."""
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from ingest_lib.semantic import chunk_markdown
 
 NOTE = (
@@ -144,7 +148,7 @@ def test_leading_horizontal_rule_without_frontmatter_keeps_body() -> None:
 
 # ------------------------------------------------ hybrid search modes (P4)
 
-def test_search_modes(tmp_path, monkeypatch):
+def test_search_modes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import json
     import numpy as np
     from ingest_lib.config import paths_for_root
@@ -166,7 +170,14 @@ def test_search_modes(tmp_path, monkeypatch):
             fh.write(json.dumps(r) + "\n")
 
     class _FakeModel:
-        def encode(self, texts, **kw):
+        def encode(
+            self,
+            sentences: list[str],
+            *,
+            normalize_embeddings: bool = True,
+            show_progress_bar: bool = False,
+            batch_size: int = 32,
+        ) -> np.ndarray:
             return np.array([[1.0, 0.0]], dtype=np.float32)  # points at row0
     monkeypatch.setattr(semantic, "_load_embedder", lambda: (_FakeModel(), "cpu"))
 
@@ -183,7 +194,7 @@ def test_search_modes(tmp_path, monkeypatch):
     assert hyb[0].source_relative_path == "b.pdf"
 
 
-def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
+def test_lexical_mode_needs_no_embedder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import json
     import numpy as np
     from ingest_lib.config import paths_for_root
@@ -198,7 +209,7 @@ def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
         encoding="utf-8")
 
     # If lexical mode touched the embedder this would raise.
-    def _boom():
+    def _boom() -> tuple[semantic.Embedder, str]:
         raise AssertionError("lexical mode must not load the embedding model")
     monkeypatch.setattr(semantic, "_load_embedder", _boom)
 
@@ -206,7 +217,9 @@ def test_lexical_mode_needs_no_embedder(tmp_path, monkeypatch):
     assert [h.source_relative_path for h in hits] == ["x.pdf"]
 
 
-def test_search_honors_top_k_above_default_candidate_cap(tmp_path, monkeypatch):
+def test_search_honors_top_k_above_default_candidate_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A top_k larger than the 100-candidate pool must widen the pool, not be
     # silently truncated — recency.memory_search's filtered path fetches 500.
     import json
@@ -228,7 +241,14 @@ def test_search_honors_top_k_above_default_candidate_cap(tmp_path, monkeypatch):
             }) + "\n")
 
     class _FakeModel:
-        def encode(self, texts, **kw):
+        def encode(
+            self,
+            sentences: list[str],
+            *,
+            normalize_embeddings: bool = True,
+            show_progress_bar: bool = False,
+            batch_size: int = 32,
+        ) -> np.ndarray:
             return np.ones((1, n), dtype=np.float32)  # ties across all rows
     monkeypatch.setattr(semantic, "_load_embedder", lambda: (_FakeModel(), "cpu"))
 
@@ -236,7 +256,9 @@ def test_search_honors_top_k_above_default_candidate_cap(tmp_path, monkeypatch):
     assert len(hits) == 150
 
 
-def test_query_instruction_prepended_and_toggleable(tmp_path, monkeypatch):
+def test_query_instruction_prepended_and_toggleable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # BGE v1.5's documented retrieval usage: the instruction is prepended to
     # the QUERY only (passages stay raw), so no reindex is needed.
     import json
@@ -255,8 +277,15 @@ def test_query_instruction_prepended_and_toggleable(tmp_path, monkeypatch):
     seen: list[str] = []
 
     class _FakeModel:
-        def encode(self, texts, **kw):
-            seen.extend(texts)
+        def encode(
+            self,
+            sentences: list[str],
+            *,
+            normalize_embeddings: bool = True,
+            show_progress_bar: bool = False,
+            batch_size: int = 32,
+        ) -> np.ndarray:
+            seen.extend(sentences)
             return np.array([[1.0]], dtype=np.float32)
 
     monkeypatch.setattr(semantic, "_load_embedder", lambda: (_FakeModel(), "cpu"))
@@ -271,7 +300,7 @@ def test_query_instruction_prepended_and_toggleable(tmp_path, monkeypatch):
     assert seen[-1] == "graphs"
 
 
-def test_sqlite_vec_tripwire_warns_past_threshold(caplog):
+def test_sqlite_vec_tripwire_warns_past_threshold(caplog: pytest.LogCaptureFixture) -> None:
     # 3.b: warn as the chunk count approaches the ~50k sqlite-vec migration
     # point, and stay quiet below it.
     import logging
@@ -287,7 +316,7 @@ def test_sqlite_vec_tripwire_warns_past_threshold(caplog):
     assert any("sqlite-vec" in r.message or "sqlite-vec" in r.getMessage() for r in caplog.records)
 
 
-def test_heading_path_tracked_per_chunk():
+def test_heading_path_tracked_per_chunk() -> None:
     # 9.a: each chunk carries the heading path in force at its start.
     from ingest_lib.semantic import _pack_blocks_with_headings
     p1 = "Directed content. " * 130   # > _TARGET_CHARS -> own chunk
@@ -304,7 +333,7 @@ def test_heading_path_tracked_per_chunk():
     assert kept["undirected"] == "Graph Theory > Undirected Graphs"
 
 
-def test_embed_text_flag_off_is_raw_on_prepends_context(monkeypatch):
+def test_embed_text_flag_off_is_raw_on_prepends_context(monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.semantic import Chunk, _embed_text
     c = Chunk(source_relative_path="uni/g.pdf", source_hash="h", title="COMP0005",
               chunk_idx=3, text="a directed graph", origin="pdf-mineru",
@@ -317,7 +346,7 @@ def test_embed_text_flag_off_is_raw_on_prepends_context(monkeypatch):
     assert _embed_text(c) == "COMP0005 > 4 Graphs > 4.2 Directed\na directed graph"
 
 
-def test_embed_text_flag_on_without_heading_uses_title_only(monkeypatch):
+def test_embed_text_flag_on_without_heading_uses_title_only(monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.semantic import Chunk, _embed_text
     monkeypatch.setenv("BRAIN_EMBED_HEADING_CONTEXT", "1")
     c = Chunk(source_relative_path="x", source_hash="h", title="Title",
@@ -325,7 +354,7 @@ def test_embed_text_flag_on_without_heading_uses_title_only(monkeypatch):
     assert _embed_text(c) == "Title\nbody"
 
 
-def test_heading_stack_ignores_fenced_code_comments():
+def test_heading_stack_ignores_fenced_code_comments() -> None:
     # 9.a fence-awareness: a '# comment' inside a ``` code fence must NOT be
     # treated as a section heading.
     from ingest_lib.semantic import _pack_blocks_with_headings
@@ -342,8 +371,83 @@ def test_heading_stack_ignores_fenced_code_comments():
     assert heads == {"Real Section"}                 # not "Real Section > not a heading..."
 
 
-def test_chunk_markdown_byte_identical_with_fence_tracking():
+def test_chunk_markdown_byte_identical_with_fence_tracking() -> None:
     # The fence guard must not change chunk TEXT (only heading_path values).
     from ingest_lib.semantic import chunk_markdown, _pack_blocks_with_headings
     doc = "# H\n\n```\n# x\n```\n\n" + ("word " * 60) + "\n"
     assert chunk_markdown(doc) == [t for t, _h in _pack_blocks_with_headings(doc, 80)]
+
+
+def test_lone_heading_is_carried_into_the_next_chunk() -> None:
+    # AUD-042: a buffer holding only a heading must not be flushed as its own
+    # chunk — that leaves a "## Log" row of pure noise AND strips the section
+    # head off the paragraph that follows.
+    from ingest_lib.semantic import _pack_blocks_with_headings
+
+    pairs = _pack_blocks_with_headings("## Log\n\n" + "x" * 1600, min_chars=1)
+    assert [t for t, _h in pairs if t.strip() == "## Log"] == []
+    assert pairs[0][0].startswith("## Log\n\nxxx")
+    assert pairs[0][1] == "Log"
+
+
+def test_oversize_block_is_split_on_line_boundaries() -> None:
+    # AUD-043: a block past the budget used to be embedded whole, so
+    # everything beyond the model's window never reached the vector.
+    from ingest_lib.semantic import _pack_blocks_with_headings, _TARGET_CHARS
+
+    block = "\n".join(f"[{i}] Author, A. A short bibliography line." for i in range(400))
+    pairs = _pack_blocks_with_headings("# Refs\n\n" + block, min_chars=1)
+    assert len(pairs) > 1
+    assert max(len(t) for t, _h in pairs) <= _TARGET_CHARS + len("# Refs") + 2
+    # split on line boundaries: no bibliography entry is cut in half
+    rejoined = "\n".join(t for t, _h in pairs).replace("# Refs\n\n", "")
+    assert rejoined == block
+    assert all(h == "Refs" for _t, h in pairs)
+
+
+def test_single_line_longer_than_the_budget_is_still_cut() -> None:
+    # A blank-line-free, newline-free blob has to be cut mid-line or it
+    # cannot be embedded at all.
+    from ingest_lib.semantic import _split_oversize_block, _TARGET_CHARS
+
+    pieces = _split_oversize_block("y" * (_TARGET_CHARS * 3 + 7))
+    assert max(len(p) for p in pieces) <= _TARGET_CHARS
+    assert "".join(pieces) == "y" * (_TARGET_CHARS * 3 + 7)
+
+
+def test_bom_before_frontmatter_does_not_embed_the_yaml() -> None:
+    # AUD-045: a UTF-8 BOM (Windows editors) made the fence unrecognisable,
+    # so the whole YAML block got embedded as body text.
+    chunks = chunk_markdown("﻿" + NOTE, min_chars=1)
+    joined = "\n".join(chunks)
+    assert "source_repo" not in joined
+    assert "﻿" not in joined
+    assert "A personal knowledge vault" in joined
+
+
+def test_heading_context_flag_is_recorded_in_the_row_model_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AUD-046: the flag changes the passage vectors without changing the
+    # model or the dimension, so it has to travel in the per-row model tag
+    # for upsert_notes' mismatch guard to see it.
+    from ingest_lib.semantic import Chunk, _MODEL_NAME, _meta_row
+
+    c = Chunk(source_relative_path="knowledge/notes/a.md", source_hash="h",
+              title="A", chunk_idx=0, text="body", origin="knowledge-note",
+              heading_path="H")
+    monkeypatch.delenv("BRAIN_EMBED_HEADING_CONTEXT", raising=False)
+    assert _meta_row(c)["model"] == _MODEL_NAME
+    monkeypatch.setenv("BRAIN_EMBED_HEADING_CONTEXT", "1")
+    assert _meta_row(c)["model"] == f"{_MODEL_NAME}+heading"
+
+
+def test_hybrid_score_is_not_documented_as_a_cosine() -> None:
+    # AUD-037: SearchHit.score is mode-dependent; the default (hybrid) is an
+    # RRF rank score bounded by 2/(k+1), not a similarity.
+    from ingest_lib.semantic import SearchHit, _RRF_K
+
+    doc = SearchHit.__doc__ or ""
+    assert "reciprocal-rank-fusion" in doc
+    assert "2/(_RRF_K + 1)" in doc
+    assert _RRF_K == 60

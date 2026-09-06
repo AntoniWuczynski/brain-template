@@ -32,7 +32,9 @@ See [`README.md`](README.md) for the full layer breakdown.
 - **Dream pass** — the LLM consolidation layer: gate + packet in
   `scripts/ingest_lib/dream.py` (`scripts/dream_gate.py` CLI), the pass
   itself in `.claude/skills/dream-pass/SKILL.md`, scheduled via
-  `scripts/dream.sh` at 05:00 (after the 04:00 deterministic maintenance).
+  `scripts/dream.sh` (a launchd/systemd timer, if one is installed on this
+  checkout — see `scripts/README.md` "Scheduling") after the deterministic
+  maintenance pass.
 - **Agent rules** — `AGENTS.md`. Don't drift from them.
 
 You should **not** spend time on:
@@ -42,15 +44,15 @@ You should **not** spend time on:
 - Over-built CI: version/OS matrices, coverage gates, packaging/wheels,
   multi-platform anything. See the CI note below for what IS wanted.
 
-**CI is wanted — but lean.** This private repo is the *source* of the
-framework that syncs to the **public** `brain-template` repo (via
-`scripts/push_to_upstream.sh`), and a public repo needs testing. There is a
-single workflow, `.github/workflows/ci.yml` (synced to the template), that
-runs pytest + ruff + mypy on **one** runner (Ubuntu, Python 3.12) for pushes
-and PRs that touch code. Keep it that way: no matrices, no packaging. It is
-gated to skip the constant `mcp(...)` vault-note commits (they change no code
-and must not burn Actions minutes). ruff + mypy must stay green — treat a red
-run as a real failure, not noise.
+**CI is wanted — but lean.** This file itself is synced verbatim to the
+**public** `brain-template` repo (via `scripts/push_to_upstream.sh`, if this
+checkout is the private source repo), and a public repo needs testing.
+There is a single workflow, `.github/workflows/ci.yml` (synced the same way),
+that runs pytest + ruff + mypy on **one** runner (Ubuntu, Python 3.12) for
+pushes and PRs that touch code. Keep it that way: no matrices, no packaging.
+It is gated to skip the constant `mcp(...)` vault-note commits (they change
+no code and must not burn Actions minutes). ruff + mypy must stay green —
+treat a red run as a real failure, not noise.
 
 ---
 
@@ -76,7 +78,14 @@ run as a real failure, not noise.
   (`gemini-2.5-flash`), and `local` (any OpenAI-compatible server via
   `BRAIN_LOCAL_URL`). Selected by `BRAIN_LLM_PROVIDER` or auto-detected
   from whichever key is set. Same `DocSummary` Pydantic schema across
-  all four.
+  all four. Documents are sent in full and never truncated, so a source
+  larger than `claude-haiku-4-5`'s 200K window fails with a `400 prompt
+  is too long`; on that error alone the anthropic path retries once on a
+  1M-context model (`BRAIN_LLM_FALLBACK_MODEL`, default
+  `claude-sonnet-5`) and records the retry in the note's processing
+  notes.
+- **Vision model**: `scripts/ingest_lib/extractors/vlm.py` defaults to
+  `claude-sonnet-5` for anthropic; override with `BRAIN_VLM_MODEL`.
 - **PDF extractor**: MinerU (package `mineru`, CLI invoked as a
   subprocess) — wraps PaddleOCR's PP-Structure for layout, PaddleOCR
   for text OCR, UniMerNet for formulas; outputs Markdown + extracted
@@ -86,8 +95,14 @@ run as a real failure, not noise.
   CLI isn't on PATH (fresh clones, devcontainers without weights yet)
   or when MinerU fails on a specific file. Notes produced via fallback
   are marked `status: partial`.
-- **Other extractors**: `python-docx`, `python-pptx`, `nbformat`,
-  plain-text reads for code/datasets.
+- **Other extractors**: `python-docx` (`.docx`), `python-pptx` (`.pptx`),
+  `nbformat` (`.ipynb`), plain-text reads for code and `.md`/`.txt`/`.rst`,
+  schema-only reads for datasets (`.csv`/`.tsv`/`.jsonl`/`.parquet`).
+  Standalone images and handwritten/scanned PDFs (`BRAIN_PDF_EXTRACTOR=vlm`)
+  go through a vision LLM; `.vtt`/`.srt` parse deterministically and audio
+  files are transcribed locally with faster-whisper when installed; Granola
+  and justREC meeting-export snapshots route to a dedicated meeting
+  extractor. See `scripts/README.md` for the backend and fallback per family.
 
 If you change any of these, update both this file and `scripts/README.md`
 in the same commit.

@@ -1,15 +1,66 @@
 """PPTX extractor: one Markdown section per slide."""
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from .base import ExtractionResult
+
+if TYPE_CHECKING:
+    # python-pptx's own enum, which (unlike the shape/table classes below) IS
+    # properly typed — only imported for the annotation, since the runtime
+    # import stays inside a try/except for older python-pptx compatibility.
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+
+class _Run(Protocol):
+    text: str
+
+
+class _Paragraph(Protocol):
+    runs: Sequence[_Run]
+
+
+class _TextFrame(Protocol):
+    text: str
+    paragraphs: Sequence[_Paragraph]
+
+
+class _Cell(Protocol):
+    text: str
+
+
+class _Row(Protocol):
+    cells: Sequence[_Cell]
+
+
+class _Table(Protocol):
+    rows: Sequence[_Row]
+
+
+class _Shape(Protocol):
+    shape_type: MSO_SHAPE_TYPE | None
+    has_table: bool
+    has_text_frame: bool
+    table: _Table
+    text_frame: _TextFrame
+    shapes: _ShapeCollection
+
+
+class _ShapeCollection(Protocol):
+    title: _Shape | None
+
+    def __iter__(self) -> Iterator[_Shape]: ...
+
+
+class _SlideLike(Protocol):
+    shapes: _ShapeCollection
 
 
 def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     try:
-        from pptx import Presentation  # type: ignore[import-not-found]
+        from pptx import Presentation
     except ImportError as exc:
         return ExtractionResult(
             status="manual_review",
@@ -29,15 +80,14 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
         )
 
     try:
-        from pptx.enum.shapes import MSO_SHAPE_TYPE  # type: ignore[import-not-found]
-        # python-pptx ships no type hints, so MSO_SHAPE_TYPE is an untyped
-        # enum class; keep a separate name so we don't reassign the import.
-        _mso: type | None = MSO_SHAPE_TYPE
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        # Keep a separate name so we don't reassign the import.
+        _mso: type[MSO_SHAPE_TYPE] | None = MSO_SHAPE_TYPE
     except ImportError:
         _mso = None  # older python-pptx; group recursion degrades
 
     parts: list[str] = []
-    counts = {"pictures": 0, "charts": 0}
+    counts: dict[str, int] = {"pictures": 0, "charts": 0}
     for i, slide in enumerate(prs.slides, start=1):
         title = _slide_title(slide) or f"Slide {i}"
         parts.append(f"## {i}. {title}")
@@ -76,7 +126,12 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     )
 
 
-def _collect_shapes(shapes, body_lines: list[str], counts: dict, mso) -> None:
+def _collect_shapes(
+    shapes: _ShapeCollection,
+    body_lines: list[str],
+    counts: dict[str, int],
+    mso: type[MSO_SHAPE_TYPE] | None,
+) -> None:
     """Walk a shape collection, appending Markdown lines. Recurses into group
     shapes (whose text would otherwise be dropped) and renders native tables;
     counts pictures/charts so the caller can flag partial extraction."""
@@ -104,7 +159,7 @@ def _cell(text: str) -> str:
     return (text or "").strip().replace("|", "\\|").replace("\n", " ")
 
 
-def _table_lines(table) -> list[str]:
+def _table_lines(table: _Table) -> list[str]:
     """Render a PowerPoint table to Markdown rows."""
     rows = [[_cell(c.text) for c in row.cells] for row in table.rows]
     if not rows:
@@ -120,7 +175,7 @@ def _table_lines(table) -> list[str]:
     return out
 
 
-def _slide_title(slide) -> str | None:
+def _slide_title(slide: _SlideLike) -> str | None:
     if slide.shapes.title and slide.shapes.title.has_text_frame:
         return slide.shapes.title.text_frame.text.strip() or None
     return None

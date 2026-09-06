@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ingest_lib import (  # noqa: E402
+    VaultPaths,
     default_paths,
     rebuild_concepts,
     rebuild_connections,
@@ -133,7 +134,7 @@ def _configure_logger(logs_dir: Path, *, dry_run: bool) -> tuple[logging.Logger,
     return logger, log_path
 
 
-def _reindex(paths, stats: ConsolidateStats, *, logger: logging.Logger) -> None:
+def _reindex(paths: VaultPaths, stats: ConsolidateStats, *, logger: logging.Logger) -> None:
     """Refresh enrichment over everything the pass changed. Non-fatal at
     every step (pipeline.py's pattern): a failed refresh just means stale
     search until the next rebuild, never a failed consolidation."""

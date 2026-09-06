@@ -155,7 +155,9 @@ def rebuild_concepts(
             continue
         if wrote:
             written_count += 1
-            written_paths.append(_vault_relative(target, paths))
+            written_paths.append(
+                _vault_relative(target, paths, fallback_dir="knowledge/concepts")
+            )
         else:
             unchanged_count += 1
 
@@ -201,7 +203,9 @@ def rebuild_concepts(
             if _AUTO_START in text and _AUTO_END in text:
                 existing.unlink()
                 removed += 1
-                removed_paths.append(_vault_relative(existing, paths))
+                removed_paths.append(
+                    _vault_relative(existing, paths, fallback_dir="knowledge/concepts")
+                )
                 logger.info("concept: removed orphaned %s", existing.name)
         except OSError as exc:
             logger.warning("concept: could not process %s (%s) — skipping", existing.name, exc)
@@ -225,14 +229,14 @@ def rebuild_concepts(
 # internals
 # ---------------------------------------------------------------------------
 
-def _vault_relative(target: Path, paths: VaultPaths) -> str:
-    """Vault-relative posix path for stats/commit lists. Falls back to the
-    canonical concepts location when ``knowledge`` sits outside ``root``
-    (hand-built VaultPaths in tests can do that)."""
+def _vault_relative(target: Path, paths: VaultPaths, *, fallback_dir: str) -> str:
+    """Vault-relative posix path for stats/commit lists. Falls back to
+    ``fallback_dir`` — the writer's canonical location — when ``knowledge``
+    sits outside ``root`` (hand-built VaultPaths in tests can do that)."""
     try:
         return target.relative_to(paths.root).as_posix()
     except ValueError:
-        return f"knowledge/concepts/{target.name}"
+        return f"{fallback_dir}/{target.name}"
 
 
 def _related_reason(r: Related) -> str:

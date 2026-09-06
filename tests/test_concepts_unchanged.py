@@ -39,7 +39,7 @@ def _concept_bytes(paths: VaultPaths) -> dict[str, str]:
     }
 
 
-def test_second_rebuild_over_unchanged_vault_writes_nothing(tmp_path: Path):
+def test_second_rebuild_over_unchanged_vault_writes_nothing(tmp_path: Path) -> None:
     paths = _seed(tmp_path)
 
     first = rebuild_concepts(paths, logger=_LOG)
@@ -61,7 +61,7 @@ def test_second_rebuild_over_unchanged_vault_writes_nothing(tmp_path: Path):
     assert _concept_bytes(paths) == snapshot
 
 
-def test_topic_change_rewrites_only_affected_notes(tmp_path: Path):
+def test_topic_change_rewrites_only_affected_notes(tmp_path: Path) -> None:
     paths = _seed(tmp_path)
     rebuild_concepts(paths, logger=_LOG)
     before = _concept_bytes(paths)
@@ -80,7 +80,7 @@ def test_topic_change_rewrites_only_affected_notes(tmp_path: Path):
     assert "sources_count: 2" in after["alpha.md"]
 
 
-def test_orphan_removal_reports_removed_paths(tmp_path: Path):
+def test_orphan_removal_reports_removed_paths(tmp_path: Path) -> None:
     # The MCP reindex stage commits deletions too, so removed orphans must
     # be reported by vault-relative path, not just counted.
     paths = _seed(tmp_path)
@@ -96,7 +96,7 @@ def test_orphan_removal_reports_removed_paths(tmp_path: Path):
     assert not (paths.knowledge / "concepts" / "beta.md").exists()
 
 
-def test_deleted_end_marker_refuses_rewrite_and_preserves_user_tail(tmp_path: Path):
+def test_deleted_end_marker_refuses_rewrite_and_preserves_user_tail(tmp_path: Path) -> None:
     # If the user deletes the AUTO-GENERATED-END marker (but the START marker
     # remains), the writer can't find the boundary. It must REFUSE to rewrite
     # rather than silently drop everything below where the marker was — the
@@ -119,7 +119,7 @@ def test_deleted_end_marker_refuses_rewrite_and_preserves_user_tail(tmp_path: Pa
     assert sentinel in alpha.read_text(encoding="utf-8")
 
 
-def test_user_tail_edit_survives_and_does_not_trigger_rewrite(tmp_path: Path):
+def test_user_tail_edit_survives_and_does_not_trigger_rewrite(tmp_path: Path) -> None:
     # The user tail below AUTO-GENERATED-END is part of the canonical
     # render, so a tail-only edit leaves the file equal to what the
     # generator would produce: no rewrite (no timestamp churn), and the
@@ -136,3 +136,33 @@ def test_user_tail_edit_survives_and_does_not_trigger_rewrite(tmp_path: Path):
     assert stats.unchanged == 2
     assert stats.written_paths == ()
     assert alpha.read_text(encoding="utf-8") == edited
+
+
+def test_hand_created_note_keeps_its_body_and_not_its_frontmatter(tmp_path: Path) -> None:
+    # AUD-105: a concept note the user pre-created by hand has no
+    # AUTO-GENERATED markers at all, so the whole BODY (never the
+    # frontmatter) is the tail to preserve. Written with CRLF line endings —
+    # the case that used to re-embed the frontmatter into the body.
+    paths = _seed(tmp_path)
+    concepts_dir = paths.knowledge / "concepts"
+    concepts_dir.mkdir(parents=True, exist_ok=True)
+    alpha = concepts_dir / "alpha.md"
+    alpha.write_bytes(
+        b"---\r\ntitle: Alpha\r\naliases: [alfa]\r\n---\r\n\r\n"
+        b"# My own Alpha notes\r\n\r\nYears of hand-written thinking.\r\n"
+    )
+
+    stats = rebuild_concepts(paths, logger=_LOG)
+    assert "knowledge/concepts/alpha.md" in stats.written_paths
+
+    text = alpha.read_text(encoding="utf-8")
+    body = text.split("<!-- AUTO-GENERATED-END -->", 1)[1]
+    # The hand-written body survives, below the generated block...
+    assert "# My own Alpha notes" in body
+    assert "Years of hand-written thinking." in body
+    # ...and the hand-written frontmatter did NOT come with it.
+    assert "title: Alpha" not in body
+    assert "aliases:" not in body
+    # It stayed frontmatter, where the user put it.
+    assert text.startswith("---\n")
+    assert "alfa" in text.split("---", 2)[1]

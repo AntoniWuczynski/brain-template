@@ -8,10 +8,14 @@ hand-written notes.
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 
 import numpy as np
+import pytest
+from pydantic import BaseModel
 
-from ingest_lib.config import paths_for_root
+from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.describe import (
     ConceptDescription,
     KeyDefinition,
@@ -37,14 +41,14 @@ _NOTE = (
 )
 
 
-def test_source_set_hash_is_order_independent_and_sensitive():
+def test_source_set_hash_is_order_independent_and_sensitive() -> None:
     h = source_set_hash(["b.md", "a.md"], "anthropic/claude-haiku-4-5")
     assert h == source_set_hash(["a.md", "b.md"], "anthropic/claude-haiku-4-5")
     assert h != source_set_hash(["a.md"], "anthropic/claude-haiku-4-5")
     assert h != source_set_hash(["a.md", "b.md"], "openai/gpt-5-mini")
 
 
-def test_content_keyed_sources_invalidate_on_hash_change():
+def test_content_keyed_sources_invalidate_on_hash_change() -> None:
     # D3: rebuild_descriptions keys on `path@source_hash`, so a revised source
     # (same path, new content hash) produces a different cache key -> regenerate.
     same_path_v1 = source_set_hash(["uni/x.pdf@hash1"], "m")
@@ -52,7 +56,7 @@ def test_content_keyed_sources_invalidate_on_hash_change():
     assert same_path_v1 != same_path_v2
 
 
-def test_render_ai_zone_body_embeds_hash_and_sections():
+def test_render_ai_zone_body_embeds_hash_and_sections() -> None:
     desc = ConceptDescription(
         short_summary="A short take.",
         detailed_explanation="## Overview\nLong text.",
@@ -65,7 +69,7 @@ def test_render_ai_zone_body_embeds_hash_and_sections():
     assert "**Foo**" in body and "A foo." in body
 
 
-def test_upsert_inserts_ai_zone_after_auto_marker_preserving_user_notes():
+def test_upsert_inserts_ai_zone_after_auto_marker_preserving_user_notes() -> None:
     out = upsert_ai_zone(_NOTE, "<!-- ai-hash: abc -->\n## Description\nhello")
     assert "<!-- AI-GENERATED-START -->" in out
     # Ordering: auto-zone, then AI-zone, then the user's Notes.
@@ -74,7 +78,7 @@ def test_upsert_inserts_ai_zone_after_auto_marker_preserving_user_notes():
     assert "my own thoughts" in out
 
 
-def _seed_index(tmp_path, rows):
+def _seed_index(tmp_path: Path, rows: list[tuple[str, str]]) -> tuple[VaultPaths, np.ndarray]:
     """Write a tiny embeddings index: identity-ish vectors so query==row text."""
     paths = paths_for_root(tmp_path / "vault")
     paths.ensure()
@@ -92,7 +96,9 @@ def _seed_index(tmp_path, rows):
     return paths, vecs
 
 
-def test_retrieve_masks_to_concepts_own_sources(tmp_path, monkeypatch):
+def test_retrieve_masks_to_concepts_own_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # F031: retrieval must return ONLY chunks from the concept's own sources,
     # never borrow semantically-close text from unrelated documents.
     rows = [
@@ -102,7 +108,14 @@ def test_retrieve_masks_to_concepts_own_sources(tmp_path, monkeypatch):
     paths, vecs = _seed_index(tmp_path, rows)
 
     class _FakeModel:
-        def encode(self, texts, **kw):
+        def encode(
+            self,
+            sentences: list[str],
+            *,
+            normalize_embeddings: bool = True,
+            show_progress_bar: bool = False,
+            batch_size: int = 32,
+        ) -> np.ndarray:
             # Query 0 ("concept") points at row 0; but we allow only row 1's
             # source, so masking must yield empty rather than row 0's text.
             return np.array([[1.0, 0.0]], dtype=np.float32)
@@ -118,7 +131,7 @@ def test_retrieve_masks_to_concepts_own_sources(tmp_path, monkeypatch):
     assert got2 == [[]]
 
 
-def test_retrieve_returns_empty_on_corrupt_index(tmp_path):
+def test_retrieve_returns_empty_on_corrupt_index(tmp_path: Path) -> None:
     # A torn/garbage embeddings.npy must degrade to empty results (like
     # connections.py), not crash the whole --describe-concepts run.
     paths = paths_for_root(tmp_path / "vault")
@@ -131,14 +144,17 @@ def test_retrieve_returns_empty_on_corrupt_index(tmp_path):
     assert _retrieve(paths, [("concept", {"a.pdf"})], top_k=5) == [[]]
 
 
-def test_describe_concept_fences_untrusted_excerpts(monkeypatch):
+def test_describe_concept_fences_untrusted_excerpts(monkeypatch: pytest.MonkeyPatch) -> None:
     # Source excerpts are untrusted document text: they must be wrapped in an
     # <excerpt> fence a literal </excerpt> in the text cannot break out of.
     import ingest_lib.describe as describe_mod
 
     captured: dict[str, str] = {}
 
-    def _fake_generate(*, system, user, schema, max_tokens, logger):
+    def _fake_generate(
+        *, system: str, user: str, schema: type[BaseModel], max_tokens: int,
+        logger: logging.Logger | None,
+    ) -> BaseModel | None:
         captured["system"] = system
         captured["user"] = user
         return None  # we only care about the assembled prompt
@@ -154,7 +170,7 @@ def test_describe_concept_fences_untrusted_excerpts(monkeypatch):
     assert "untrusted" in captured["system"].lower()
 
 
-def test_upsert_replaces_existing_ai_zone_in_place_keeping_user_notes():
+def test_upsert_replaces_existing_ai_zone_in_place_keeping_user_notes() -> None:
     once = upsert_ai_zone(_NOTE, "<!-- ai-hash: old -->\nold description")
     twice = upsert_ai_zone(once, "<!-- ai-hash: new -->\nnew description")
     assert "old description" not in twice
@@ -163,7 +179,7 @@ def test_upsert_replaces_existing_ai_zone_in_place_keeping_user_notes():
     assert "my own thoughts" in twice
 
 
-def test_existing_description_hash_reads_ai_zone_comment():
+def test_existing_description_hash_reads_ai_zone_comment() -> None:
     note = upsert_ai_zone(_NOTE, "<!-- ai-hash: deadbeef -->\n## Description\nx")
     assert existing_description_hash(note) == "deadbeef"
     assert existing_description_hash(_NOTE) is None

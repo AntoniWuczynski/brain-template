@@ -2,16 +2,17 @@
 #
 # Push framework changes from this private fork up to the public template
 # repo (``upstream`` remote). Sync the local ``template`` branch from the
-# current ``main`` working tree, then push it to ``upstream:main``.
+# current ``main`` working tree, then publish it via a PR on ``upstream``.
 #
 # Mental model: brain-template is the canonical framework. This private
 # repo is a downstream consumer with personal content layered on top.
 # When you make framework changes here that should be shared, run this.
 #
-# Run from the main branch (clean or dirty — the script copies the working
-# tree, not the committed state). The local ``template`` branch is an
-# orphan on first creation (no shared history with your personal content)
-# and gets refreshed on subsequent runs.
+# Run from the main branch with the synced paths (see FRAMEWORK_PATHS below,
+# plus _template/) committed — the script copies the working tree, not HEAD,
+# so it refuses to run if any of them have uncommitted or untracked changes.
+# The local ``template`` branch is an orphan on first creation (no shared
+# history with your personal content) and gets refreshed on subsequent runs.
 #
 # Files synced from main:
 #   - scripts/, mcp_server/, tests/, .github/workflows/ci.yml
@@ -19,7 +20,7 @@
 #   - AGENTS.md, CLAUDE.md, mcp/, .devcontainer/, .gitignore, .gitattributes
 #   - .env.example, .claude/CODEBASE.md, .claude/{hooks,memory,patterns}/.gitkeep
 #   - .obsidian/{app,appearance,core-plugins,graph}.json
-#   - knowledge/index/Note Template.md
+#   - knowledge/index/Note Template.md, knowledge/index/templates/
 #
 # Files sourced from _template/ on main (overlay specific to the public branch):
 #   - README.md, LICENSE, TODO.md, WORK_LOG.md, CONTRIBUTING.md
@@ -34,8 +35,9 @@
 #   - hand-written notes anywhere else under knowledge/
 #   - .env, .obsidian/workspace.json
 #
-# After the script runs, push to ``upstream`` with the line it prints
-# at the end.
+# After the script runs, publish with the lines it prints at the end:
+# upstream's ``main`` is branch-protected, so the sync goes up as a dated
+# ``framework-sync-<date>`` branch and a PR, never as a direct push.
 
 set -euo pipefail
 
@@ -51,28 +53,6 @@ fi
 if [ ! -d "_template" ]; then
     echo "error: _template/ directory missing — the public overlay should live there"
     exit 1
-fi
-
-# Use a worktree so the main checkout isn't disturbed.
-WORKTREE=$(mktemp -d -t brain-template-sync-XXXXXX)
-echo "worktree: $WORKTREE"
-trap 'git worktree remove --force "$WORKTREE" 2>/dev/null || true; rm -rf "$WORKTREE"' EXIT
-
-# Create or attach to the template branch.
-if git show-ref --verify --quiet refs/heads/template; then
-    git worktree add "$WORKTREE" template
-    # Clean the worktree so removed files on main translate to removals
-    # on template. Keep .git intact.
-    find "$WORKTREE" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-else
-    # First run: create an orphan branch with no shared history.
-    git worktree add --detach "$WORKTREE"
-    (
-        cd "$WORKTREE"
-        git checkout --orphan template
-        git rm -rf --cached . 2>/dev/null || true
-        find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-    )
 fi
 
 # Framework files to copy verbatim from main.
@@ -104,6 +84,42 @@ FRAMEWORK_PATHS=(
     # blanks — no personal data.
     "knowledge/index/templates"
 )
+
+# Refuse to publish uncommitted or untracked changes: this script copies the
+# working tree, not HEAD, so anything dirty under a synced path (or under
+# _template/, the source of the public overlay files below) would otherwise
+# leak into the public repo with no corresponding private commit (F3).
+# Scoped to what's actually synced rather than the whole tree, since this
+# repo's personal content (inbox/, archive/, knowledge/ notes, ...) is
+# routinely dirty and none of it is ever copied.
+dirty="$(git status --porcelain --untracked-files=all -- "${FRAMEWORK_PATHS[@]}" "_template")"
+if [ -n "$dirty" ]; then
+    echo "error: uncommitted or untracked changes in synced paths — commit or stash first:" >&2
+    echo "$dirty" >&2
+    exit 2
+fi
+
+# Use a worktree so the main checkout isn't disturbed.
+WORKTREE=$(mktemp -d -t brain-template-sync-XXXXXX)
+echo "worktree: $WORKTREE"
+trap 'git worktree remove --force "$WORKTREE" 2>/dev/null || true; rm -rf "$WORKTREE"' EXIT
+
+# Create or attach to the template branch.
+if git show-ref --verify --quiet refs/heads/template; then
+    git worktree add "$WORKTREE" template
+    # Clean the worktree so removed files on main translate to removals
+    # on template. Keep .git intact.
+    find "$WORKTREE" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+else
+    # First run: create an orphan branch with no shared history.
+    git worktree add --detach "$WORKTREE"
+    (
+        cd "$WORKTREE"
+        git checkout --orphan template
+        git rm -rf --cached . 2>/dev/null || true
+        find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+    )
+fi
 
 copy_path() {
     local src="$1"
@@ -224,7 +240,10 @@ if git diff --cached --quiet; then
     exit 0
 fi
 
-git commit -m "sync framework from main ($(date +%Y-%m-%d))"
+SYNC_DATE=$(date +%Y-%m-%d)
+git commit -m "sync framework from main ($SYNC_DATE)"
+
+SYNC_BRANCH="framework-sync-$SYNC_DATE"
 
 echo
 echo "template branch updated. To publish:"
@@ -234,6 +253,11 @@ echo "  gh repo create <your-user>/brain-template --public --source=$ROOT --remo
 echo "  # or, if you already have the public repo:"
 echo "  git -C $ROOT remote add upstream git@github.com:<your-user>/brain-template.git"
 echo
-echo "  # push the template branch as main on the public repo"
-echo "  git -C $ROOT push upstream template:main"
+echo "  # publish via a PR — brain-template's main is branch-protected, so"
+echo "  # pushing template:main straight at it is rejected."
+echo "  git -C $ROOT push upstream template:refs/heads/$SYNC_BRANCH"
+echo "  gh pr create --repo <your-user>/brain-template \\"
+echo "    --base main --head $SYNC_BRANCH \\"
+echo "    --title \"sync framework from main ($SYNC_DATE)\" \\"
+echo "    --body \"Framework sync from the private vault. Review the diff before merging.\""
 echo

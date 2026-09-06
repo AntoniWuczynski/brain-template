@@ -8,13 +8,12 @@ interrupted pull leaves no torn snapshot in ``inbox/``.
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..atomic import atomic_write_bytes, umask_mode
 from ..config import VaultPaths
-from .base import Connector
+from .base import Connector, Snapshot
 from .state import load_state, save_state
 
 
@@ -26,20 +25,40 @@ class PullStats:
 
 
 def _atomic_write_bytes(dest: Path, payload: bytes) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".snap-", suffix=dest.suffix, dir=str(dest.parent))
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, dest)
-    except Exception:
+    # A snapshot is vault content a human reads and edits, so it gets the
+    # umask's mode rather than mkstemp's 0600.
+    atomic_write_bytes(
+        dest, payload, prefix=".snap-", suffix=dest.suffix, mode=umask_mode()
+    )
+
+
+def _versioned_relpath(relpath: str, content_hash: str) -> str:
+    """Insert a hash tag before the extension, e.g. ``a.json`` ->
+    ``a.3f9c1a7b2e04.json`` — two versions of the same item are told apart
+    by this content-hash segment in the filename."""
+    p = Path(relpath)
+    return str(p.with_name(f"{p.stem}.{content_hash[:12]}{p.suffix}"))
+
+
+def _resolve_dest(paths: VaultPaths, snap: Snapshot) -> tuple[Path, str]:
+    """Pick the inbox path to write ``snap`` to.
+
+    The connector's own (stable) ``inbox_relpath`` is used when it is free or
+    already holds byte-identical content; otherwise a changed re-pull of the
+    same native id is routed to a hash-versioned sibling path so the prior
+    snapshot already sitting in ``inbox/`` is never overwritten.
+    """
+    relpath = snap.inbox_relpath
+    dest = paths.root / relpath
+    if dest.exists():
         try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+            unchanged_on_disk = dest.read_bytes() == snap.payload
+        except OSError:
+            unchanged_on_disk = False
+        if not unchanged_on_disk:
+            relpath = _versioned_relpath(relpath, snap.content_hash)
+            dest = paths.root / relpath
+    return dest, relpath
 
 
 def run_connector(
@@ -64,13 +83,13 @@ def run_connector(
         if state.is_unchanged(snap):
             stats.skipped += 1
             continue
-        dest = paths.root / snap.inbox_relpath
+        dest, relpath = _resolve_dest(paths, snap)
         if not dry_run:
             _atomic_write_bytes(dest, snap.payload)
-        state.record(snap, pulled_at=pulled_at)
+        state.record(snap, pulled_at=pulled_at, inbox_relpath=relpath)
         stats.written += 1
-        stats.snapshots.append(snap.inbox_relpath)
-        log.info("pull %s: %s", connector.name, snap.inbox_relpath)
+        stats.snapshots.append(relpath)
+        log.info("pull %s: %s", connector.name, relpath)
     if not dry_run:
         save_state(paths, state)
     log.info(

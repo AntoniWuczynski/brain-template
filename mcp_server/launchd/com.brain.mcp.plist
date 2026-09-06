@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: run the brain MCP server (the macOS counterpart of
+  mcp_server/systemd/brain-mcp.service).
+
+  Install:  cp this to ~/Library/LaunchAgents/ (edit REPO_ROOT first), then:
+            launchctl load ~/Library/LaunchAgents/com.brain.mcp.plist
+
+  It runs mcp_server/run-local.sh, which reads the bearer token from
+  ~/.brain-mcp-token (0600) at start. Do NOT put the token in this file, and
+  do NOT `launchctl setenv` it: a setenv value is readable by every process in
+  the GUI session, which undoes the 0600 file and defeats the per-agent token
+  model in mcp/DEPLOY.md.
+
+  KeepAlive is a dict, not <true/>: an unconditional KeepAlive restarts the
+  server forever even when it exits cleanly, and pairs badly with a short
+  throttle — a config error (empty token, port already bound) then respawns on
+  every ThrottleInterval and appends a traceback to the log each time.
+  Restarting only on a crash or a non-zero exit, at most every 30 seconds,
+  keeps that bounded.
+
+  stdout and stderr go to separate files so a crash loop is legible. Neither is
+  rotated: scripts/rotate_logs.py only handles the MCP telemetry streams
+  (logs/mcp-access.jsonl, logs/mcp-audit.jsonl), so watch these two by hand or
+  add them to a newsyslog/logrotate config.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brain.mcp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_ROOT/mcp_server/run-local.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which has
+             no uv. Adjust to wherever uv is installed on this machine. -->
+        <key>PATH</key>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Set to 1 only if this machine should push vault commits. -->
+        <key>BRAIN_MCP_GIT_PUSH_ON_WRITE</key>
+        <string>0</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/brain-mcp.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/brain-mcp.err.log</string>
+</dict>
+</plist>
