@@ -21,7 +21,7 @@ _ENV = [
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+def _clean(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in _ENV:
         monkeypatch.delenv(k, raising=False)
 
@@ -33,12 +33,12 @@ def _git_vault(tmp_path: Path) -> Path:
     return root
 
 
-def test_missing_vault_root_raises(monkeypatch):
+def test_missing_vault_root_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(RuntimeError, match="BRAIN_MCP_VAULT_ROOT"):
         load_config()
 
 
-def test_non_git_vault_raises(monkeypatch, tmp_path):
+def test_non_git_vault_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(plain))
@@ -47,20 +47,22 @@ def test_non_git_vault_raises(monkeypatch, tmp_path):
         load_config()
 
 
-def test_no_tokens_raises(monkeypatch, tmp_path):
+def test_no_tokens_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(_git_vault(tmp_path)))
     with pytest.raises(RuntimeError, match="set BRAIN_MCP_TOKENS"):
         load_config()
 
 
-def test_short_bearer_raises(monkeypatch, tmp_path):
+def test_short_bearer_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(_git_vault(tmp_path)))
     monkeypatch.setenv("BRAIN_MCP_BEARER_TOKEN", "tooshort")
     with pytest.raises(RuntimeError, match="at least 24 characters"):
         load_config()
 
 
-def test_bearer_duplicating_a_named_token_raises(monkeypatch, tmp_path):
+def test_bearer_duplicating_a_named_token_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(_git_vault(tmp_path)))
     shared = "a" * 40
     monkeypatch.setenv("BRAIN_MCP_TOKENS", f"claude={shared}")
@@ -69,7 +71,7 @@ def test_bearer_duplicating_a_named_token_raises(monkeypatch, tmp_path):
         load_config()
 
 
-def test_default_agent_name_clash_raises(monkeypatch, tmp_path):
+def test_default_agent_name_clash_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(_git_vault(tmp_path)))
     monkeypatch.setenv("BRAIN_MCP_TOKENS", f"default={'a' * 40}")
     monkeypatch.setenv("BRAIN_MCP_BEARER_TOKEN", "b" * 40)
@@ -77,7 +79,9 @@ def test_default_agent_name_clash_raises(monkeypatch, tmp_path):
         load_config()
 
 
-def test_happy_path_merges_named_and_bearer(monkeypatch, tmp_path):
+def test_happy_path_merges_named_and_bearer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     monkeypatch.setenv("BRAIN_MCP_VAULT_ROOT", str(_git_vault(tmp_path)))
     monkeypatch.setenv("BRAIN_MCP_TOKENS", f"claude-code={'a' * 40}")
     monkeypatch.setenv("BRAIN_MCP_BEARER_TOKEN", "b" * 40)

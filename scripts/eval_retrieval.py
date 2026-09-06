@@ -21,15 +21,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import cast
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from ingest_lib.config import default_paths  # noqa: E402
-from ingest_lib.evalret import EvalReport, evaluate  # noqa: E402
+from ingest_lib.config import VaultPaths, default_paths  # noqa: E402
+from ingest_lib.evalret import EvalReport, GoldenQuery, evaluate  # noqa: E402
 from ingest_lib.notes import _atomic_write  # noqa: E402
 from ingest_lib.semantic import search as semantic_search  # noqa: E402
 
@@ -38,32 +40,64 @@ _REPORT = "knowledge/index/retrieval-eval.md"
 _KS = (5, 10)
 
 
-def _load_golden(path: Path) -> list[dict]:
-    out: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+def _load_golden(path: Path) -> list[GoldenQuery]:
+    out: list[GoldenQuery] = []
+    for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        out.append(json.loads(line))
+        row = json.loads(line)
+        if not isinstance(row, dict) or not isinstance(row.get("query"), str) or not row["query"].strip():
+            raise ValueError(f"{path}:{lineno}: golden line missing a non-empty \"query\": {line!r}")
+        expected = row.get("expected")
+        if not isinstance(expected, list) or not expected or not all(
+            isinstance(e, str) and e.strip() for e in expected
+        ):
+            raise ValueError(
+                f"{path}:{lineno}: golden line needs a non-empty \"expected\" list "
+                f"of source paths (mined candidates must be confirmed before "
+                f"promotion): {line!r}"
+            )
+        golden: GoldenQuery = {
+            "query": cast(str, row["query"]),
+            "expected": cast("list[str]", expected),
+        }
+        note = row.get("note")
+        if isinstance(note, str):
+            golden["note"] = note
+        out.append(golden)
     return out
 
 
-def _retriever(paths, top_k: int, mode: str = "hybrid"):
+_OVERFETCH_MAX_MULTIPLIER = 40  # cap the escalation below (~400x n at n=10)
+
+
+def _retriever(
+    paths: VaultPaths, top_k: int, mode: str = "hybrid"
+) -> Callable[[str, int], list[str]]:
     """query -> ordered, de-duplicated source paths from the live index."""
     def retrieve(query: str, n: int) -> list[str]:
         # Over-fetch CHUNKS before de-duping to SOURCES: n chunks dominated by
         # one multi-chunk source would otherwise yield far fewer than n
         # distinct sources, so an expected source whose best chunk ranks just
-        # outside n is scored a miss. Fetch a wide chunk pool, then return the
-        # first n distinct sources. (The ×5 only bites for n>20 once
-        # semantic.search's candidate cap is lifted above 100 — it is.)
-        hits = semantic_search(paths, query, top_k=max(n, top_k) * 5, mode=mode)
-        seen: set[str] = set()
+        # outside n is scored a miss. Start at a 5x chunk pool and double it
+        # until n distinct sources are found or the candidate pool is
+        # exhausted (semantic.search returns fewer chunks than requested).
+        base = max(n, top_k)
+        multiplier = 5
         ordered: list[str] = []
-        for h in hits:
-            if h.source_relative_path not in seen:
-                seen.add(h.source_relative_path)
-                ordered.append(h.source_relative_path)
+        while True:
+            fetch_k = base * multiplier
+            hits = semantic_search(paths, query, top_k=fetch_k, mode=mode)
+            seen: set[str] = set()
+            ordered = []
+            for h in hits:
+                if h.source_relative_path not in seen:
+                    seen.add(h.source_relative_path)
+                    ordered.append(h.source_relative_path)
+            if len(ordered) >= n or len(hits) < fetch_k or multiplier >= _OVERFETCH_MAX_MULTIPLIER:
+                break
+            multiplier *= 2
         return ordered[:n]
     return retrieve
 
@@ -71,7 +105,7 @@ def _retriever(paths, top_k: int, mode: str = "hybrid"):
 _MODES = ("dense", "lexical", "hybrid")
 
 
-def _run_mine_log(paths) -> int:
+def _run_mine_log(paths: VaultPaths) -> int:
     """Mine the MCP access log into golden candidates + a zero-hit report."""
     from ingest_lib.evalmine import candidate_lines, load_access_log
 
@@ -98,7 +132,7 @@ def _run_mine_log(paths) -> int:
     return 0
 
 
-def _run_compare_modes(paths, golden: list[dict], top_k: int) -> int:
+def _run_compare_modes(paths: VaultPaths, golden: list[GoldenQuery], top_k: int) -> int:
     """Score each retrieval mode over the golden set, side by side."""
     fetch = max(top_k, max(_KS))
     print(f"{'mode':>8}  {'recall@5':>9} {'recall@10':>10} {'MRR':>6}  (n={len(golden)})")

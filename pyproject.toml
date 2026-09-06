@@ -63,6 +63,18 @@ dependencies = [
 [tool.uv]
 managed = true
 
+# Dependency cooldown: never resolve a release that is less than 7 days old,
+# so a compromised publish has a week to be caught and yanked before it can
+# enter our lockfile.
+#
+# Relative durations need uv >= 0.9.17. On older uv this whole table fails to
+# parse ("failed to parse year in date"), which discards `required-version`
+# along with it — so the version gate cannot self-enforce here. CI is safe
+# (setup-uv installs latest); local dev must be on >= 0.9.17 or the cooldown
+# silently does nothing. Upgrade with `uv self update`.
+required-version = ">=0.9.17"
+exclude-newer = "7 days"
+
 [tool.pytest.ini_options]
 # Collect only from tests/. Without this, pytest walks the whole vault tree
 # (inbox/, archive/, the 22k tracked source files) — importing and executing
@@ -103,17 +115,43 @@ select = ["E", "F", "W", "UP", "B"]
 "mcp_server/provenance.py" = ["E402"]
 "mcp_server/reindex.py" = ["E402"]
 "mcp_server/tools.py" = ["E402"]
+"mcp_server/tools_read.py" = ["E402"]
 "scripts/ingest_lib/semantic.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.12"
-# Third-party ML/LLM SDKs (torch, sentence_transformers, mineru, anthropic,
-# openai, google.genai, python-docx/pptx, nbformat, pypdf, pypdfium2) ship no
-# usable stubs; ignore their import types rather than drown in stub-gap noise.
-# We still typecheck OUR code's own annotations.
-ignore_missing_imports = true
+# Owner rule: everything strictly typed. Widening to pass is a failure.
+strict = true
 check_untyped_defs = true
 # The scripts/ package is imported via a sys.path shim, not installed; point
 # mypy at it so cross-module imports resolve.
 mypy_path = "scripts"
 explicit_package_bases = true
+
+# Per-module stub-gap ignores instead of a blanket ignore_missing_imports
+# (AUD-076). Every other third-party import in this repo ships py.typed and
+# resolves cleanly; only these four genuinely need it:
+[[tool.mypy.overrides]]
+# PyYAML ships no py.typed marker and we don't carry a types-PyYAML dev dep.
+module = "yaml"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pypdfium2 is installed but ships no py.typed marker either.
+module = "pypdfium2"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional extras (try/except ImportError at the call site): not installed
+# in this environment at all, so even the module lookup fails.
+module = ["faster_whisper", "pillow_heif"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The ML stack is installed on the maintainer's machine (mineru[pipeline]
+# pulls torch; the semantic index pulls sentence-transformers) but is NOT in
+# the locked env CI installs, so there the module lookup itself fails. Both
+# are imported behind try/except at the call site. Verified against a
+# `uv sync --locked` environment, not the local one, which hid this gap.
+module = ["sentence_transformers", "sentence_transformers.*", "torch", "torch.*"]
+ignore_missing_imports = true

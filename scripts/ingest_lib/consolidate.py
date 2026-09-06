@@ -20,11 +20,17 @@ The lifecycle (the "dream pass", minus the mysticism):
 4. Everything else waits in the inbox for more confirmations or a
    human's ``approved: true``.
 
-LLMs may *propose* facts; only deterministic code or the human promotes
-them. Every decision here derives from frontmatter + ``as_of`` + the
-thresholds, so two runs over identical inputs produce byte-identical
-results. The only timestamps written are frontmatter values derived
-from ``as_of`` (AGENTS.md rule 7).
+WHO MAY APPROVE — ``approved:`` and ``confirmations:`` in the fact note's
+own frontmatter are taken at face value. Note the standing limitation the
+2026-09-04 audit named: an agent that writes a fact note also writes those
+keys, so this gate is advisory, not enforced. Reverting the out-of-reach
+approval ledger was a deliberate owner decision (FOUNDER_DECISIONS.md
+IMP-016) on the grounds that the path has never fired in practice.
+
+Every decision here derives from frontmatter + ``as_of`` + the
+thresholds, so two runs over identical inputs produce
+byte-identical results. The only timestamps written are frontmatter
+values derived from ``as_of`` (AGENTS.md rule 7).
 
 Run this pass when the MCP server is idle. It takes NO cross-process
 lock: it rewrites entity notes and unlinks inbox copies directly on
@@ -45,6 +51,7 @@ from .config import VaultPaths
 from .notes import _atomic_write, _split_frontmatter  # private helpers, module-internal
 from .relations import (
     append_fact_to_log,
+    folder_overview_id,
     is_valid_node_id,
     normalize_target,
     note_path_for_node,
@@ -108,6 +115,8 @@ def _coerce_int(raw: object) -> int:
         return int(_coerce_str(raw))
     except ValueError:
         return 0
+
+
 
 
 def _parse_date(raw: object) -> date | None:
@@ -261,10 +270,10 @@ def consolidate(
 
     Per note (sorted, top-level ``*.md`` only — the inbox is flat):
 
-    - PROMOTE when ``approved`` is truthy OR
-      ``confirmations >= min_confirmations`` and the target entity note
-      exists. Missing target -> the note STAYS in the inbox and counts
-      ``unresolved`` (a human or the agent resolves it).
+    - PROMOTE when ``approved:`` is truthy or ``confirmations >=
+      min_confirmations``, and the target entity note exists. Missing
+      target -> the note STAYS in the inbox and counts ``unresolved``
+      (a human or the agent resolves it).
     - DIGEST when still ``unconsolidated``, unapproved, and ``created:``
       is more than ``stale_days`` old relative to ``as_of``.
     - Otherwise ``skipped`` — still fresh, still unapproved; it waits.
@@ -307,14 +316,20 @@ def consolidate(
             )
             continue
 
+        created = _parse_date(fm.get("created"))
         approved = _coerce_bool(fm.get("approved"))
         confirmations = _coerce_int(fm.get("confirmations"))
-        created = _parse_date(fm.get("created"))
 
         # -- PROMOTE -------------------------------------------------------
         if approved or confirmations >= min_confirmations:
             promote = promote_raw if isinstance(promote_raw, dict) else {}
-            target = normalize_target(_coerce_str(promote.get("target")))
+            raw_target = _coerce_str(promote.get("target"))
+            # vault_root: resolve a folder-backed project's ambiguous short
+            # form ("projects/server") to the overview note that actually
+            # exists ("projects/server/server"). Without it such a target
+            # never resolves and the fact sits in the inbox until it is
+            # digested unpromoted (F9).
+            target = normalize_target(raw_target, vault_root=paths.root)
             if not target:
                 unresolved += 1
                 problems.append(
@@ -335,8 +350,12 @@ def consolidate(
             entity_path = paths.root / entity_rel
             if not entity_path.is_file():
                 unresolved += 1
+                tried = [entity_rel]
+                if is_valid_node_id(target):
+                    tried.append(note_path_for_node(folder_overview_id(target)))
                 problems.append(
-                    f"{rel}: target note {entity_rel} does not exist — left in inbox"
+                    f"{rel}: promote.target {raw_target!r} resolves to no note "
+                    f"(tried {', '.join(tried)}) — left in inbox"
                 )
                 continue
             try:
@@ -385,8 +404,18 @@ def consolidate(
                 problems.append(f"{rel}: promote.{p}")
 
             new_text = entity_text
-            for relation in relations:
-                new_text, _action = upsert_relation_in_text(new_text, relation)
+            try:
+                for relation in relations:
+                    new_text, _action = upsert_relation_in_text(new_text, relation)
+            except ValueError as exc:
+                # The target note's own frontmatter does not parse; writing
+                # into it would bury the breakage (AUD-001 class). Leave the
+                # fact in the inbox for a human to repair the entity note.
+                unresolved += 1
+                problems.append(
+                    f"{rel}: target note {entity_rel} has unparseable frontmatter ({exc}) — left in inbox"
+                )
+                continue
 
             # Collapse internal whitespace: a multi-line block-scalar fact
             # would otherwise land as several raw lines in ## Log, a

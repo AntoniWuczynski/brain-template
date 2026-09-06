@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from ingest_lib.config import paths_for_root
+import pytest
+
+from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.metadata import IndexRecord, append_record
 from ingest_lib.status import rebuild_status
 
@@ -21,13 +23,13 @@ def _rec(rel: str, status: str, *, extractor: str, ext: str, src_hash: str,
     )
 
 
-def _vault(tmp_path: Path):
+def _vault(tmp_path: Path) -> VaultPaths:
     paths = paths_for_root(tmp_path / "vault")
     paths.ensure()
     return paths
 
 
-def test_dashboard_and_review_content(tmp_path: Path):
+def test_dashboard_and_review_content(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     append_record(paths.metadata_index_jsonl,
                   _rec("uni/a.pdf", "processed", extractor="pdf-mineru", ext=".pdf", src_hash="h1"))
@@ -55,7 +57,7 @@ def test_dashboard_and_review_content(tmp_path: Path):
     assert "--path archive/raw/uni/b.pdf" in review
 
 
-def test_inbox_pending_vs_ingested(tmp_path: Path):
+def test_inbox_pending_vs_ingested(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     # A file whose hash matches an ingested record -> "already ingested".
     ingested = paths.inbox / "done.txt"
@@ -75,7 +77,7 @@ def test_inbox_pending_vs_ingested(tmp_path: Path):
     assert "1 inbox file(s) match an ingested hash" in dash
 
 
-def test_rebuild_is_skip_unchanged(tmp_path: Path):
+def test_rebuild_is_skip_unchanged(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     append_record(paths.metadata_index_jsonl, _rec("a.txt", "processed", extractor="text", ext=".txt", src_hash="h"))
     first = rebuild_status(paths, logger=_LOG)
@@ -84,7 +86,7 @@ def test_rebuild_is_skip_unchanged(tmp_path: Path):
     assert not second.dashboard_written and not second.review_written
 
 
-def test_user_tail_preserved(tmp_path: Path):
+def test_user_tail_preserved(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     append_record(paths.metadata_index_jsonl, _rec("a.txt", "processed", extractor="text", ext=".txt", src_hash="h"))
     rebuild_status(paths, logger=_LOG)
@@ -106,7 +108,7 @@ def _rec_dated(rel: str, status: str, *, src_hash: str, created: str) -> IndexRe
     return IndexRecord(**{**r.__dict__, "created_at": created})
 
 
-def test_now_dashboard_recent_and_attention(tmp_path: Path):
+def test_now_dashboard_recent_and_attention(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     append_record(paths.metadata_index_jsonl,
                   _rec_dated("notes/old.md", "processed", src_hash="h1",
@@ -135,7 +137,7 @@ def test_now_dashboard_recent_and_attention(tmp_path: Path):
     assert "| notes | 3 |" in now
 
 
-def test_now_dashboard_skip_unchanged(tmp_path: Path):
+def test_now_dashboard_skip_unchanged(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     append_record(paths.metadata_index_jsonl,
                   _rec_dated("notes/a.md", "processed", src_hash="h1",
@@ -146,3 +148,55 @@ def test_now_dashboard_skip_unchanged(tmp_path: Path):
     second = rebuild_status(paths, logger=_LOG)
     assert not second.now_written  # no index change -> byte-for-byte no-op
     assert (paths.knowledge_index / "Now.md").read_bytes() == before
+
+
+def test_inbox_is_hashed_once_per_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AUD-093: the dashboard and Now.md each walked and SHA-256-hashed the
+    # whole inbox, so every ingest run read the tracked mirror twice.
+    from ingest_lib import status as status_mod
+    from ingest_lib.hashing import sha256_of
+
+    paths = _vault(tmp_path)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (paths.inbox / name).write_text(name, encoding="utf-8")
+    append_record(paths.metadata_index_jsonl,
+                  _rec("a.txt", "processed", extractor="text", ext=".txt",
+                       src_hash=sha256_of(paths.inbox / "a.txt")))
+
+    hashed: list[Path] = []
+
+    def counting(p: Path) -> str:
+        hashed.append(p)
+        return sha256_of(p)
+
+    monkeypatch.setattr(status_mod, "sha256_of", counting)
+    st = rebuild_status(paths, logger=_LOG)
+
+    assert len(hashed) == 3
+    assert st.inbox_pending == 2 and st.inbox_ingested == 1
+
+
+def test_now_surfaces_failed_summaries(tmp_path: Path) -> None:
+    # AUD-020: a summariser failure leaves a permanently `processed` record
+    # with no summary that ingestion never revisits. Now.md names the count
+    # and the command that repairs it.
+    paths = _vault(tmp_path)
+    stuck = IndexRecord(
+        relative_path="uni/big.pdf", source_hash="h1", size_bytes=1, extension=".pdf",
+        extractor="pdf-mineru", status="processed", raw_path="archive/raw/uni/big.pdf",
+        processed_path="archive/processed/uni/big.pdf.md",
+        index_note_path="knowledge/index/uni/big.pdf.md",
+        notes=["summary: skipped (see warnings in log)"],
+    )
+    append_record(paths.metadata_index_jsonl, stuck)
+    append_record(paths.metadata_index_jsonl,
+                  _rec("uni/ok.pdf", "processed", extractor="pdf-mineru", ext=".pdf",
+                       src_hash="h2"))
+
+    st = rebuild_status(paths, logger=_LOG)
+    assert st.summary_failed == 1
+    now = (paths.knowledge_index / "Now.md").read_text(encoding="utf-8")
+    assert "| Sources whose summary failed | 1 |" in now
+    assert "--backfill-summaries" in now

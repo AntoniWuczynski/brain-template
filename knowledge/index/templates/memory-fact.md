@@ -40,7 +40,11 @@ Lifecycle:
 
 Shapes:
 - promote.target: node id — knowledge/-relative path without extension,
-  e.g. people/anna-kowalska.
+  e.g. people/anna-kowalska. A project lives in a FOLDER, so its id is the
+  overview note's own path: projects/server/server (the note
+  knowledge/projects/server/server.md), never the folder projects/server.
+  The short folder form still promotes — consolidate.py resolves it to the
+  overview when one exists — but write the canonical form.
 - promote.relations: same shape as entity relations; closed vocabulary
   works_at, member_of, attended, stakeholder_in, collaborator_on,
   met_at, related_to; targets are knowledge/-relative no-extension paths.

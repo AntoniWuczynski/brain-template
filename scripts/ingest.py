@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Load .env at the repo root (if present) before anything else, so
 # ANTHROPIC_API_KEY and friends are visible to all submodules.
 try:
-    from dotenv import load_dotenv  # type: ignore[import-not-found]
+    from dotenv import load_dotenv
     _repo_root = Path(__file__).resolve().parent.parent
     load_dotenv(_repo_root / ".env", override=False)
 except ImportError:
@@ -43,6 +43,16 @@ from ingest_lib import (  # noqa: E402
 from ingest_lib.dashboards import rebuild_dashboards  # noqa: E402
 from ingest_lib.status import rebuild_status, retry_partial  # noqa: E402
 from ingest_lib.logging_setup import configure_run_logger  # noqa: E402
+from ingest_lib.extractors.pdf import mineru_available  # noqa: E402
+
+
+def _mineru_status_line() -> str:
+    if mineru_available():
+        return "available"
+    return (
+        "unavailable — PDFs fall back to pypdf and land as status: partial "
+        "(see CLAUDE.md for the reinstall command)"
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -218,6 +228,13 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("repo root: %s", paths.root)
     logger.info("log file: %s", log_path.relative_to(paths.root))
 
+    if args.inbox or args.raw or args.path is not None or args.retry_partial:
+        mineru_line = _mineru_status_line()
+        if mineru_available():
+            logger.info("MinerU: %s", mineru_line)
+        else:
+            logger.warning("MinerU: %s", mineru_line)
+
     if args.backfill_summaries:
         if args.dry_run:
             logger.error("--dry-run is not supported with --backfill-summaries")
@@ -283,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  processed    : {stats.processed}")
         print(f"  partial      : {stats.partial}")
         print(f"  manual_review: {stats.manual_review}")
+        print(f"  MinerU       : {_mineru_status_line()}")
         print(f"  log          : {log_path.relative_to(paths.root)}")
         return 0
 
@@ -425,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  partial       : {stats.partial}")
     print(f"  manual_review : {stats.manual_review}")
     print(f"  skipped       : {stats.skipped}")
+    print(f"  MinerU        : {_mineru_status_line()}")
     print(f"  log           : {log_path.relative_to(paths.root)}")
     return 0
 

@@ -25,11 +25,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.types import CallToolResult
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +42,8 @@ def _free_port() -> int:
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
+    if not isinstance(port, int):
+        raise RuntimeError("getsockname() did not return a port")
     return port
 
 
@@ -75,7 +79,9 @@ class TestRunner:
             self.failures.append(f"{label}: {detail}")
             print(f"  FAIL  {label}  ({detail})")
 
-    async def expect_error(self, label: str, coro, expect_in_msg: str = "") -> None:
+    async def expect_error(
+        self, label: str, coro: Awaitable[CallToolResult], expect_in_msg: str = ""
+    ) -> None:
         try:
             result = await coro
         except Exception as exc:  # noqa: BLE001 - manual test, we want to see anything
@@ -97,16 +103,18 @@ class TestRunner:
         self.expect(label, False, f"expected an error but got: {content!r}"[:120])
 
 
-async def _call(session: ClientSession, name: str, **kwargs):
+async def _call(
+    session: ClientSession, name: str, **kwargs: str | int | list[str]
+) -> CallToolResult:
     return await session.call_tool(name, kwargs)
 
 
-def _ok(result) -> bool:
+def _ok(result: CallToolResult) -> bool:
     return not getattr(result, "isError", False)
 
 
 @asynccontextmanager
-async def _client(url: str, token: str):
+async def _client(url: str, token: str) -> AsyncIterator[ClientSession]:
     headers = {"Authorization": f"Bearer {token}"}
     async with streamablehttp_client(url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:

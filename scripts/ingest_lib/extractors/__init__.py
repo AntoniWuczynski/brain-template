@@ -17,6 +17,7 @@ from . import notebook as _notebook_mod
 from . import pdf as _pdf_mod
 from . import pptx as _pptx_mod
 from . import text as _text_mod
+from . import transcript as _transcript_mod
 
 
 # Map of *lowercase* extension (with the leading dot) to the extractor.
@@ -74,28 +75,37 @@ _REGISTRY: dict[str, Extractor] = {
 # Source-class registry: a vault-relative path PREFIX (e.g.
 # ``meetings/granola/``) → extractor, consulted BEFORE the suffix map.
 # Connector snapshots (see ``ingest_lib.connectors``) land under a
-# source-class directory and are often ``.json`` — an extension the suffix
-# map already assigns to ``text.py`` — so they need path-based routing.
+# source-class directory and are ``.json`` — an extension the suffix map
+# already assigns to ``text.py`` — so they need path-based routing. The
+# route is limited to that extension (see ``_SOURCE_CLASS_SUFFIX``) so a
+# PDF or Markdown file a human filed in the same folder still gets its own
+# extractor instead of being fed to a snapshot parser.
+_SOURCE_CLASS_SUFFIX = ".json"
 _SOURCE_CLASS_REGISTRY: dict[str, Extractor] = {
     "meetings/granola/": _meeting_mod.extract,
     "meetings/justrec/": _meeting_mod.extract,
+    "transcripts/claude_code/": _transcript_mod.extract,
+    "transcripts/chat_export/": _transcript_mod.extract,
 }
 
 
 def dispatch_extractor(path: Path, relative_path: str | None = None) -> Extractor | None:
     """Pick an extractor for ``path``.
 
-    When ``relative_path`` (the vault-relative logical path) is given, a
-    source-class prefix match wins over the file extension — so a connector's
-    ``.json`` snapshot under ``meetings/granola/`` routes to the Granola
-    extractor rather than the generic text one. Falls back to the suffix map.
+    When ``relative_path`` (the vault-relative logical path) is given and the
+    file is a ``.json`` snapshot, a source-class prefix match wins over the
+    file extension — so a connector's snapshot under ``meetings/granola/``
+    routes to the Granola extractor rather than the generic text one. Any
+    other extension under the same prefix, and anything with no
+    ``relative_path``, falls back to the suffix map.
     """
-    if relative_path is not None:
+    suffix = path.suffix.lower()
+    if relative_path is not None and suffix == _SOURCE_CLASS_SUFFIX:
         rel = relative_path.replace("\\", "/").lstrip("/")
         for prefix, extractor in _SOURCE_CLASS_REGISTRY.items():
             if rel.startswith(prefix):
                 return extractor
-    return _REGISTRY.get(path.suffix.lower())
+    return _REGISTRY.get(suffix)
 
 
 def registered_extensions() -> list[str]:

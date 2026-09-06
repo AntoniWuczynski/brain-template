@@ -23,16 +23,19 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 # Module (not function) import so tests can monkeypatch
 # ``recency.memory_search`` and the patch is visible through here.
-from ingest_lib import recency as _recency  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib.config import paths_for_root  # type: ignore[import-not-found]  # noqa: E402
+from ingest_lib import recency as _recency  # noqa: E402
+from ingest_lib.config import paths_for_root  # noqa: E402
 
 from . import tools as _tools
+from . import tools_read as _tools_read
 from .config import PROFILE_NOTE_PATH, ServerConfig
+from .errors import ToolError
 from .identity import current_agent
 from .provenance import stamp_provenance
 from .runtime import Runtime
 from .safety import SafetyError, resolve_read, resolve_write_under_allowlist
-from .tools import ToolError, WriteResult
+from .tools import WriteResult
+from .tools_read import EvidenceHintOut
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,7 @@ class MemoryHitOut(BaseModel):
     chunk_idx: int
     snippet: str
     updated: str            # the timestamp the decay was computed from
+    evidence: EvidenceHintOut
 
 
 class MemorySearchOut(BaseModel):
@@ -61,18 +65,26 @@ def tool_memory_search(
     recency_halflife_days: float = 30.0,
     types: list[str] | None = None,
 ) -> MemorySearchOut:
-    """Semantic search re-ranked by recency and memory status."""
+    """Semantic search re-ranked by recency and memory status. Each hit
+    carries an ``evidence`` hint (exists/probable/unknown, plus a node_id
+    when known) saying whether its subject already has an entity note under
+    knowledge/people|organisations|projects|meetings/ — check it before
+    creating a new entity note so you link the existing one instead of
+    splitting the person/project graph."""
     if not query or not query.strip():
         raise ToolError("query must be non-empty")
-    _tools._check_query_len(query)
+    _tools_read._check_query_len(query)
     if not 1 <= top_k <= 50:
         raise ToolError("top_k must be in [1, 50]")
     if not 1.0 <= recency_halflife_days <= 3650.0:
         raise ToolError("recency_halflife_days must be in [1, 3650]")
-    _tools._rate_check_search()
+    _tools_read._rate_check_search()
 
     paths = paths_for_root(cfg.vault_root)
-    with _tools._search_guard:
+    # Same loud failure vault_search gives for a missing index: an empty hit
+    # list here reads as "you know nothing about X" (AUD-039).
+    _tools_read.require_search_index(cfg)
+    with _tools_read._search_guard:
         try:
             hits = _recency.memory_search(
                 paths, query,
@@ -91,11 +103,15 @@ def tool_memory_search(
     safe = []
     for h in hits:
         try:
-            resolve_read(
+            resolved = resolve_read(
                 cfg.vault_root,
-                _tools._hit_gate_path(h.source_relative_path, h.origin),
+                _tools_read._hit_gate_path(h.source_relative_path, h.origin),
             )
         except SafetyError:
+            continue
+        if not _tools_read.note_still_exists(
+            h.source_relative_path, h.origin, resolved
+        ):
             continue
         safe.append(h)
     # Audit the query plus the GATED hit paths — what the agent actually saw.
@@ -105,6 +121,9 @@ def tool_memory_search(
         paths=[h.source_relative_path for h in safe],
         query=query,
     )
+    if not safe:
+        return MemorySearchOut(hits=[])
+    entity_index = _tools_read.build_entity_index(cfg)
     return MemorySearchOut(
         hits=[
             MemoryHitOut(
@@ -117,6 +136,7 @@ def tool_memory_search(
                 chunk_idx=h.chunk_idx,
                 snippet=h.snippet,
                 updated=h.updated,
+                evidence=entity_index.hint(h.source_relative_path, h.title),
             )
             for h in safe
         ]

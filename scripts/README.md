@@ -15,7 +15,7 @@ unchanged files is a no-op.
 ## Running
 
 ```bash
-uv sync                                                   # one-time setup
+uv sync                                                   # one-time setup — prunes mineru, see below
 uv run python scripts/ingest.py --dry-run --inbox         # see the plan
 uv run python scripts/ingest.py --inbox                   # do it
 uv run python scripts/ingest.py --raw                     # re-process archive
@@ -59,7 +59,8 @@ scores dense / lexical / hybrid side by side over the golden set, and
 zero-hit report of queries that never returned a result). Mined candidates
 carry ``expected: []`` — a human confirms relevance before promoting a line
 into the golden set; the file is gitignored (it holds real query strings) and
-never synced to the template.
+never synced to the template. ``--golden PATH`` points ``eval_retrieval.py``
+at a different query set (default ``scripts/eval/retrieval_golden.jsonl``).
 
 - First run downloads ~100 MB of model weights to ``~/.cache/huggingface/``.
 - **Query instruction.** ``bge-small-en-v1.5`` is trained to prepend
@@ -140,13 +141,37 @@ key is set):
 | `anthropic` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` |
 | `openai` | `OPENAI_API_KEY` | `gpt-5-mini` |
 | `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `gemini-2.5-flash` |
-| `local` | `BRAIN_LOCAL_URL` + `BRAIN_LOCAL_MODEL` | (see below) |
+| `local` | `BRAIN_LOCAL_URL` + `BRAIN_LOCAL_MODEL` | `llama3.1:8b` (via `BRAIN_LOCAL_MODEL`) |
 
 The model name can be overridden with `BRAIN_LLM_MODEL`. The `local`
 provider uses the OpenAI SDK with a custom `base_url`, so anything
 that speaks the OpenAI Chat Completions API works: Ollama (≥0.5 for
 structured outputs), LM Studio, llama.cpp's server, vLLM. Same Pydantic
 schema across all four providers, so behaviour is consistent.
+
+### Oversized documents (anthropic)
+
+Documents are sent to the model **in full** — the summarizer never
+truncates. `claude-haiku-4-5` has a 200K-token context window, so a very
+large source (a 700-page textbook, a statistical-tables PDF) comes back
+as a `400 prompt is too long`. On exactly that error the call is retried
+**once** on a 1M-context model, `claude-sonnet-5` by default:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `BRAIN_LLM_FALLBACK_MODEL` | `claude-sonnet-5` | Model to retry an oversized document on. Set it to an empty string to disable the retry. |
+
+The retry is triggered by the API's own error, not by a character-count
+guess (a character estimate is wrong by a factor of several for slides,
+code and CJK text), and it is **anthropic-only** — the other three
+providers have their own model lineups, limits and error wording, so they
+keep reporting the failure honestly instead. When it fires, the note
+records which model actually did the work:
+
+```
+- summary: anthropic/claude-haiku-4-5
+- summary: input exceeded claude-haiku-4-5's context window — retried on claude-sonnet-5
+```
 
 ## Chat with your vault
 
@@ -157,6 +182,7 @@ Two paths, both offline-capable when paired with the `local` provider:
 ```bash
 uv run python scripts/ask.py "what does my vault say about X?"
 uv run python scripts/ask.py --top-k 12 --provider local --model gemma4:31b "..."
+uv run python scripts/ask.py -q "..."   # -q/--quiet: omit the trailing model/provider line
 ```
 
 Pipeline: question → embed query against the existing `metadata/embeddings.npy`
@@ -315,16 +341,26 @@ concurrent MCP write could race the same note or the git index.
 
 ### Scheduling
 
-`scripts/maintain.sh` is the single entry point that runs `consolidate` then
-`sweep --write-report` — deterministic, exit 0, safe to run by hand or on a
-schedule (`scripts/maintain.sh --dry-run` to plan only). It prefers the repo
-`.venv` interpreter so a scheduler needs no `uv` on PATH. Schedule it for a
-quiet hour (no cross-process lock vs a running MCP server):
+`scripts/maintain.sh` is the single entry point that runs `consolidate`,
+`sweep --write-report`, then `rotate_logs` — deterministic, exit 0, safe to
+run by hand or on a schedule (`scripts/maintain.sh --dry-run` to plan only).
+It prefers the repo `.venv` interpreter so a scheduler needs no `uv` on PATH.
+Schedule it for a quiet hour (no cross-process lock vs a running MCP
+server):
 
 - **macOS** — `mcp_server/launchd/com.brain.maintenance.plist` (edit
   `REPO_ROOT`, `cp` to `~/Library/LaunchAgents/`, `launchctl load` it).
 - **Linux** — `mcp_server/systemd/brain-maintenance.{service,timer}`
   (`systemctl enable --now brain-maintenance.timer`).
+
+`scripts/rotate_logs.py` rotates the two MCP telemetry streams
+(`logs/mcp-access.jsonl`, `logs/mcp-audit.jsonl` — see `mcp_server/audit.py`)
+once a stream exceeds `--max-mb` (default 10, env `BRAIN_LOG_ROTATE_MB`):
+the oversized file is renamed to a UTC-timestamped segment, gzipped, and the
+uncompressed copy is dropped; the writer recreates the active path on its
+next append. Rotated `.gz` segments are kept forever — this step never
+touches an existing one — and are already excluded from git via
+`logs/*.gz`.
 
 ## Dream pass
 
@@ -355,6 +391,12 @@ fires, cleared by `--mark-done`) — both gitignored, machine-local scheduler
 state, unlike the committed `index.jsonl`. A pending marker two or more days
 old means the dream keeps failing to complete: `sweep.py`'s `dream-stalled`
 check flags it.
+
+Each of the first three env vars also has a same-named CLI flag on
+`dream_gate.py` (`--threshold`, `--stale-days`, `--pairs`) that overrides it
+for one invocation — handy for tests and replays. `dream_gate.py` also takes
+`--as-of ISO8601` (a full UTC timestamp, unlike `sweep`/`consolidate`'s
+`--as-of YYYY-MM-DD`) to fix the reference time.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -424,6 +466,70 @@ wikilinks, summary, transcript):
 - **`granola`** — pulls meetings from the Granola API (`GRANOLA_API_KEY`).
 - **`justrec`** — reads justREC's local export folder (`BRAIN_JUSTREC_DIR`),
   no API/auth.
+
+Two more connectors normalise into a second shared snapshot schema (one
+JSON object per session/conversation, routed to `extractors/transcript.py`
+— title, date, source context, the surviving user/assistant prose exchange,
+and a processing-notes section recording exactly what was dropped or
+redacted):
+
+- **`claude_code`** — reads local Claude Code CLI session transcripts under
+  `~/.claude/projects/<slugged-cwd>/*.jsonl` (override with
+  `BRAIN_CLAUDE_CODE_DIR`, or `pull.py claude_code --path <dir>`, which sets
+  the generic `BRAIN_PULL_PATH` and wins when both are set — a sessions
+  DIRECTORY, same shape as `BRAIN_CLAUDE_CODE_DIR`). No API, no auth — the
+  "fetch" is a local file read. Bounded by `BRAIN_CLAUDE_CODE_SINCE_DAYS`
+  (default 14) and `BRAIN_CLAUDE_CODE_MAX_SESSIONS` (default 50). A session
+  whose file was modified more recently than `BRAIN_CLAUDE_CODE_SETTLE_HOURS`
+  (default 24) is skipped — it excludes the session doing the pulling, but
+  the 24h default also lets a session spanning several days settle into ONE
+  snapshot instead of being re-snapshotted whole (duplicated into the
+  immutable archive) on every pull while it's still open. The title prefers
+  the session's own `ai-title` line, then the first surviving user turn that
+  isn't a collapsed bare-command marker (`_(ran `/dream-pass`)_` survives as
+  a turn's text but is never used as a title), then the slugged project path
+  and date.
+- **`chat_export`** — reads a user-downloaded `conversations.json` archive
+  (claude.ai's or ChatGPT's "Export data"), format auto-detected from shape.
+  Pointed at by `BRAIN_CHAT_EXPORT_PATH`, or `pull.py <connector> --path
+  <file>` (sets the generic `BRAIN_PULL_PATH`, which wins when both are
+  set). Bounded to the `BRAIN_CHAT_EXPORT_MAX` most recent conversations
+  (default 50, newest first). No API, no auth, no credential search.
+
+Both connectors share `_transcript_common.py`: harness bookkeeping (tool
+calls, "thinking" blocks, hook/queue events, injected wrapper tags like
+`<system-reminder>`/`<task-notification>`/a bare slash-command invocation)
+is dropped and counted in `stats`, never written — the wrapper-tag
+allowlist is restricted to this harness's own tag vocabulary
+(`local-command-*`/`task-*`/`bash-*`/`command-*`/`skill-*`/`system-*`), not
+any tag-shaped text, so real pasted HTML/JSX/XML a turn happens to open
+with (`<div>`, `<details>`, ...) survives instead of being mistaken for an
+unrecognised wrapper and dropped whole. Obvious credential patterns — env
+assignments in any casing (quoted or not, with or without a leading
+`export`/`set`), JSON/YAML secret keys, `Authorization`/`Cookie`/
+`X-Api-Key` headers, vendor-prefixed tokens (AWS, Anthropic, OpenAI,
+GitHub, npm, GitLab, Google, Slack), a bare 40-hex/40-base64 high-entropy
+value, private-key blocks, JWTs, and URL-embedded credentials (including an
+empty username) — are redacted before a snapshot ever reaches `inbox/`
+(`inbox/` and `archive/raw/` are immutable, so this must happen here, not
+downstream; over-redacting a non-secret-looking value is an accepted
+false positive, missing a real one is not). Each session/conversation's
+total size is capped by `BRAIN_TRANSCRIPT_MAX_CHARS` (default 60,000
+chars) on top of the 6,000-char per-turn cap — keeping BOTH the oldest and
+newest turns (roughly a 25%/75% split of the budget) and eliding the
+middle behind a visible `…[N turn(s) elided]…` marker turn, rather than
+only ever dropping the oldest turns, so a note never opens mid-conversation
+with the framing request gone; `dropped_overflow_turns` records how many
+were elided, and a conversation left with no surviving user OR assistant
+turn after capping is dropped rather than written as a one-sided note. A
+source explicitly configured (a `--path`/dir/file env var) but not
+resolving to a real file/dir is a loud, non-zero-exit failure, not a
+silent zero-item pull.
+
+A transcript pull that lands enough new snapshots (see
+`BRAIN_DREAM_THRESHOLD` below) will make the next scheduled dream run fire —
+by design, new sources are new evidence the dream gate has always counted,
+same as any other connector's output; it is deliberately not excluded.
 
 Adding another connector is a `pull()` + an extractor + an `.env` stanza.
 Follow-up for meetings: promote each into a first-class `knowledge/meetings/`
@@ -501,9 +607,9 @@ its model weights from Hugging Face on first run — about 14 GB into
 
 Knobs (env vars, all optional):
 
-- `MINERU_DEVICE_MODE` — `cpu` (default), `mps` (Apple Silicon), or
-  `cuda`. The extractor picks `mps` automatically when PyTorch reports
-  it available.
+- `MINERU_DEVICE_MODE` — `mps` (Apple Silicon), `cuda`, or `cpu`. Defaults
+  to `mps` when PyTorch reports it available, else `cuda` if available,
+  else `cpu`.
 - `MINERU_MODEL_SOURCE` — `huggingface` (default) or `modelscope` (use
   Alibaba's mirror if HF is blocked).
 - `BRAIN_MINERU_LANG` — OCR language passed to MinerU (default `en`).
@@ -530,7 +636,7 @@ unreadable bits — it is prompted to **never invent** content). The
 rendered page image is kept as an asset so the original stays viewable.
 
 - Provider/model reuse the summarizer's config (`BRAIN_LLM_PROVIDER`,
-  keys). Vision model defaults to `claude-sonnet-4-6`; override with
+  keys). Vision model defaults to `claude-sonnet-5`; override with
   `BRAIN_VLM_MODEL`. Render resolution via `BRAIN_VLM_SCALE` (default 2.0).
 - Cost is ~one vision call per page (~cents). Set the env var only for
   handwritten modules — leave it unset so printed material keeps using
@@ -560,6 +666,12 @@ errors on a specific PDF, the script transparently falls back to
 `pypdf` and records the MinerU error verbatim in the note's
 `Processing notes` section.
 
+**Every `uv sync` prunes MinerU.** Because it isn't in the lockfile, `uv sync`
+removes it (and its torch transitives) from the venv on every run, not just
+the first. Re-run `uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six`
+after each `uv sync` to restore full PDF extraction, or ingestion silently
+falls back to `pypdf` and every PDF lands `partial`.
+
 ## Internals
 
 ```
@@ -568,6 +680,17 @@ scripts/
 ├── ask.py                          # single-shot RAG chat with the vault
 ├── sweep.py                        # vault linter CLI
 ├── consolidate.py                  # memory-consolidation CLI
+├── rotate_logs.py                  # MCP telemetry log rotation CLI
+├── dream_gate.py                   # deterministic dream-pass gate CLI
+├── eval_retrieval.py               # retrieval eval CLI (recall@k / MRR)
+├── pull.py                         # connector CLI: pull an external source into inbox/
+├── maintain.sh                     # consolidate + sweep + rotate_logs, one entry point
+├── dream.sh                        # dream-pass scheduler entry point
+├── push_to_upstream.sh             # sync framework files to the public brain-template repo
+├── pull_from_upstream.sh           # pull framework updates from brain-template
+├── check-action-pins.sh            # verify workflow `uses:` lines are pinned to a commit SHA
+├── eval/
+│   └── retrieval_golden.jsonl      # golden query set for eval_retrieval.py
 ├── README.md                       # this file (you are here)
 └── ingest_lib/
     ├── __init__.py                 # public re-exports
@@ -587,9 +710,23 @@ scripts/
     ├── sweep.py                    # vault-lint checks (CLI: scripts/sweep.py)
     ├── consolidate.py              # consolidation pass (CLI: scripts/consolidate.py)
     ├── semantic.py                 # embeddings index: build, search, upsert_notes
+    ├── lexical.py                  # BM25 lexical retrieval over chunk text
     ├── describe.py                 # AI concept descriptions (RAG)
     ├── caption.py                  # figure/table captioning (vision)
     ├── chat.py                     # RAG plumbing for ask.py
+    ├── dream.py                    # dream-pass gate: deterministic prep for the LLM session
+    ├── evalmine.py                 # mine real queries from the MCP access log
+    ├── evalret.py                  # recall@k / MRR scoring over the golden set
+    ├── status.py                   # Processing Dashboard + Manual Review notes
+    ├── connectors/
+    │   ├── base.py                  # connector contract: source-native pull()
+    │   ├── granola.py               # Granola meeting connector
+    │   ├── justrec.py               # justREC meeting connector (local-first)
+    │   ├── claude_code.py           # Claude Code session-transcript connector (local-first)
+    │   ├── chat_export.py           # claude.ai/ChatGPT conversation-export connector (local-first)
+    │   ├── _transcript_common.py    # shared normalisation for the two transcript connectors
+    │   ├── runner.py                # drive a connector: pull, skip-unchanged, snapshot
+    │   └── state.py                 # per-connector pull state (metadata/connectors/<name>.json)
     └── extractors/
         ├── __init__.py             # extension → extractor registry
         ├── base.py                 # ExtractionResult dataclass
@@ -599,7 +736,11 @@ scripts/
         ├── notebook.py             # nbformat
         ├── dataset.py              # CSV/TSV/JSONL schema-only
         ├── pdf.py                  # MinerU primary, pypdf fallback
-        └── vlm.py                  # vision-LLM page transcription (BRAIN_PDF_EXTRACTOR=vlm)
+        ├── vlm.py                  # vision-LLM page transcription (BRAIN_PDF_EXTRACTOR=vlm)
+        ├── image.py                # standalone-image extractor (vision LLM)
+        ├── audio.py                # audio + subtitle/transcript extractor (faster-whisper)
+        ├── meeting.py              # Granola/justREC meeting-snapshot extractor
+        └── transcript.py           # claude_code/chat_export snapshot extractor
 ```
 
 ## Adding a new file type
@@ -641,8 +782,10 @@ purpose: raw is immutable.
 
 ## What this script will not do
 
-- It will not OCR images outside of MinerU's pipeline. Install MinerU
-  for OCR.
+- It will not caption or transcribe a standalone image or handwritten PDF
+  without a vision LLM configured (an API key, or `BRAIN_LOCAL_URL` for a
+  local model) — with none configured it's marked `manual_review`, never
+  described from nothing.
 - It will not generate "summaries" for content it could not extract.
 - It will not modify files in `archive/raw/` or `inbox/`.
 - It will not delete or rename the user's hand-written notes.

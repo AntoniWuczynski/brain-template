@@ -81,6 +81,17 @@ def _read(paths: VaultPaths, rel: str) -> str:
     return (paths.root / rel).read_text(encoding="utf-8")
 
 
+def _approve(paths: VaultPaths, *names: str) -> None:
+    """Mark inbox fact notes approved. The gate is the note's own
+    ``approved:`` frontmatter — FOUNDER_DECISIONS.md IMP-016 reverted the
+    out-of-reach ledger — so approving is flipping that key."""
+    for name in names:
+        note = paths.root / _INBOX / name
+        text = note.read_text(encoding="utf-8")
+        assert "approved:" in text, f"{name} is not a fact note"
+        note.write_text(text.replace("approved: false", "approved: true", 1), encoding="utf-8")
+
+
 def _fact_note(
     *,
     title: str = "Anna works at Acme",
@@ -91,29 +102,36 @@ def _fact_note(
     fact: str = "Anna works at Acme",
     source: str = "knowledge/meetings/2026/2026-06-01-call",
     body: str = "Anna mentioned her new role twice during the call.",
+    provenance: bool = True,
 ) -> str:
-    """Hand-built note matching knowledge/index/templates/memory-fact.md."""
+    """Note matching knowledge/index/templates/memory-fact.md.
+
+    ``provenance=True`` (the default, and the live case) carries the
+    server-asserted keys the MCP server stamps on every write, marking the
+    note agent-written: its own ``approved:``/``confirmations:`` are then
+    advisory and only the human ledger (``_approve``) promotes it.
+    ``provenance=False`` is a note the human wrote by hand — no server
+    provenance, so the plain frontmatter gate applies."""
     return (
         "---\n"
         f'title: "{title}"\n'
         "type: memory_fact\n"
         f'created: "{created}"\n'
-        'author: "claude"\n'
-        'written_via: "mcp"\n'
-        "memory_status: unconsolidated\n"
-        f"confirmations: {confirmations}\n"
-        f"approved: {'true' if approved else 'false'}\n"
-        "promote:\n"
-        f'  target: "{target}"\n'
-        "  relations:\n"
-        "    - rel: works_at\n"
-        "      target: organisations/acme\n"
-        '      valid_from: "2026-06-01"\n'
-        f'  fact: "{fact}"\n'
-        f'  source: "{source}"\n'
-        "---\n"
-        "\n"
-        f"{body}\n"
+        + ("author: 'agent:claude-code'\nwritten_via: \"mcp\"\n" if provenance else "")
+        + "memory_status: unconsolidated\n"
+        + f"confirmations: {confirmations}\n"
+        + f"approved: {'true' if approved else 'false'}\n"
+        + "promote:\n"
+        + f'  target: "{target}"\n'
+        + "  relations:\n"
+        + "    - rel: works_at\n"
+        + "      target: organisations/acme\n"
+        + '      valid_from: "2026-06-01"\n'
+        + f'  fact: "{fact}"\n'
+        + f'  source: "{source}"\n'
+        + "---\n"
+        + "\n"
+        + f"{body}\n"
     )
 
 
@@ -135,6 +153,7 @@ def test_approved_fact_promotes(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _write(paths, "knowledge/people/anna.md", _ENTITY)
     _write(paths, f"{_INBOX}/fact-anna.md", _fact_note(approved=True))
+    _approve(paths, "fact-anna.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -172,8 +191,10 @@ def test_approved_fact_promotes(tmp_path: Path) -> None:
 def test_confirmations_threshold_promotes_below_waits(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _write(paths, "knowledge/people/anna.md", _ENTITY)
-    _write(paths, f"{_INBOX}/confirmed.md", _fact_note(confirmations=3))
-    _write(paths, f"{_INBOX}/unconfirmed.md", _fact_note(confirmations=2))
+    # Hand-written notes (no server provenance): their own confirmations
+    # counter IS the human's, so the threshold gate applies to them.
+    _write(paths, f"{_INBOX}/confirmed.md", _fact_note(confirmations=3, provenance=False))
+    _write(paths, f"{_INBOX}/unconfirmed.md", _fact_note(confirmations=2, provenance=False))
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF, min_confirmations=3)
 
@@ -182,13 +203,16 @@ def test_confirmations_threshold_promotes_below_waits(tmp_path: Path) -> None:
     assert not (paths.root / _INBOX / "confirmed.md").exists()
     assert (paths.root / _ARCHIVE_MONTH / "confirmed.md").is_file()
     # Below threshold: untouched, byte-for-byte.
-    assert _read(paths, f"{_INBOX}/unconfirmed.md") == _fact_note(confirmations=2)
+    assert _read(paths, f"{_INBOX}/unconfirmed.md") == _fact_note(
+        confirmations=2, provenance=False
+    )
 
 
 def test_unresolved_target_stays_in_inbox(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     original = _fact_note(approved=True, target="people/ghost")
     _write(paths, f"{_INBOX}/fact-ghost.md", original)
+    _approve(paths, "fact-ghost.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -209,6 +233,7 @@ def test_promote_target_traversal_is_rejected(tmp_path: Path) -> None:
     sentinel.write_text("ORIGINAL AGENTS CONTENT\n", encoding="utf-8")
     original = _fact_note(approved=True, target="../AGENTS")
     _write(paths, f"{_INBOX}/fact-evil.md", original)
+    _approve(paths, "fact-evil.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -221,8 +246,106 @@ def test_promote_target_traversal_is_rejected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# digestion + waiting
+# folder-backed project targets (F9)
 # ---------------------------------------------------------------------------
+
+_PROJECT = """---
+title: Home server
+type: project
+created: '2026-01-01'
+updated: '2026-01-01'
+---
+
+# Home server
+
+## Log
+
+- 2026-01-01 — note created
+"""
+
+
+def test_short_form_project_target_promotes_into_folder_overview(tmp_path: Path) -> None:
+    """F9: a project lives in a folder, so ``projects/server`` names no note
+    and the live inbox fact could never promote. The overview note
+    ``knowledge/projects/server/server.md`` is the entity, and the short form
+    resolves to it."""
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/projects/server/server.md", _PROJECT)
+    _write(paths, f"{_INBOX}/fact-server.md",
+           _fact_note(approved=True, target="projects/server",
+                      fact="Antoni runs the brain on the home server"))
+    _approve(paths, "fact-server.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 1
+    assert stats.unresolved == 0
+    assert stats.touched_entity_paths == ("knowledge/projects/server/server.md",)
+    overview = _read(paths, "knowledge/projects/server/server.md")
+    assert "- 2026-06-10 — Antoni runs the brain on the home server" in overview
+    # No stray flat note was created next to the folder.
+    assert not (paths.root / "knowledge/projects/server.md").exists()
+    assert not (paths.root / f"{_INBOX}/fact-server.md").exists()
+
+
+def test_flat_project_note_wins_over_folder_overview(tmp_path: Path) -> None:
+    """Resolution is by existence, not by shape: a real note at the short
+    path keeps its own id even when a same-named folder overview exists."""
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/projects/rex.md", _PROJECT)
+    _write(paths, "knowledge/projects/rex/rex.md", _PROJECT)
+    _write(paths, f"{_INBOX}/fact-rex.md",
+           _fact_note(approved=True, target="projects/rex", fact="Rex shipped"))
+    _approve(paths, "fact-rex.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 1
+    assert stats.touched_entity_paths == ("knowledge/projects/rex.md",)
+    assert "Rex shipped" in _read(paths, "knowledge/projects/rex.md")
+    assert "Rex shipped" not in _read(paths, "knowledge/projects/rex/rex.md")
+
+
+def test_folder_without_overview_stays_unresolved_and_names_both_paths(
+    tmp_path: Path,
+) -> None:
+    """A project folder holding only curated notes has no entity note, so the
+    fact stays in the inbox — and the problem names every path that was
+    tried, not just the flat one."""
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/projects/ghost/design.md", _PROJECT)
+    original = _fact_note(approved=True, target="projects/ghost")
+    _write(paths, f"{_INBOX}/fact-ghost-project.md", original)
+    _approve(paths, "fact-ghost-project.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 0
+    assert stats.unresolved == 1
+    assert _read(paths, f"{_INBOX}/fact-ghost-project.md") == original
+    problem = next(p for p in stats.problems if "fact-ghost-project.md" in p)
+    assert "'projects/ghost'" in problem
+    assert "knowledge/projects/ghost.md" in problem
+    assert "knowledge/projects/ghost/ghost.md" in problem
+
+
+# ---------------------------------------------------------------------------
+# anti-self-approval (F1)
+# ---------------------------------------------------------------------------
+
+
+def test_hand_written_note_promotes_on_its_own_approved(tmp_path: Path) -> None:
+    """A note with NO server provenance was written by the human, so its own
+    ``approved: true`` is the human's decision — no ledger entry needed."""
+    paths = _vault(tmp_path)
+    _write(paths, "knowledge/people/anna.md", _ENTITY)
+    _write(paths, f"{_INBOX}/hand.md", _fact_note(approved=True, provenance=False))
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 1
+    assert stats.problems == ()
+    assert (paths.root / _ARCHIVE_MONTH / "hand.md").is_file()
 
 def test_stale_unconsolidated_is_digested(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
@@ -279,6 +402,7 @@ def test_dry_run_mutates_nothing(tmp_path: Path) -> None:
     _write(paths, "knowledge/people/anna.md", _ENTITY)
     _write(paths, f"{_INBOX}/promotable.md", _fact_note(approved=True))
     _write(paths, f"{_INBOX}/stale.md", _fact_note(created="2026-04-01"))
+    _approve(paths, "promotable.md")
 
     before = _snapshot(paths.root)
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF, dry_run=True)
@@ -297,6 +421,7 @@ def test_archive_collision_gets_numeric_suffix(tmp_path: Path) -> None:
     _write(paths, "knowledge/people/anna.md", _ENTITY)
     _write(paths, f"{_ARCHIVE_MONTH}/fact.md", "earlier archived note\n")
     _write(paths, f"{_INBOX}/fact.md", _fact_note(approved=True))
+    _approve(paths, "fact.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -312,7 +437,10 @@ def test_determinism_byte_identical_across_copies(tmp_path: Path) -> None:
         paths = _vault(root)
         _write(paths, "knowledge/people/anna.md", _ENTITY)
         _write(paths, f"{_INBOX}/approved.md", _fact_note(approved=True))
-        _write(paths, f"{_INBOX}/confirmed.md", _fact_note(confirmations=5, source=""))
+        _write(paths, f"{_INBOX}/confirmed.md", _fact_note(
+            confirmations=5, source="", provenance=False,
+        ))
+        _approve(paths, "approved.md")
         _write(paths, f"{_INBOX}/stale.md", _fact_note(created="2026-03-15"))
         _write(paths, f"{_INBOX}/fresh.md", _fact_note(created="2026-06-11"))
         return paths
@@ -360,6 +488,7 @@ def test_crashed_promote_rerun_relation_upsert_is_noop(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _write(paths, "knowledge/people/anna.md", _ENTITY_AFTER_PROMOTE)
     _write(paths, f"{_INBOX}/fact-anna.md", _fact_note(approved=True))
+    _approve(paths, "fact-anna.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -378,6 +507,7 @@ def test_crashed_promote_rerun_does_not_duplicate_fact_line(tmp_path: Path) -> N
     paths = _vault(tmp_path)
     _write(paths, "knowledge/people/anna.md", _ENTITY_AFTER_PROMOTE)
     _write(paths, f"{_INBOX}/fact-anna.md", _fact_note(approved=True))
+    _approve(paths, "fact-anna.md")
 
     stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
 
@@ -399,6 +529,7 @@ def test_crashed_promote_rerun_next_day_no_duplicate(tmp_path: Path) -> None:
     _write(paths, "knowledge/people/anna.md", _ENTITY)
     fact = _fact_note(approved=True, source="")  # source unset -> dest fallback
     _write(paths, f"{_INBOX}/fact-anna.md", fact)
+    _approve(paths, "fact-anna.md")
 
     day1 = date(2026, 6, 12)
     s1 = consolidate(paths, logger=_LOG, as_of=day1)
@@ -418,3 +549,22 @@ def test_crashed_promote_rerun_next_day_no_duplicate(tmp_path: Path) -> None:
         p.name for p in (paths.root / _ARCHIVE_MONTH).glob("fact-anna*.md")
     )
     assert archived == ["fact-anna.md"]  # no 'fact-anna-2.md' duplicate
+
+
+def test_promote_into_unparseable_entity_note_is_left_unresolved(tmp_path: Path) -> None:
+    """A target note whose frontmatter fence does not parse must not be
+    written into (it would be buried under a second fence); the fact stays
+    in the inbox and the run reports why."""
+    paths = _vault(tmp_path)
+    broken = "---\ntitle: fps — \"Quarterly Review: a fever dream\"\ntype: person\n---\n\n# Anna\n"
+    _write(paths, "knowledge/people/anna.md", broken)
+    _write(paths, f"{_INBOX}/fact-anna.md", _fact_note(approved=True))
+    _approve(paths, "fact-anna.md")
+
+    stats = consolidate(paths, logger=_LOG, as_of=AS_OF)
+
+    assert stats.promoted == 0
+    assert stats.unresolved == 1
+    assert (paths.root / _INBOX / "fact-anna.md").exists()
+    assert _read(paths, "knowledge/people/anna.md") == broken
+    assert any("unparseable frontmatter" in p for p in stats.problems)

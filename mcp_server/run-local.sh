@@ -8,9 +8,22 @@
 # Code config must keep matching. Override the location with
 # BRAIN_MCP_TOKEN_FILE.
 #
-# Git push is OFF by default for local runs: write tools still commit to
-# the vault's currently checked-out branch, but nothing is pushed. Set
-# BRAIN_MCP_GIT_PUSH_ON_WRITE=1 to push.
+# Never publish that token with `launchctl setenv` (or the shell-profile
+# equivalent): a setenv value is inherited by every process in the login
+# session, so the 0600 file and 0600 plist stop meaning anything and any app,
+# hook or agent on the machine can read a credential that commits — and, with
+# BRAIN_MCP_GIT_PUSH_ON_WRITE=1, pushes — to the vault. Clients read the file
+# at use time instead, the way the `claude mcp add` line printed below does.
+# A second client (Codex, a scheduled job) gets its OWN token: give the server
+# BRAIN_MCP_TOKENS="claude=<tok1>,codex=<tok2>" so each agent is separately
+# named in the audit log and separately revocable.
+#
+# Git push is OFF by default for local runs: write tools still commit, but
+# nothing is pushed. Set BRAIN_MCP_GIT_PUSH_ON_WRITE=1 to push. Commits only
+# land if the vault's checked-out branch matches BRAIN_MCP_GIT_BRANCH
+# (default "main", not set here) — on any other branch, writes still land on
+# disk but the tool returns committed:false. Export BRAIN_MCP_GIT_BRANCH
+# before running this script if you're working from a feature branch.
 
 set -euo pipefail
 

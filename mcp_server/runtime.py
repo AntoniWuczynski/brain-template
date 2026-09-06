@@ -41,5 +41,6 @@ def build_runtime(cfg: ServerConfig) -> Runtime:
         cfg.vault_root,
         audit=audit,
         request_push=push_worker.request_push,
+        branch=cfg.git_branch,
     )
     return Runtime(audit=audit, push_worker=push_worker, refresher=refresher)
