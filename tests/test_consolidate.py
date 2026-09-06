@@ -576,7 +576,7 @@ def test_promote_into_unparseable_entity_note_is_left_unresolved(tmp_path: Path)
 # ---------------------------------------------------------------------------
 # duplicate-entity merge (promote.merge) — FOUNDER_DECISIONS.md IMP-021
 # Fixtures are the three live pairs (alicia/nate/peter beside their
-# @focaldata.com twins), anonymised: same frontmatter key order, quoting and
+# email-address twins), anonymised: same frontmatter key order, quoting and
 # meeting_create-minted ``attended`` relation, because those exact bytes are
 # what the merge has to survive.
 # ---------------------------------------------------------------------------
