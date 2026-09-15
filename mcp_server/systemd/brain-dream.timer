@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the brain dream pass daily
+
+[Timer]
+# 05:00 local — one hour after brain-maintenance.timer (04:00), so the
+# deterministic consolidate and sweep passes have finished before the LLM
+# dreams over their output. Persistent catches a missed run after downtime.
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

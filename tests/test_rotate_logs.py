@@ -28,7 +28,12 @@ if _SCRIPTS_DIR not in sys.path:
 
 import rotate_logs  # noqa: E402
 from ingest_lib.config import paths_for_root  # noqa: E402
-from rotate_logs import _build_parser, rotate_if_large  # noqa: E402
+from rotate_logs import (  # noqa: E402
+    _build_parser,
+    copytruncate_if_large,
+    rotate_if_large,
+    rotate_launchd_logs_if_large,
+)
 
 _ONE_KB = 1024
 
@@ -352,6 +357,143 @@ def test_compress_after_days_default_without_env_is_fourteen(
 ) -> None:
     monkeypatch.delenv("BRAIN_LOG_COMPRESS_DAYS", raising=False)
     assert _build_parser().parse_args([]).compress_after_days == 14
+
+
+# ------------------------------------------- launchd combined logs (AUD-060 residual)
+
+
+def test_oversized_launchd_log_is_copytruncated_with_matching_gz_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "brain-mcp.out.log"
+    original = b"line\n" * 300  # comfortably over a 1 KiB threshold
+    target.write_bytes(original)
+
+    result = copytruncate_if_large(target, _ONE_KB)
+
+    assert result is not None
+    assert result.name.startswith("brain-mcp.out-") and result.name.endswith(".log.gz")
+    # Unlike rotate_if_large: the active path is NOT renamed away or
+    # unlinked — same inode, now empty, so a writer's open fd stays valid.
+    assert target.exists()
+    assert target.read_bytes() == b""
+    with gzip.open(result, "rb") as fh:
+        assert fh.read() == original
+
+
+def test_copytruncate_preserves_an_open_appending_writers_fd(tmp_path: Path) -> None:
+    """The whole point: a process that already has ``target`` open for
+    O_APPEND writing must be able to keep writing after the truncate, with
+    its next line landing at the START of the now-empty file — not at its
+    old offset (which would leave a zero-filled gap no reader would see
+    past)."""
+    target = tmp_path / "maintain.out.log"
+    original = b"x" * 2000
+    target.write_bytes(original)
+
+    with target.open("ab") as writer_fd:
+        result = copytruncate_if_large(target, _ONE_KB)
+        assert result is not None
+        writer_fd.write(b"new line after truncate\n")
+        writer_fd.flush()
+
+    assert target.read_bytes() == b"new line after truncate\n"  # no gap, no old bytes
+    with gzip.open(result, "rb") as fh:
+        assert fh.read() == original
+
+
+def test_launchd_log_under_threshold_untouched(tmp_path: Path) -> None:
+    target = tmp_path / "dream.err.log"
+    content = b"small\n"
+    target.write_bytes(content)
+
+    result = copytruncate_if_large(target, _ONE_KB)
+
+    assert result is None
+    assert target.read_bytes() == content
+
+
+def test_launchd_log_missing_file_is_noop(tmp_path: Path) -> None:
+    assert copytruncate_if_large(tmp_path / "brain-mcp.err.log", _ONE_KB) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_launchd_log_dry_run_writes_nothing(tmp_path: Path) -> None:
+    target = tmp_path / "brain-mcp.out.log"
+    original = b"x" * 2000
+    target.write_bytes(original)
+
+    result = copytruncate_if_large(target, _ONE_KB, dry_run=True)
+
+    assert result is not None and not result.exists()
+    assert target.read_bytes() == original  # untouched, not even truncated
+
+
+def test_launchd_log_same_second_collision_skips_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "brain-mcp.out.log"
+    original = b"x" * 2000
+    target.write_bytes(original)
+    monkeypatch.setattr(rotate_logs, "_now_stamp", lambda: "20260101T000000Z")
+    existing_gz = tmp_path / "brain-mcp.out-20260101T000000Z.log.gz"
+    existing_gz.write_bytes(b"do not clobber")
+
+    result = copytruncate_if_large(target, _ONE_KB)
+
+    assert result is None  # skipped, not overwritten
+    assert target.read_bytes() == original  # left alone, not truncated either
+    assert existing_gz.read_bytes() == b"do not clobber"
+
+
+def test_rotate_launchd_logs_skips_dated_run_logs(tmp_path: Path) -> None:
+    # A dated run log (job 2's territory) is never copy-truncated here, even
+    # oversized — job 2 already rotates it by rename+gzip.
+    dated = tmp_path / "ingest-20260101T010203Z.log"
+    dated.write_bytes(b"x" * 2000)
+    undated = tmp_path / "brain-mcp.out.log"
+    undated.write_bytes(b"y" * 2000)
+
+    produced = rotate_launchd_logs_if_large(tmp_path, _ONE_KB)
+
+    assert [p.name for p in produced] == [
+        p.name for p in tmp_path.glob("brain-mcp.out-*.log.gz")
+    ]
+    assert len(produced) == 1
+    assert dated.read_bytes() == b"x" * 2000  # untouched
+    assert undated.read_bytes() == b""        # truncated
+
+
+def test_rotate_launchd_logs_handles_several_streams_at_once(tmp_path: Path) -> None:
+    for name in ("brain-mcp.out.log", "brain-mcp.err.log", "maintain.out.log"):
+        (tmp_path / name).write_bytes(b"z" * 2000)
+    (tmp_path / "dream.err.log").write_bytes(b"small\n")  # stays under threshold
+
+    produced = rotate_launchd_logs_if_large(tmp_path, _ONE_KB)
+
+    assert len(produced) == 3
+    assert (tmp_path / "brain-mcp.out.log").read_bytes() == b""
+    assert (tmp_path / "brain-mcp.err.log").read_bytes() == b""
+    assert (tmp_path / "maintain.out.log").read_bytes() == b""
+    assert (tmp_path / "dream.err.log").read_bytes() == b"small\n"
+
+
+def test_cli_copytruncates_oversized_launchd_logs_under_vault_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = paths_for_root(tmp_path / "vault")
+    paths.ensure()
+    (paths.logs / "brain-mcp.out.log").write_bytes(b"a" * 2_000_000)  # ~2 MB, over 1 MiB
+    (paths.logs / "brain-mcp.err.log").write_bytes(b"small\n")
+    monkeypatch.setattr(rotate_logs, "default_paths", lambda: paths)
+
+    rc = rotate_logs.main(["--max-mb", "1"])
+
+    assert rc == 0
+    assert (paths.logs / "brain-mcp.out.log").read_bytes() == b""
+    assert (paths.logs / "brain-mcp.err.log").read_bytes() == b"small\n"
+    gz_files = sorted(paths.logs.glob("brain-mcp.out-*.log.gz"))
+    assert len(gz_files) == 1
+    with gzip.open(gz_files[0], "rb") as fh:
+        assert fh.read() == b"a" * 2_000_000
 
 
 def test_cli_compresses_old_run_logs_under_vault_root(

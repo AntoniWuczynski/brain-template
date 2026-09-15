@@ -55,12 +55,13 @@ from .notes import _atomic_write, _split_frontmatter, fm_list, fm_scalar, md_cel
 from .relations import EntityInfo, entity_notes, normalize_target
 
 # knowledge/ subdir -> dashboard title. Order is the render order; the
-# other hand-edited areas (notes, research, university, assistant) are
-# free-form and don't dashboard into a meaningful table.
+# other hand-edited areas (notes, personal, research, university, assistant)
+# are free-form and don't dashboard into a meaningful table.
 _GROUPS: tuple[tuple[str, str], ...] = (
     ("people", "People"),
     ("organisations", "Organisations"),
     ("projects", "Projects"),
+    ("chats", "Chats"),
     ("meetings", "Meetings"),
 )
 
@@ -165,7 +166,7 @@ def _rows_for_group(
     sub: str, infos: list[EntityInfo], paths: VaultPaths
 ) -> tuple[tuple[str, ...], list[str]]:
     """Return ``(header_lines, row_lines)`` for one dashboard table."""
-    if sub == "projects":
+    if sub in ("projects", "chats"):
         header = ("| Note | Status | Topics | Updated |", "| --- | --- | --- | --- |")
         rows = []
         for info in infos:

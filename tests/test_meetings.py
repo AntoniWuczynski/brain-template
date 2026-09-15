@@ -119,10 +119,10 @@ def test_bad_snapshot_returns_an_error_not_an_exception(tmp_path: Path) -> None:
 
 def test_attendee_slug_folds_accents_to_the_live_slug_shape() -> None:
     """The live vault's person notes are slugged accent-folded
-    (people/antoni-wuczynski, people/lluis-masanes); punching the accent out
+    (people/antoni-wuczynski, people/lluis-cardona); punching the accent out
     as a separator produces a slug that resolves to nothing."""
     assert meeting_ex.attendee_slug("Antoni Wuczyński") == "antoni-wuczynski"
-    assert meeting_ex.attendee_slug("Lluís Masanes") == "lluis-masanes"
+    assert meeting_ex.attendee_slug("Lluís Cardona") == "lluis-cardona"
     assert meeting_ex.attendee_slug("日本語") == ""
 
 
@@ -242,14 +242,14 @@ def test_the_note_body_has_no_section_the_meeting_template_lacks(
 
 
 def test_attendee_named_by_email_resolves_by_title(tmp_path: Path) -> None:
-    """The live vault's email-slugged nodes (people/alexasymmetricsecuritycom)
+    """The live vault's email-slugged nodes (people/alexexamplecom)
     do not match the address's slug, but their title is the address verbatim."""
     paths = _vault(tmp_path)
-    _person(paths, "alexasymmetricsecuritycom", "alex@asymmetricsecurity.com")
-    _snapshot(paths, attendees=["alex@asymmetricsecurity.com"])
+    _person(paths, "alexexamplecom", "alex@example.com")
+    _snapshot(paths, attendees=["alex@example.com"])
     report = promote_meetings(paths, now=_NOW)
     assert report.promotions[0].candidate.resolved_ids == (
-        "people/alexasymmetricsecuritycom",
+        "people/alexexamplecom",
     )
 
 

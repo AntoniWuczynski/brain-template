@@ -135,6 +135,22 @@ def test_project_dashboard_columns(tmp_path: Path) -> None:
     ) in projects
 
 
+def test_chats_dashboard_uses_project_columns(tmp_path: Path) -> None:
+    paths = _seed(tmp_path)
+    _write(
+        tmp_path,
+        "knowledge/chats/worksearch/worksearch.md",
+        "---\ntitle: WorkSearch\ntype: project\nstatus: active\n"
+        "topics: [job-search]\nupdated: \"2026-08-31\"\n---\n\n# WorkSearch\n",
+    )
+    stats = rebuild_dashboards(paths, logger=_LOG)
+
+    assert stats.written == 5
+    chats = _dashboard(paths, "chats.md")
+    assert "| Note | Status | Topics | Updated |" in chats
+    assert "| [[knowledge/chats/worksearch/worksearch]] | active | job-search | 2026-08-31 |" in chats
+
+
 def test_meetings_sorted_most_recent_first(tmp_path: Path) -> None:
     paths = _seed(tmp_path)
     rebuild_dashboards(paths, logger=_LOG)

@@ -169,6 +169,26 @@ _REDACTIONS: list[tuple[str, re.Pattern[str]]] = [
 # ``redact_secrets`` (e.g. "here is a secret: [REDACTED:bearer-token]" must
 # not be re-redacted as ``env-secret``, clobbering the more specific label)
 # — this is why the vendor-prefixed patterns above run FIRST.
+#
+# LEFT AS-IS, deliberately (review AUD-118/m6): ``NOT_A_SECRET=plainvalue``
+# and the loose ``xox[baprs]-`` slack-token pattern both over-redact —
+# `NOT_A_SECRET` contains the literal substring `SECRET`, and a real Slack
+# token's ``-``-separated numeric segments aren't required by the pattern.
+# The obvious tightener (require the value to contain a digit) was tried
+# against both pinned tables and rejected: it breaks the exact rows that
+# pin the two hard cases this module exists to catch —
+# ``test_redact_env_style_bare_keyword_assignment``'s bare keyword forms
+# (e.g. ``SECRET=supersecretvalue`` — no digit in the value) and
+# ``test_redact_secrets_known_patterns``'s pinned Slack row
+# (``"xoxb-" + "a" * 15`` — no digit either). Any digit-based or
+# length/shape-based discriminator narrow enough to reject
+# ``NOT_A_SECRET=``/the documentation-shaped Slack string is exactly narrow
+# enough to also reject a real bare secret with no digits in it, which is
+# the one outcome this module treats as unacceptable (see the module
+# docstring: "over-redacting ... is an accepted false positive, silently
+# keeping a real secret is not"). No discriminator was found that keeps
+# every row of both tables passing, so this stays over-redacting rather
+# than risk leaking.
 _ENV_ASSIGN_RE = re.compile(
     r"(?im)(?P<lead>^|[\s\"'\[{(,?&-])"
     r"(?P<prefix>[A-Za-z0-9_.-]*"

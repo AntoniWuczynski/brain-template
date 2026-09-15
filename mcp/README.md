@@ -13,7 +13,9 @@ ingestion without per-agent custom integrations.
 
 1. **Single source of truth.** The vault filesystem (this repo) is
    authoritative; the MCP server is a thin adapter on top. Every write is
-   committed to git (and pushed asynchronously when configured).
+   committed to git — preceded by a pull and followed by an asynchronous
+   push when a remote is configured, so the server and the owner's Obsidian
+   clone can share one branch.
 2. **Multi-agent.** Multiple agents may connect concurrently, each with its
    own bearer token and identity; writes are serialised behind a global lock
    and a git lock.
@@ -40,7 +42,7 @@ implemented in [`mcp_server/tools_read.py`](../mcp_server/tools_read.py) (read),
 | `vault_metadata_query` | Query `metadata/index.jsonl`. | `by: "status"\|"extension"\|"extractor"\|"path_prefix"\|"all", value?: string, limit?: int=50` → `{records: [...]}` |
 | `vault_related` | Concepts most related to a concept, by co-occurrence + semantic similarity. | `concept: string, limit?: int=8` → `{concept, related: [...]}` |
 | `relations_query` | Structured, time-aware query over the typed relation graph. Filter by `rel` (closed vocab), `entity` (declaring node), `target` (reverse lookup — who points here). `as_of` (YYYY-MM-DD) returns relations whose interval contains that date — the supersede history, queryable; without it, only open relations unless `include_closed`. | `rel?: string, entity?: string, target?: string, as_of?: string, include_closed?: bool=false, limit?: int=50` → `{relations: [{entity, rel, target, valid_from, valid_until, source}]}` |
-| `memory_search` | Same index as `vault_search`, re-ranked for **memory**: `score = cosine × recency × status_weight`. Recency is half-life decay on each note's `updated` date; `memory_status: superseded` notes sink (×0.2). `types` filters to knowledge subdirs (`people`, `organisations`, `projects`, `meetings`, `notes`, `research`, `university`, `assistant`) and/or `archive`; an unknown token is refused, not ignored. Use this for "what do I currently know about X"; `vault_search` for timeless archival lookups. | `query: string, top_k?: int=10, recency_halflife_days?: float=30, types?: [string]` → `{hits: [{score, cosine, recency, status_weight, source_relative_path, title, chunk_idx, snippet, updated}]}` |
+| `memory_search` | Same index as `vault_search`, re-ranked for **memory**: `score = cosine × recency × status_weight`. Recency is half-life decay on each note's `updated` date; `memory_status: superseded` notes sink (×0.2). `types` filters to knowledge subdirs (`people`, `organisations`, `projects`, `chats`, `meetings`, `notes`, `personal`, `research`, `university`, `assistant`) and/or `archive`; an unknown token is refused, not ignored. Use this for "what do I currently know about X"; `vault_search` for timeless archival lookups. | `query: string, top_k?: int=10, recency_halflife_days?: float=30, types?: [string]` → `{hits: [{score, cosine, recency, status_weight, source_relative_path, title, chunk_idx, snippet, updated}]}` |
 
 ### Write
 
@@ -88,7 +90,8 @@ that is `vault_create_note`'s job, so "who made this note" stays unambiguous.
 
 **Write allowlist** (`mcp_server/config.py`): `create`/`replace`/`append`
 notes may only touch
-`knowledge/{notes,projects,research,people,organisations,university,meetings,assistant}`.
+`knowledge/{notes,projects,chats,personal,research,people,organisations,university,meetings,assistant}`
+(areas and slug rules: `AGENTS.md`, "Where a note lives").
 Concept notes use the dedicated `vault_update_concept_user_section` tool.
 `knowledge/assistant/PROFILE.md` lives inside the allowlist but the three
 general verbs **refuse** it — that is what makes `profile_update`'s byte
@@ -121,8 +124,35 @@ before anything reaches disk:
   The note is still written to disk — the tool returns `committed: false`
   with a warning, not an error, so the caller knows the change didn't land
   in git.
+- **A conflicting hand edit to this note.** The pull that precedes every
+  write (below) can hit a genuine conflict. The rebase is aborted, the
+  branch is left exactly where it was, and the tool raises naming the
+  conflicting path(s) — but only when one of them is what this write
+  targets. Nothing is merged automatically in either direction
+  (`FOUNDER_DECISIONS.md` IMP-029), and the refusal says so: a conflict is
+  settled by hand (resolve the note on the other clone, or `git rebase` in
+  the server's vault), never by retrying. A conflict on some *other* note
+  does **not** refuse the write — see "Every write pulls first" below.
+- **A dirty working tree.** Uncommitted changes to *tracked* files mean
+  someone else's work is in flight and a rebase would carry it, so the
+  write refuses, naming the dirty paths. Untracked files are ignored — a
+  real vault always has some. "Someone else" here means outside this
+  process: the server's own write tools and its background refresher all
+  hold one re-entrant write lock from their first byte on disk through
+  their commit, so neither can leave a dirty tree for the other to trip
+  over (that is exactly what it used to do — a write would refuse itself
+  over a half-written *derived* note no agent could commit or discard).
+- **A rebase left half-finished.** If git left `rebase-merge` /
+  `rebase-apply` behind (a killed rebase), HEAD is parked mid-replay with
+  a clean tree. The write refuses and names the remedy: finish the rebase
+  or `git rebase --abort` in the vault.
+- **HEAD moved mid-write.** The tool reads a note, transforms it, and
+  writes it back. If HEAD moved in between — another *process* sharing
+  this clone (a human, `ingest.py`, a maintenance script) committing or
+  pulling — the read is stale and writing over it would destroy what
+  arrived. Nothing is written; re-read the note and retry.
 
-## After a write: provenance, commits, push, reindex
+## Around a write: pull, provenance, commits, push, reindex
 
 - **Provenance is server-asserted.** Every Markdown note written under
   `knowledge/` gets frontmatter stamped by the server, never trusted from
@@ -134,10 +164,55 @@ before anything reaches disk:
 - **Commits are attributed**: `mcp(<agent>): <action>`, where `<agent>` is
   the name the presented token maps to. The background reindex commits
   derived notes as `mcp: refresh derived notes`.
+- **Every write pulls first, inside one critical section.** The vault has
+  two writers — this server and the owner's Obsidian clone, both pushing to
+  one remote — so immediately before an audited write the server fetches
+  `BRAIN_MCP_GIT_BRANCH` and fast-forwards onto it, or rebases its own
+  unpushed commits on top when it has any (`git_ops.pull_rebase`). The
+  pull, the tool body and its commit are **one** critical section
+  (`mcp_server/sync.py`'s `WRITE_LOCK`, re-entrant, shared with the
+  background refresher and with the push worker's rebase): a pull that ran
+  outside it inspected a tree another writer was midway through, and a
+  rebase that landed between a tool's read and its commit overwrote the
+  hand edit it had just absorbed.
+  Four outcomes, and only the first two refuse the write:
+  - a **dirty tree**, or a **conflict on a path this write targets** — see
+    "Refusals" above;
+  - an **unreachable remote** is not an error: the failure is logged and
+    the write commits locally (the laptop case), for the next successful
+    push to carry;
+  - a **conflict on another note** — the rebase replays *every* unpushed
+    local commit, so its conflicts are usually about notes this write never
+    mentions. The pull is skipped, the write commits locally, and the
+    standing conflict is reported as a `pull-conflict` audit row and in the
+    push worker's `sync_error`, naming the manual recovery. It does not
+    wedge every write tool until a human notices;
+  - a **blocked pull** — the remote was reached but its commits would not
+    apply (classically an untracked file where an incoming commit adds
+    one). A `pull-failed` audit row names the cause, `sync_error` carries
+    it, and the write commits locally. This clone stays behind until the
+    blocker is cleared by hand;
+  - a **dirty tree** — a tracked file has uncommitted changes, which means
+    a hand edit in flight outside this process (Obsidian, another session);
+    on the Mac before the migration that is the working clone's normal
+    state. A rebase cannot run over it, so the pull is skipped with a
+    `pull-skipped` audit row and `sync_error`, the write commits only its
+    own paths, the hand edit is left exactly as it was, and the next
+    clean-tree write absorbs the remote.
+
+  When commits were absorbed, the audit log gets a `rebased` row saying how
+  many and whether it was a rebase or a fast-forward.
 - **The push is asynchronous.** The commit lands before the tool returns;
   a single background worker pushes the branch and retries failures on a
   capped backoff (30s → 5min). `push_state: "queued"` means a push is owed,
-  not done — hence `pushed` is always false at return.
+  not done — hence `pushed` is always false at return. A push the remote
+  rejects as non-fast-forward (the other clone got there first) is not a
+  plain failure: the worker fetches, rebases the same way (under the same
+  write lock, and only when `BRAIN_MCP_GIT_BRANCH` is the branch actually
+  checked out — it rewrites history, so it must never touch whatever branch
+  a human happened to leave out), and retries **once**. A conflict there is
+  logged and left in the worker's status — never resolved — and those
+  commits stay local until a human settles it.
 - **The reindex is automatic.** A background refresher re-embeds written
   notes into the semantic index (debounced, batched), and — when a write
   changed `topics`/`relations` frontmatter — rebuilds the connection graph,

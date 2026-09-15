@@ -181,6 +181,27 @@ def test_types_filter_includes_and_excludes(
     assert len(everything) == 3
 
 
+def test_chats_and_personal_are_type_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _vault(tmp_path)
+    _note(paths, "knowledge/chats/worksearch/worksearch.md", updated=_iso(NOW))
+    _note(paths, "knowledge/personal/leases/flat-2026.md", updated=_iso(NOW))
+    _patch_search(monkeypatch, [
+        _hit("knowledge/chats/worksearch/worksearch.md"),
+        _hit("knowledge/personal/leases/flat-2026.md"),
+    ])
+
+    chats = memory_search(paths, "q", types=["chats"], now=NOW, logger=_LOG)
+    assert [h.source_relative_path for h in chats] == [
+        "knowledge/chats/worksearch/worksearch.md",
+    ]
+    personal = memory_search(paths, "q", types=["personal"], now=NOW, logger=_LOG)
+    assert [h.source_relative_path for h in personal] == [
+        "knowledge/personal/leases/flat-2026.md",
+    ]
+
+
 def test_types_filter_overfetches_so_sparse_type_survives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,275 +1,321 @@
 # Deploying the brain MCP server
 
-This is the recipe for putting `mcp_server/` on a Linux box behind a Cloudflare Tunnel so your devices (and, when you want, hosted agents like claude.ai) can reach it. About 30 minutes end to end if you've never used CF Tunnel before.
+This is the recipe for running `mcp_server/` on a Linux box you control, as **user** systemd units (no `sudo`, no dedicated system account), reachable over your own Tailscale network. About 30 minutes end to end.
+
+Three decisions this doc assumes:
+
+- **Ingestion stays on the Mac (or wherever your working clone lives) — always, not just at first.** MinerU, faster-whisper, the vision extractors and their multi-GB weights never run on the server. `pull.py`/`ingest.py` keep running there against the Obsidian working clone; the server only ever *serves* the vault (the 18 MCP tools) and runs the maintenance/dream passes over what's already there. That is the whole reason the install below needs no ML stack.
+- **One unit set, user-scoped.** All three scheduled units (`brain-mcp`, `brain-maintenance`, `brain-dream`) are `systemd --user` units under `~/services/brain` — a plain user account, no `sudo`, no `/srv`, no `/etc/brain-mcp`, no dedicated system user.
+- **No extraction stack on the server, but embeddings YES.** MinerU, whisper and the vision extractors stay on the Mac with ingestion. The embedding model does run here, because `memory_search` and the dense half of `vault_search` are the server's whole job. The lockfile's Linux `torch` is the CUDA build (several GB of `nvidia-*` libraries for a box with no GPU), so the default install below excludes those and adds a CPU-only torch; the fully locked alternative and the lexical-only fallback are spelled out beside it (AUD-125 tracks locking the CPU build).
 
 ## Prerequisites
 
-- A Linux server you control (any distro with systemd). The instructions below use Ubuntu/Debian apt syntax; adjust for your distro.
-- `git`, `python3.12`, and [`uv`](https://docs.astral.sh/uv/) installed.
-- A clone of your private brain repo at `/srv/brain` (you can pick a different path; just be consistent).
-- A Cloudflare account with a domain you control (any TLD; you don't need to pay anything beyond domain registration).
-- `cloudflared` installed (`curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb && sudo dpkg -i /tmp/cloudflared.deb`).
+- A Linux box you control, with a normal user account and `systemd --user` support (any modern distro; the commands below use Debian/Ubuntu `apt` syntax where one is needed — adjust for yours).
+- `git` and [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+- [Tailscale](https://tailscale.com/) installed and logged into the same account as your other devices, so the server has a stable tailnet hostname. (A public hostname for the claude.ai connector is a separate, optional step — see the very end of this doc.)
+- Write access to the private `brain` GitHub repo, to add a deploy key.
 
-## 1. Generate a bearer token
-
-The server requires a static bearer token on every request (inner ring of auth — Cloudflare Access is the outer ring). Generate one:
+## 1. Clone the repo and install Python 3.12 (no ML stack)
 
 ```bash
-openssl rand -hex 32
+git clone git@github.com:<you>/brain.git ~/services/brain
+cd ~/services/brain
 ```
 
-Keep the output safe. You'll paste it into the env file in the next step and into every MCP client config that connects.
-
-## 2. Configure the service environment
-
-Create a non-root user and a config dir:
+`pyproject.toml` pins `requires-python = ">=3.12,<3.13"` (MinerU's PaddlePaddle has no 3.13/3.14 wheels yet) — irrelevant to *running* MinerU here since it never runs here, but the pin is enforced at resolve time regardless, and your box may well ship a newer system Python than that (3.14 is common on current distro images). Get a matching interpreter without touching the system Python:
 
 ```bash
-sudo useradd --system --home /srv/brain --shell /usr/sbin/nologin brain
-sudo chown -R brain:brain /srv/brain
-sudo install -d -m 750 -o root -g brain /etc/brain-mcp
+uv python install 3.12
 ```
 
-Write the env file (`/etc/brain-mcp/env`):
-
-```ini
-# Path to your private brain checkout
-BRAIN_MCP_VAULT_ROOT=/srv/brain
-
-# Bearer token from step 1. This single token maps to the agent name
-# "default" in commits and audit logs.
-BRAIN_MCP_BEARER_TOKEN=PASTE-YOUR-TOKEN-HERE
-
-# Optional: named per-agent tokens instead of (or alongside) the single
-# token above. Each agent commits as `mcp(<name>): ...` and is attributed
-# in logs/mcp-{audit,access}.jsonl. Names: lowercase slug, max 32 chars;
-# tokens: min 24 chars, no '=' or ','. A duplicate token or a second
-# "default" is refused at startup.
-#BRAIN_MCP_TOKENS=claude-code=PASTE-TOKEN-1,codex=PASTE-TOKEN-2
-
-# Optional: byte budget for knowledge/assistant/PROFILE.md writes via the
-# profile_update tool (default 4096).
-#BRAIN_PROFILE_MAX_BYTES=4096
-
-# Bind to localhost ONLY. The server trusts the CF-Connecting-IP header
-# for logging and assumes the only way in is the Cloudflare Tunnel. Do not
-# bind 0.0.0.0 without the tunnel + Access in front, or that trust (and the
-# single-bearer model) is exposed to the whole network.
-BRAIN_MCP_BIND_HOST=127.0.0.1
-BRAIN_MCP_BIND_PORT=8765
-
-# Push writes back to origin/main so your laptop sees them on `git pull`.
-# The commit is synchronous; the push runs on a background worker and
-# retries failures with capped backoff (30s -> 5min). A failed push never
-# fails the write — check the server log and logs/mcp-audit.jsonl.
-BRAIN_MCP_GIT_PUSH_ON_WRITE=1
-BRAIN_MCP_GIT_REMOTE=origin
-# Must equal the branch actually checked out at BRAIN_MCP_VAULT_ROOT — every
-# write's commit step compares the two and refuses (committed:false, note
-# still written to disk) on a mismatch, including detached HEAD.
-BRAIN_MCP_GIT_BRANCH=main
-
-# SSH key for git push. Kept OUTSIDE the vault (see step 3) so a
-# compromised agent can never read it through the read tools.
-GIT_SSH_COMMAND=ssh -i /etc/brain-mcp/ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/brain-mcp/ssh/known_hosts -o StrictHostKeyChecking=yes
-
-# warning | info | debug
-BRAIN_MCP_LOG_LEVEL=info
-
-# Public hostname(s) the tunnel presents (comma-separated). Required, or
-# the DNS-rebinding guard rejects tunnel traffic whose Host header is not
-# localhost. Use the same hostname as the Cloudflare ingress below.
-BRAIN_MCP_ALLOWED_HOSTS=mcp.yourdomain.example
-```
-
-Lock it down so only the service user can read it:
+Install the locked environment **without** the CUDA stack, then add a CPU-only torch and
+the embedding package — this is the default, because the server serves search:
 
 ```bash
-sudo chmod 640 /etc/brain-mcp/env
-sudo chown root:brain /etc/brain-mcp/env
+# Run this in bash. $EXCLUDES relies on word-splitting an unquoted
+# variable into multiple arguments — zsh (macOS's default shell) doesn't
+# do that by default, and passes the whole string as one argument instead.
+EXCLUDES=$(grep -v '^\s*#' .github/workflows/ci.yml | grep -oE -- '--no-install-package [^ \\]+' | tr '\n' ' ')
+uv sync --locked $EXCLUDES
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install sentence-transformers
 ```
 
-## 3. Set up git push from the server
+The exclusion list is extracted from the CI workflow rather than hand-copied, so it cannot
+drift from what CI tests. It removes `torch`, `sentence-transformers` and every CUDA/`triton`
+package the lockfile carries (`nvidia-*`, `cuda-*`, reachable only through the CUDA torch
+build). The two `uv pip install` lines put back a CPU torch and the embedder. Those two are
+**not** locked or hashed — the one gap in an otherwise locked install, and the reason AUD-125
+exists (pin a CPU torch for Linux in `uv.lock` so this collapses to one locked command).
 
-The MCP server commits write tool results and pushes them to `origin`. It needs an SSH deploy key kept **outside the vault** — if it lived under `/srv/brain` a compromised agent could read it through the read tools and take over the repo. Put it under `/etc/brain-mcp`, which the service mounts read-only:
+Two alternatives, both honest:
+
+- **Fully locked, heavy.** Plain `uv sync --locked` installs the lockfile as is: the CUDA torch
+  and its NVIDIA libraries, several GB, unused on a GPU-less box, but every byte hashed. Works.
+- **Lexical-only, minimal.** The `uv sync --locked $EXCLUDES` line alone. `vault_search` and
+  `memory_search` still answer, but with no embedder the dense half of hybrid search cannot
+  load, so every search silently degrades to BM25 (`semantic.py:search()` does this by design,
+  and the boot log line from AUD-124 says so once at start). Choose this only for a box that
+  will never serve search.
+
+Smoke-test the import before wiring any unit:
 
 ```bash
-sudo install -d -m 750 -o root -g brain /etc/brain-mcp/ssh
-sudo ssh-keygen -t ed25519 -f /etc/brain-mcp/ssh/id_ed25519 -N "" -C "brain-mcp deploy key"
-sudo chgrp brain /etc/brain-mcp/ssh/id_ed25519 && sudo chmod 640 /etc/brain-mcp/ssh/id_ed25519
-# Pin GitHub's host key (avoids trust-on-first-use). Verify the fingerprint
-# against https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
-sudo sh -c 'ssh-keyscan github.com > /etc/brain-mcp/ssh/known_hosts'
-sudo chgrp brain /etc/brain-mcp/ssh/known_hosts && sudo chmod 644 /etc/brain-mcp/ssh/known_hosts
-sudo cat /etc/brain-mcp/ssh/id_ed25519.pub
+uv run --no-sync python -c "import mcp_server.app; print('ok')"
 ```
 
-In your GitHub private brain repo: **Settings → Deploy keys → Add deploy key**. Paste the public key, **check "Allow write access"**, save.
+(`python -m mcp_server` itself won't help here — it reads `BRAIN_MCP_VAULT_ROOT` and the rest
+of `.env` before importing `app.py`, so it fails on missing config before it would ever hit a
+missing package.)
 
-The `GIT_SSH_COMMAND` line you added to `/etc/brain-mcp/env` in step 2 points git at this key. Test as the service user with the same command:
+First `vault_search` after that downloads the ~90 MB embedding model into `HF_HOME` — pointed at the service dir by the unit file (step 4), not the default `~/.cache`, so a `ProtectHome`-sandboxed run and a stray `$HOME` can't send it somewhere the service can't read back.
+
+## 2. Generate a deploy key — outside the vault
+
+The server commits and pushes on every write, so it needs its own SSH key. Keep it **outside** `~/services/brain`: `mcp_server/config.py`'s read tools already deny any file literally named `id_rsa`/`id_ed25519` or `.env`/`.env.local` by name, and separately allow only `knowledge/`, `archive/`, `inbox/`, `metadata/` and a few named root docs by path — but defence in depth costs nothing here, and a key that never lives under the vault root can't be reached by a future bug in either check.
 
 ```bash
-sudo -u brain env GIT_SSH_COMMAND="ssh -i /etc/brain-mcp/ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/brain-mcp/ssh/known_hosts -o StrictHostKeyChecking=yes" \
-  git -C /srv/brain push origin main
+mkdir -p ~/.ssh
+ssh-keygen -t ed25519 -f ~/.ssh/brain-mcp-deploy -N "" -C "brain-mcp deploy key ($(hostname))"
+ssh-keyscan github.com >> ~/.ssh/known_hosts   # pin GitHub's host key; verify the fingerprint against
+                                                # https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+cat ~/.ssh/brain-mcp-deploy.pub
 ```
 
-Should succeed without prompting. The key never lives under `/srv/brain`, so it sits outside both the read allowlist and the agent-writable area.
+In the private `brain` repo: **Settings → Deploy keys → Add deploy key**. Paste the public key, **check "Allow write access"**, save.
 
-## 4. Build the venv and install the systemd unit
-
-Build the virtualenv as the `brain` user (the unit runs `/srv/brain/.venv/bin/python` directly):
+Test it as yourself (the unit will run as you too — no `sudo -u` needed):
 
 ```bash
-sudo -u brain bash -lc 'cd /srv/brain && uv sync'
+GIT_SSH_COMMAND="ssh -i ~/.ssh/brain-mcp-deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes" \
+  git -C ~/services/brain push origin main
 ```
 
-This creates `/srv/brain/.venv` with the server's dependencies (FastAPI, the MCP SDK, uvicorn, sentence-transformers). The first `vault_search` downloads the ~100 MB embedding model into `/srv/brain/.cache/huggingface` (pinned by the unit's `HF_HOME`), so make sure `/srv/brain` has room and is writable by `brain`.
+Should succeed (or say "everything up-to-date") without prompting.
 
-Then install the unit:
+## 3. Write the service's `.env`
+
+`.env.example` at the repo root carries the template for this, below its `MCP server (mcp_server/)` divider — copy just that file to the service directory, not the repo's own `.env` (they're for two different processes: yours locally loads the connector-config half via python-dotenv; the server reads its own `.env` straight from the environment through `EnvironmentFile=`):
 
 ```bash
-sudo cp /srv/brain/mcp_server/systemd/brain-mcp.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now brain-mcp
-sudo systemctl status brain-mcp
+cp .env.example ~/services/brain/.env
+chmod 600 ~/services/brain/.env
 ```
 
-If the status shows `active (running)` you're past the local part. Verify the health endpoint:
+Fill in every key under the `MCP server` divider:
+
+| Key | Value here |
+|---|---|
+| `BRAIN_MCP_VAULT_ROOT` | `/home/<you>/services/brain` (absolute — `~` does not expand in a systemd `EnvironmentFile`) |
+| `BRAIN_MCP_TOKENS` | `claude-code=<token>,codex=<token>,claude-ai=<token>` — one fresh `openssl rand -hex 32` per client, never reused from the Mac's old tokens (see step 7) |
+| `BRAIN_MCP_BIND_HOST` / `_PORT` | `127.0.0.1` / `8765` — loopback only; Tailscale/a tunnel is what makes it reachable, not a public bind |
+| `BRAIN_MCP_ALLOWED_HOSTS` | your tailnet MagicDNS hostname, e.g. `myhost.tailXXXX.ts.net` (no port — see step 5 on why) — **required**: `TrustedHostMiddleware` rejects any request whose `Host` header isn't loopback or in this list, so a request that reaches the box over the tailnet is rejected at the guard, not your code, until this is set |
+| `BRAIN_MCP_GIT_PUSH_ON_WRITE` | `1` |
+| `BRAIN_MCP_GIT_REMOTE` / `_BRANCH` | `origin` / `main` — `_BRANCH` must equal the branch actually checked out here, or every write's commit step refuses (`committed: false`, note still written to disk) |
+| `GIT_SSH_COMMAND` | points at the step-2 key (the commented-out line in `.env.example` is ready to uncomment) |
+| `BRAIN_MCP_LOG_LEVEL` | `info` |
+| `HF_HOME` | set by the unit file unconditionally (step 4) — leave commented out here unless running without systemd |
+
+## 4. Install the units (AUD-123)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp mcp_server/systemd/brain-mcp.service \
+   mcp_server/systemd/brain-maintenance.service mcp_server/systemd/brain-maintenance.timer \
+   mcp_server/systemd/brain-dream.service mcp_server/systemd/brain-dream.timer \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+So the units keep running after you log out of the SSH session (user units otherwise stop when your last session ends):
+
+```bash
+loginctl enable-linger "$(whoami)"
+```
+
+Start everything:
+
+```bash
+systemctl --user enable --now brain-mcp.service brain-maintenance.timer brain-dream.timer
+systemctl --user status brain-mcp
+```
+
+`brain-dream.service` runs the `claude` CLI itself (subscription auth — see `scripts/dream.sh`), which needs your normal `~/.claude` config and credentials, so — unlike `brain-mcp.service` — neither it nor `brain-maintenance.service` is filesystem-sandboxed with `ProtectHome`/`ProtectSystem`; see the comments in those two unit files for why that line was drawn where it was. `brain-mcp.service` doesn't need that latitude (its I/O surface is just the vault, the git push, and — with the optional ML stack — a model load), so it keeps the tighter hardening.
+
+`active (running)` means you're past the local part:
 
 ```bash
 curl -s http://127.0.0.1:8765/health
 # {"status":"ok"}
+journalctl --user -u brain-mcp -n 20   # confirm the boot line: "brain MCP server starting (vault=..., ...)"
+                                        # and the extractor-availability line right after it (step 1's degrade, spelled out)
 ```
 
-## 5. Cloudflare Tunnel
-
-Log into Cloudflare on the server:
+## 5. Tailscale
 
 ```bash
-cloudflared tunnel login
+sudo tailscale up   # once per machine; prints a URL to authenticate in a browser
 ```
 
-Create a tunnel:
+`BRAIN_MCP_BIND_HOST=127.0.0.1` (step 3) means the server is reachable from this box alone by default — Tailscale being up does not, on its own, expose a loopback-bound port to the tailnet. Use [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) to proxy it, rather than rebinding to `0.0.0.0`, which would keep the security posture "reachable over the tailnet only" while widening it to "reachable from anywhere the box's network stack sees":
 
 ```bash
-cloudflared tunnel create brain-mcp
+tailscale serve --bg https / http://127.0.0.1:8765
 ```
 
-This prints a tunnel UUID and writes credentials to `~/.cloudflared/<UUID>.json`. Copy them where the system service can read them:
+This needs HTTPS certificates enabled once for the tailnet (Tailscale admin console → **DNS** → **HTTPS Certificates**) — `tailscale serve` then issues and renews the cert itself. The server becomes reachable at `https://<this box's MagicDNS name>/` (port 443, no `:8765` — `tailscale serve` is the thing listening on 443 and forwarding to your local port). Confirm the exact name:
 
 ```bash
-sudo mkdir -p /etc/cloudflared && sudo cp ~/.cloudflared/<UUID>.json /etc/cloudflared/
+tailscale status   # this box's MagicDNS name, e.g. myhost.tailXXXX.ts.net
 ```
 
-Then write the config (`/etc/cloudflared/config.yml`):
-
-```yaml
-tunnel: <UUID>
-credentials-file: /etc/cloudflared/<UUID>.json
-ingress:
-  - hostname: mcp.yourdomain.example
-    service: http://127.0.0.1:8765
-  - service: http_status:404
-```
-
-Route DNS:
+Confirm `BRAIN_MCP_ALLOWED_HOSTS` in `.env` already has that hostname (with no port — the client's `Host` header carries `myhost.tailXXXX.ts.net`, since `tailscale serve` terminates TLS at 443), then restart if you changed it after step 4:
 
 ```bash
-cloudflared tunnel route dns brain-mcp mcp.yourdomain.example
+systemctl --user restart brain-mcp
 ```
 
-Install + start the cloudflared service:
+## 6. Post-cutover probe (scripts/mcp_probe.py)
+
+Run this from the Mac (or anywhere with `uv`/Python and network access to the tailnet) after cutover, and again after any token rotation. It checks `/health`, runs one full MCP `initialize` → `tools/list` handshake, and confirms every given token authenticates — exiting non-zero if anything is wrong, so it's the one command to point at "is the server actually OK":
 
 ```bash
-sudo cloudflared service install
-sudo systemctl status cloudflared
+uv run --no-sync python scripts/mcp_probe.py \
+    --url https://myhost.tailXXXX.ts.net \
+    claude-code=<token> codex=<token> claude-ai=<token>
 ```
 
-Verify externally:
-
-```bash
-curl -s https://mcp.yourdomain.example/health
-# {"status":"ok"}
+```
+mcp-probe: [ok] health: 200
+mcp-probe: [ok] mcp_initialize: 200
+mcp-probe: [ok] tools_list: 18 tools
+mcp-probe: [ok] token:claude-code: 200
+mcp-probe: [ok] token:codex: 200
+mcp-probe: [ok] token:claude-ai: 200
+mcp-probe: server exposes 18 tool(s)
 ```
 
-## 6. Cloudflare Access (outer auth ring)
+A `[FAIL]` line names exactly which check broke rather than hiding it behind an overall failure — a single bad token doesn't hide a genuinely down server, and vice versa.
 
-In the Cloudflare dashboard: **Zero Trust → Access → Applications → Add an application → Self-hosted**.
+## 7. Point the Mac's clients at the server, and rotate tokens
 
-- Application domain: `mcp.yourdomain.example`
-- Session duration: as you prefer (24h is reasonable)
-- Path: `/mcp*`  (gate only the MCP endpoint; leave `/health` open so Cloudflare and systemd liveness probes are not challenged — it returns only `{"status":"ok"}`)
+**Rotate every token first.** Generate three fresh ones (`openssl rand -hex 32` each) and put them in the server's `.env` (step 3) — never copy the Mac's existing launchd-era tokens across; they've been sitting in plaintext in a running config for a while and this cutover is the natural moment to retire them.
 
-Create a policy:
+Claude Code (`~/.claude.json` on the Mac), the `brain` MCP server entry:
 
-- Name: "Owner"
-- Action: Allow
-- Rules → Include → "Emails ending in `@yourdomain.example`" *(or just your single email)*
-- Optionally: enable "Service Auth" if you want to let claude.ai or another hosted agent reach the tunnel via a service token.
-
-Save. Now browser visits prompt for SSO; agents need either a service token in their headers or a different Access policy.
-
-## 7. Connect a client
-
-Any MCP client speaking Streamable HTTP can reach it now. Example with the official Python client:
-
-```python
-import asyncio, os
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-
-async def main():
-    headers = {
-        "Authorization": f"Bearer {os.environ['BRAIN_MCP_BEARER_TOKEN']}",
-        # If CF Access is in front of the tunnel, also include a service token:
-        # "CF-Access-Client-Id":     "...",
-        # "CF-Access-Client-Secret": "...",
+```json
+{
+  "mcpServers": {
+    "brain": {
+      "url": "https://myhost.tailXXXX.ts.net/mcp",
+      "headers": { "Authorization": "Bearer <claude-code token>" }
     }
-    async with streamablehttp_client(
-        "https://mcp.yourdomain.example/mcp",
-        headers=headers,
-    ) as (r, w, _):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            print((await s.list_tools()).tools)
-
-asyncio.run(main())
+  }
+}
 ```
 
-For claude.ai or Claude Code: register the URL + bearer header as a remote MCP server in their config. They'll auto-discover the seventeen tools listed in `mcp/README.md`. Give each client its own token via `BRAIN_MCP_TOKENS` so its writes are attributed to it.
+Codex, the equivalent `http_headers` map in its own MCP server config:
 
-## 8. Updating the server later
+```toml
+[mcp_servers.brain]
+url = "https://myhost.tailXXXX.ts.net/mcp"
+http_headers = { Authorization = "Bearer <codex token>" }
+```
 
-When you pull framework updates from `brain-template`:
+(Exact key names depend on your Codex config version — check its current MCP-server block; the shape is the same `url` + bearer header regardless.)
+
+Re-run the probe (step 6) with the new tokens before removing the old ones from anywhere, then re-run it once more from the Mac after editing the configs above, to confirm the clients themselves — not just curl — can reach the server.
+
+## 8. Retire the Mac's launchd jobs
+
+Only once the server has been serving for a few days without incident. The corrected Mac-side unit lives at `mcp_server/launchd/com.brain.mcp.plist` — the server side of this deploy does not touch it; this step is entirely on the Mac:
 
 ```bash
-sudo -u brain git -C /srv/brain pull origin main
-sudo -u brain bash -lc 'cd /srv/brain && uv sync'
-sudo systemctl restart brain-mcp
+launchctl bootout gui/$(id -u)/com.brain.mcp
+launchctl bootout gui/$(id -u)/com.brain.dream
+launchctl bootout gui/$(id -u)/com.brain.maintenance
 ```
 
-Same shape if you change `mcp_server/` code on your laptop and push: pull on the server, sync, restart.
+**`~/brain` on the Mac stays** as the Obsidian working clone — you edit notes there by hand, `git pull` picks up the server's commits, and anything you push is absorbed by the server's pull-before-write on its next tool call (AUD-122). Ingestion (`scripts/ingest.py`, `scripts/pull.py`) also keeps running from this same Mac clone — that's the whole point of IMP-028: the Mac is the only machine with the sources (Granola/justREC exports, `~/.claude/projects` transcripts, the MinerU weights), so it stays the only machine that ingests, indefinitely, not just until the server is stable.
+
+## 9. Updating the server later
+
+```bash
+cd ~/services/brain
+git pull origin main
+# Run this in bash. $EXCLUDES relies on word-splitting an unquoted
+# variable into multiple arguments — zsh (macOS's default shell) doesn't
+# do that by default, and passes the whole string as one argument instead.
+EXCLUDES=$(grep -v '^\s*#' .github/workflows/ci.yml | grep -oE -- '--no-install-package [^ \\]+' | tr '\n' ' ')
+uv sync --locked $EXCLUDES
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu   # a bare sync prunes the two unlocked packages
+uv pip install sentence-transformers
+systemctl --user restart brain-mcp
+```
+
+Re-copy any unit file that changed (`mcp_server/systemd/*`) to `~/.config/systemd/user/` and `daemon-reload` first if the update touched one.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `systemctl start brain-mcp` fails with "BRAIN_MCP_VAULT_ROOT must be set" | env file wasn't read; check the `EnvironmentFile=` path in the service unit |
-| `auth: rejected request from <ip>` in `journalctl -u brain-mcp` | client and server tokens differ; rotate one to match the other |
-| Writes commit but never reach GitHub | the async push worker is failing; check `journalctl -u brain-mcp` for `push worker:` lines (it retries with backoff — a fresh write retries immediately) and `logs/mcp-audit.jsonl` for the write outcomes |
-| `git push exited 128: Permission denied` in logs after a write | deploy key missing "Allow write access" on GitHub |
-| `Session terminated` on every client call | the lifespan didn't run; check that the FastAPI app was built via `mcp_server.app.build_app()` and the systemd unit didn't override `ExecStart` |
-| Health works but `/mcp` returns 404 | client URL is `/mcp` not `/mcp/mcp`; double-prefix bug |
+| `systemctl --user start brain-mcp` fails with "BRAIN_MCP_VAULT_ROOT must be set" | `.env` wasn't read; check the `EnvironmentFile=` path resolves — `%h` expands to your home directory, so it must be `~/services/brain/.env` exactly |
+| `auth: rejected request from <ip>` in `journalctl --user -u brain-mcp` | client and server tokens differ; rotate one to match the other, then re-run the probe |
+| A request over the tailnet gets no response / a rebind rejection | `BRAIN_MCP_ALLOWED_HOSTS` doesn't list the tailnet hostname the client actually connected with — `tailscale status` shows the exact one |
+| Writes commit but never reach GitHub | the async push worker is failing; check `journalctl --user -u brain-mcp` for `push worker:` lines and `logs/mcp-audit.jsonl` for the write outcomes |
+| `git push exited 128: Permission denied` in logs after a write | the step-2 deploy key is missing "Allow write access" on GitHub |
+| Boot log doesn't mention extractor availability | you're looking at an old build — the line was added under AUD-124; `git pull` and restart |
+| `mcp_probe.py` reports `mcp_initialize: status 0, request failed: ...` | the URL is unreachable from where you're running the probe — check Tailscale is up on both ends, and that you used the tailnet hostname, not `127.0.0.1` |
+| Health works but `/mcp` returns 404 | client URL is `/mcp`, not `/mcp/mcp` — a double-prefix bug in the client config |
 
 Logs:
 
 ```bash
-sudo journalctl -u brain-mcp -f          # server
-sudo journalctl -u cloudflared -f        # tunnel
+journalctl --user -u brain-mcp -f
+journalctl --user -u brain-maintenance -f
+journalctl --user -u brain-dream -f
 ```
+
+## Optional: a public hostname, for claude.ai only
+
+Skip this section entirely if only your own devices (over Tailscale) need to reach the server — that's the complete, done state as of step 8.
+
+claude.ai runs in Anthropic's cloud, not on a device of yours, so it cannot reach the tailnet; reaching it needs a public hostname on a domain you control, via [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create brain-mcp
+```
+
+This prints a tunnel UUID and writes credentials to `~/.cloudflared/<UUID>.json`. Write the config (`~/.cloudflared/config.yml`):
+
+```yaml
+tunnel: <UUID>
+credentials-file: /home/<you>/.cloudflared/<UUID>.json
+ingress:
+  - hostname: brain.yourdomain.example
+    service: http://127.0.0.1:8765
+  - service: http_status:404
+```
+
+```bash
+cloudflared tunnel route dns brain-mcp brain.yourdomain.example
+cloudflared service install   # needs sudo: installs a SYSTEM unit for cloudflared itself
+                              # (unlike brain-mcp, which stays a user unit)
+```
+
+Add the public hostname to `BRAIN_MCP_ALLOWED_HOSTS` in `.env` (alongside the tailnet one, not instead of it) and restart `brain-mcp`. Verify: `curl -s https://brain.yourdomain.example/health`.
+
+**Two independent auth layers, deliberately not Access service tokens:**
+
+1. A Cloudflare Access policy (**Zero Trust → Access → Applications**) restricting the hostname's `/mcp*` path to Anthropic's published egress range, `160.79.104.0/21` ([anthropic's IP list](https://platform.claude.com/docs/en/api/ip-addresses)) — leave `/health` outside the policy so it stays a plain liveness check.
+2. This server's own `claude-ai` bearer token (step 3's `BRAIN_MCP_TOKENS`), in the `Authorization` header claude.ai sends via its `static_headers` connector config.
+
+Access **service tokens** are the wrong tool here: claude.ai's `static_headers` support accepts the `authorization`/`x-api-key` header names without review but needs Anthropic's approval for any other header, so `CF-Access-Client-Id`/`CF-Access-Client-Secret` are out — and Cloudflare's single-header fallback (`read_service_tokens_from_header: Authorization`) would then consume the very header this server's own bearer token needs. The IP-range policy avoids the collision entirely and keeps both layers independent. (`static_headers` is in beta on claude.ai as of this writing — confirm it's available on your account before relying on this path.)
 
 ## What this deploy does NOT do
 
-- **No automated ingestion.** PDFs dropped via `vault_drop_inbox_file` land in `inbox/`; ingestion happens on your laptop (where MinerU + its 14 GB of model weights live) when you run `scripts/ingest.py --inbox`. The MCP server's job ends at the drop.
-- **No remote summarisation.** If you want LLM summaries on the server side (so a Linux box without an internet API key can still tag topics), wire `local` provider against an Ollama instance running on the box. See `_template/README.md` (this is `README.md` at the root of the public template) → "Requirements" for the provider list, "Switch LLM provider" for how to change it.
-- **No multi-user.** `BRAIN_MCP_TOKENS` gives each *agent* its own identity over the shared vault (attributed commits + audit lines), but every token has the same full read/write access — this is one person's vault, a single trust domain. If multiple humans need different identities or permissions, put per-person policies in Cloudflare Access; per-agent tokens are "machine credentials", not user accounts.
+- **No automated ingestion, ever — not just until the server is stable.** PDFs dropped via `vault_drop_inbox_file` land in `inbox/`; ingestion happens on the Mac, where MinerU's weights live, when you run `scripts/ingest.py --inbox`. Per IMP-028 this is a standing property of the design, not a temporary gap — see step 8.
+- **Embeddings are on by default; the CPU torch and embedder are the one unlocked part** of the install (see step 1). Lexical-only is a deliberate, documented downgrade, not the default.
+- **No remote summarisation.** If you want LLM summaries generated on this box (so ingestion — were it ever to run here — wouldn't need an internet API key), wire the `local` provider against an Ollama instance running on it. See the root `README.md` → "Requirements" for the provider list.
+- **No multi-user.** `BRAIN_MCP_TOKENS` gives each *agent* its own identity over the shared vault (attributed commits + audit lines), but every token has the same full read/write access — this is one person's vault, a single trust domain. If multiple humans need different identities or permissions, that's a Cloudflare Access / Tailscale ACL policy question, not something per-agent tokens solve.

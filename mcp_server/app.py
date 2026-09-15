@@ -29,6 +29,33 @@ from .auth import BearerAuthMiddleware
 from .config import ServerConfig, load_config
 from .runtime import Runtime, build_runtime
 
+# ingest_lib is already on sys.path by the time this line runs — importing
+# .tools_read above executes its sys.path shim as a side effect. Reused here
+# rather than duplicated so the two capability checks below (MinerU, vision)
+# can't drift from what the extractors themselves actually check.
+from ingest_lib import summarize as _summarize  # noqa: E402
+from ingest_lib.extractors.pdf import mineru_available as _mineru_available  # noqa: E402
+
+
+def unavailable_extractor_families() -> tuple[str, ...]:
+    """Extractor families this environment cannot run right now.
+
+    Per IMP-028, ingestion itself runs on the Mac, not here — the server
+    never calls these extractors on its own. This is diagnostic only, so a
+    server started without the ML stack (AUD-124) says so once at boot
+    instead of a future ingest attempt failing deep in a stack trace.
+    """
+    missing: list[str] = []
+    if not _mineru_available():
+        missing.append("MinerU (PDF extraction: 'mineru' not on PATH)")
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        missing.append("whisper (audio transcription: faster-whisper not installed)")
+    if _summarize._select_provider() is None:
+        missing.append("vision (image/handwriting transcription: no LLM provider configured)")
+    return tuple(missing)
+
 # Generic parameters for _offload (defined in _register_tools below): the
 # wrapped tool function's own argument shape and its Pydantic result model.
 _ToolParams = ParamSpec("_ToolParams")
@@ -47,6 +74,14 @@ def build_app() -> FastAPI:
         "brain MCP server starting (vault=%s, host=%s:%d, git_push=%s)",
         cfg.vault_root, cfg.bind_host, cfg.bind_port, cfg.git_push_on_write,
     )
+    missing_families = unavailable_extractor_families()
+    if missing_families:
+        log.warning(
+            "extractor families unavailable in this environment: %s",
+            "; ".join(missing_families),
+        )
+    else:
+        log.info("all extractor families available")
     # One runtime for the process: audit appender, async push worker,
     # background index refresher. Tools receive it alongside cfg.
     runtime = build_runtime(cfg)
@@ -197,19 +232,27 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
     @mcp.tool()
     async def vault_create_note(path: str, content: str) -> _tools.WriteResult:
         """Create a new Markdown note. ``path`` must live under one of
-        knowledge/{notes,projects,research,people,organisations,university,meetings,assistant}.
-        Refuses to overwrite an existing note — vault_append_to_note
-        extends one, vault_replace_note rewrites one in full.
-        knowledge/assistant/PROFILE.md is excluded — it is byte-budgeted,
-        write it through profile_update.
+        knowledge/{notes,projects,chats,personal,research,people,organisations,
+        university,meetings,assistant}. Refuses to overwrite an existing note
+        — vault_append_to_note extends one, vault_replace_note rewrites one
+        in full. knowledge/assistant/PROFILE.md is excluded — it is
+        byte-budgeted, write it through profile_update.
 
-        A project is not limited to its knowledge/projects/<slug>/<slug>.md
-        overview and log/<date>.md entries: when a durable decision, design,
-        artefact or sub-topic deserves its own home, create a focused curated
-        note flat beside the overview
-        (knowledge/projects/<slug>/<descriptive-kebab-name>.md). Put notes that
-        span several projects under knowledge/projects/shared/ and link each
-        project with a related_to relation. Give such notes topics: and
+        Choose the area by what the note is about, not by which client wrote
+        it (AGENTS.md, "Where a note lives"): knowledge/projects/<slug>/ for a
+        bounded piece of work, repo or not; knowledge/chats/<slug>/ for a
+        chat-based project with no repo (same folder shape as a project);
+        knowledge/personal/<area>/ for life admin such as leases, contracts,
+        health or finance (free-form, no graph nodes). Slugs are readable
+        kebab-case names — the git remote name when there is one, otherwise a
+        name derived from the title, never a directory or chat-project id.
+
+        A project (or chat) is not limited to its <slug>/<slug>.md overview
+        and log/<date>.md entries: when a durable decision, design, artefact
+        or sub-topic deserves its own home, create a focused curated note flat
+        beside the overview (<slug>/<descriptive-kebab-name>.md). Put notes
+        that span several projects under knowledge/projects/shared/ and link
+        each project with a related_to relation. Give such notes topics: and
         relations: frontmatter so they join the concept and relation graph. Do
         not write into a project's notes/ subdir — that is the human's area."""
         return await _offload(_tools.tool_create_note, cfg, runtime, path=path, content=content)
@@ -359,8 +402,8 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         notes sink). Use this for "what do I currently know about X";
         use vault_search for timeless archival lookups. ``types``
         optionally filters to knowledge subdirs (people, organisations,
-        projects, meetings, notes, research, university, assistant)
-        and/or 'archive' for ingested sources. Each hit carries an
+        projects, chats, meetings, notes, personal, research, university,
+        assistant) and/or 'archive' for ingested sources. Each hit carries an
         ``evidence`` hint (exists/probable/unknown, plus a node_id when
         known) saying whether its subject already has an entity note under
         knowledge/people|organisations|projects|meetings/ — check it before

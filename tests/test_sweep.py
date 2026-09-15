@@ -175,8 +175,14 @@ def _write(root: Path, rel: str, text: str) -> Path:
     return p
 
 
-def _record(rel: str, src_hash: str, **overrides: object) -> IndexRecord:
-    base: dict[str, object] = dict(
+def _record(
+    rel: str,
+    src_hash: str,
+    *,
+    processed_path: str | None = "",
+    index_note_path: str | None = "",
+) -> IndexRecord:
+    return IndexRecord(
         relative_path=rel,
         source_hash=src_hash,
         size_bytes=1,
@@ -184,11 +190,13 @@ def _record(rel: str, src_hash: str, **overrides: object) -> IndexRecord:
         extractor="text",
         status="processed",
         raw_path=f"archive/raw/{rel}",
-        processed_path=f"archive/processed/{Path(rel).stem}.md",
-        index_note_path=f"knowledge/index/{Path(rel).stem}.md",
+        processed_path=(
+            f"archive/processed/{Path(rel).stem}.md" if processed_path == "" else processed_path
+        ),
+        index_note_path=(
+            f"knowledge/index/{Path(rel).stem}.md" if index_note_path == "" else index_note_path
+        ),
     )
-    base.update(overrides)
-    return IndexRecord(**base)  # type: ignore[arg-type]
 
 
 def _meta_row(src: str, src_hash: str, origin: str) -> dict[str, object]:
@@ -853,6 +861,34 @@ def test_gitignored_absent_source_is_its_own_category(tmp_path: Path) -> None:
     assert "archive/raw/big deck.pdf" in local_only.detail
     assert "git-ignored" in local_only.detail
     assert by_category["archive-orphan-record"].path == "lost.txt"
+
+
+@_needs_git
+def test_gitignored_source_wikilink_is_its_own_category(tmp_path: Path) -> None:
+    """AUD-117: on a fresh clone an ELEC0031-style index note's own
+    ``Source: [[archive/raw/...]]`` link points at a file .gitignore keeps
+    local-only. That must read as absent-by-design, the same as
+    ``archive-source-local-only`` does for the archive check, not as a
+    dangling wikilink."""
+    paths = _git_vault(tmp_path, "/archive/raw/big deck.pdf\n")
+    append_record(
+        paths.metadata_index_jsonl,
+        _record("big deck.pdf", "a" * 64, processed_path=None, index_note_path=None),
+    )
+    _write(
+        paths.root, "knowledge/index/big-deck.md",
+        "---\ntitle: Big Deck\ntype: source_note\n---\n\n"
+        "- Source: [[archive/raw/big deck]]\n",
+    )
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    by_category = {f.category: f for f in report.findings if "wikilink" in f.category}
+    assert "dangling-wikilink" not in by_category
+    local_only = by_category["wikilink-source-local-only"]
+    assert local_only.path == "knowledge/index/big-deck.md"
+    assert "archive/raw/big deck" in local_only.detail
+    assert "git-ignored" in local_only.detail
 
 
 @_needs_git

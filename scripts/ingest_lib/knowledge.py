@@ -40,10 +40,12 @@ from .notes import _split_frontmatter
 # and feed concept notes back into the concept graph.
 KNOWLEDGE_NOTE_DIRS: tuple[str, ...] = (
     "assistant",
+    "chats",
     "meetings",
     "notes",
     "organisations",
     "people",
+    "personal",
     "projects",
     "research",
     "university",

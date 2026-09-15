@@ -19,7 +19,16 @@ Semantics:
 - On failure the worker retries on a capped backoff schedule until the
   push succeeds or a fresh request resets the backoff (a new commit is
   a good reason to try again immediately).
-- Pushing does NOT take ``git_ops._GIT_LOCK``: push only reads refs,
+- A push the remote rejects as non-fast-forward (the other clone got
+  there first) is not a plain failure: the worker fetches, rebases the
+  branch the same way pull-before-write does, and retries ONCE. A
+  conflict is never resolved — it is logged and left in ``status()``.
+  That rebase runs under ``sync.WRITE_LOCK`` (it moves HEAD, so it must
+  not land between a write tool's read of a note and its commit) and is
+  guarded by ``expected_branch`` (it rewrites history, so it must never
+  touch a branch that is merely what happens to be checked out).
+- Pushing does NOT take ``git_ops._GIT_LOCK`` or ``sync.WRITE_LOCK``:
+  push only reads refs,
   never the index or working tree, so racing a concurrent commit can't
   corrupt anything — worst case the push misses that commit and the
   next push catches up.
@@ -39,7 +48,8 @@ from pathlib import Path
 from typing import TypedDict
 
 from .audit import AuditLog
-from .git_ops import GitError, _git
+from .git_ops import GitError, RebaseConflictError, _git, pull_rebase
+from .sync import WRITE_LOCK
 
 log = logging.getLogger(__name__)
 
@@ -55,12 +65,31 @@ _PUSH_TIMEOUT_S = 15.0
 _ALARM_AFTER_FAILURES = 3
 
 
+def _is_non_fast_forward(exc: BaseException) -> bool:
+    """Whether a failed push was rejected for being behind the remote.
+
+    git has no exit code for it, so this reads the message ``_git`` carried
+    out of stderr. Both wordings appear depending on git version and remote
+    type; matching too broadly only costs one extra fetch, matching too
+    narrowly costs a vault that never pushes again.
+    """
+    text = str(exc).lower()
+    return "non-fast-forward" in text or "fetch first" in text
+
+
 class PushStatus(TypedDict):
     """Shape of :meth:`PushWorker.status` snapshots."""
 
     state: str
     consecutive_failures: int
     last_error: str | None
+    # A condition that stops this clone converging with the remote and that
+    # no retry will clear — a standing rebase conflict, a blocked pull. Set
+    # by whoever hits it (the write path's pull, this worker's rebase),
+    # cleared by the next successful pull or push. None when the clone is
+    # converging normally, which is NOT the same as ``last_error is None``:
+    # a push can be failing for a network reason and still be recoverable.
+    sync_error: str | None
 
 
 class PushWorker:
@@ -92,6 +121,7 @@ class PushWorker:
         self._state: str = "idle"          # "idle" | "pending" | "retrying"
         self._consecutive_failures: int = 0
         self._last_error: str | None = None
+        self._sync_error: str | None = None
         # True once this run of failures has been alarmed, so a long outage
         # writes one audit row rather than one per retry.
         self._alarmed = False
@@ -117,6 +147,18 @@ class PushWorker:
     def branch(self) -> str:
         """The branch commits are expected on and pushes target."""
         return self._branch
+
+    @property
+    def remote(self) -> str:
+        """The remote pushes target and pull-before-write fetches from."""
+        return self._remote
+
+    @property
+    def push_enabled(self) -> bool:
+        """Whether this vault syncs with a remote at all. False means a
+        local-only vault: nothing pushes, so nothing has to be pulled
+        before a write either."""
+        return self._enabled
 
     def request_push(self) -> str:
         """Ask for a push soon. Returns the resulting push_state:
@@ -145,7 +187,20 @@ class PushWorker:
                 "state": self._state,
                 "consecutive_failures": self._consecutive_failures,
                 "last_error": self._last_error,
+                "sync_error": self._sync_error,
             }
+
+    def note_sync_problem(self, detail: str | None) -> None:
+        """Record (``detail``) or clear (``None``) the standing reason this
+        clone cannot converge with its remote.
+
+        Called from the write path's pull (``sync.pull_before_write``) and
+        from this worker's own rebase. Kept separate from the push failure
+        counters on purpose: a failing push is usually the network and
+        heals itself, whereas this is a human's to settle and would
+        otherwise be visible only to whoever tails the server log."""
+        with self._lock:
+            self._sync_error = detail
 
     def stop(self, flush_seconds: float = 5.0) -> None:
         """Shut down: stop the worker, then make one final best-effort
@@ -219,6 +274,9 @@ class PushWorker:
             self._alarmed = False
             self._consecutive_failures = 0
             self._last_error = None
+            # The branch reached the remote, so nothing is standing between
+            # the two clones any more.
+            self._sync_error = None
         if recovered:
             log.info("push worker: push to %s/%s recovered", self._remote, self._branch)
             self._audit.tool_event(
@@ -226,9 +284,84 @@ class PushWorker:
                 detail="git push succeeded after a run of failures",
             )
 
+    def _push(self) -> None:
+        """The push itself. Deliberately NOT under git_ops._GIT_LOCK — see
+        the module docstring."""
+        _git(self._vault_root, "push", self._remote, self._branch,
+             timeout=_PUSH_TIMEOUT_S)
+
+    def _rebase_and_retry_once(self) -> str | None:
+        """Handle a push the remote rejected as non-fast-forward: absorb its
+        commits and push once more (AUD-122). Returns None when the retry
+        succeeded, else a sanitized error for ``status()``.
+
+        Exactly one retry — a second rejection means another writer is
+        pushing faster than this worker, and the normal backoff loop is the
+        right place for that. A conflict is never resolved (IMP-029): the
+        rebase is aborted, the branch is left where it was, and the conflict
+        surfaces through PushStatus for a human to settle.
+
+        The REBASE runs under ``sync.WRITE_LOCK`` — it moves HEAD and the
+        working tree, and a write tool between its read of a note and its
+        commit cannot survive that. The push either side of it does not:
+        it only reads refs, and a 15 s network round trip is not something
+        to hold every agent's writes behind.
+        """
+        log.info("push worker: push to %s/%s was rejected as non-fast-forward; "
+                 "rebasing onto the remote", self._remote, self._branch)
+        try:
+            with WRITE_LOCK:
+                outcome = pull_rebase(
+                    self._vault_root, remote=self._remote, branch=self._branch,
+                    expected_branch=self._branch,
+                )
+        except RebaseConflictError as exc:
+            log.error("push worker: rebase after a rejected push conflicts on %s; "
+                      "the branch is unchanged and these commits are NOT pushed",
+                      ", ".join(exc.paths))
+            sanitized = "git push rejected; rebase conflicts on " + ", ".join(exc.paths)
+            self.note_sync_problem(
+                sanitized + " — resolve the note on the other clone and push, or "
+                "run 'git rebase' in the server's vault; no retry clears it"
+            )
+            return sanitized
+        except GitError as exc:
+            # Includes the branch guard: HEAD is not on the configured
+            # branch (a debugging checkout, a detached HEAD, an interrupted
+            # rebase), so nothing was touched — rewriting whatever branch
+            # happens to be out is exactly the damage the guard prevents.
+            log.warning("push worker: rebase after a rejected push refused: %s", exc)
+            self.note_sync_problem(f"git push rejected and the rebase was refused: {exc}"[:300])
+            return "git push rejected and the rebase was refused (details in server log)"
+        except Exception as exc:  # noqa: BLE001 — thread must survive any failure
+            log.warning("push worker: rebase after a rejected push failed: %s", exc)
+            return "git push rejected and the rebase failed (details in server log)"
+        if not outcome.fetched:
+            return "git push rejected and the fetch failed (details in server log)"
+        if outcome.blocked:
+            log.error("push worker: the remote's commits could not be absorbed: %s",
+                      outcome.blocked)
+            self.note_sync_problem(
+                "git push rejected and the remote's commits could not be absorbed: "
+                f"{outcome.blocked}"
+            )
+            return "git push rejected; absorbing the remote is blocked (details in server log)"
+        try:
+            self._push()
+        except Exception as exc:  # noqa: BLE001 — thread must survive any failure
+            log.warning("push worker: retry push after rebase failed: %s", exc)
+            return "git push failed after rebase (details in server log)"
+        log.info("push worker: absorbed %d commit(s) from %s/%s and pushed",
+                 outcome.absorbed, self._remote, self._branch)
+        return None
+
     def _try_push(self) -> bool:
         """One push attempt. Records a sanitized error on failure; the
         real stderr (remote URL / ssh hints) goes to the server log only.
+
+        A rejection for being behind the remote is retried once through
+        ``_rebase_and_retry_once``; every other failure goes straight to
+        the backoff loop.
 
         Catches BOTH GitError and any other exception (e.g. an OSError from
         subprocess spawn under EMFILE/ENOMEM). Letting a non-GitError escape
@@ -237,17 +370,21 @@ class PushWorker:
         status() kept reporting success. Failing soft keeps the retry loop
         (and the visible failure counter) alive."""
         try:
-            # Deliberately NOT under git_ops._GIT_LOCK — see module docstring.
-            _git(self._vault_root, "push", self._remote, self._branch,
-                 timeout=_PUSH_TIMEOUT_S)
+            self._push()
             return True
         except Exception as exc:  # noqa: BLE001 — thread must survive any failure
-            log.warning("push worker: push to %s/%s failed: %s",
-                        self._remote, self._branch, exc)
-            sanitized = (
-                "git push timed out" if "timed out" in str(exc)
-                else "git push failed (details in server log)"
-            )
+            if _is_non_fast_forward(exc):
+                sanitized_or_none = self._rebase_and_retry_once()
+                if sanitized_or_none is None:
+                    return True
+                sanitized = sanitized_or_none
+            else:
+                log.warning("push worker: push to %s/%s failed: %s",
+                            self._remote, self._branch, exc)
+                sanitized = (
+                    "git push timed out" if "timed out" in str(exc)
+                    else "git push failed (details in server log)"
+                )
             with self._lock:
                 self._consecutive_failures += 1
                 self._last_error = sanitized

@@ -24,13 +24,18 @@ either active, or an immutable ``.gz`` that stays until a human deletes it.
 Compression is the only lifecycle step, so "how far back do the logs go" has
 the same answer forever: all the way.
 
-Deliberately NOT rotated: the launchd/nohup stdout streams
-(``brain-mcp.launchd.log``, ``maintain.out.log``/``.err.log``,
-``dream.out.log``/``.err.log``). launchd holds those open for the life of
-the process, so renaming one leaves the running server appending to a
-now-unlinked inode — every later line silently lost until a restart. They
-need copy-truncate (or a restart) rather than the rename-and-gzip below;
-until that is built, they are the operator's business, not this script's.
+3. Bounds the undated launchd/nohup stdout streams (``brain-mcp.out.log``/
+   ``.err.log``, ``maintain.out.log``/``.err.log``, ``dream.out.log``/
+   ``.err.log`` and any future one shaped like them) once they cross the
+   same size threshold as job 1. These are held open for the life of the
+   process (launchd's ``StandardOutPath``/``StandardErrorPath``), so unlike
+   jobs 1 and 2 this NEVER renames or unlinks the active path — see
+   ``copytruncate_if_large`` for why a rename would strand the writer on a
+   now-unlinked inode, and why truncating the live one in place is safe.
+
+Any ``*.log`` matched by job 2's dated-run-log pattern is a per-run log, not
+a live stream, and is left to job 2 — job 3 only ever touches the undated
+remainder.
 
 Benign race, no locking needed: ``AuditLog._append`` opens, appends, and
 closes the target file per event (see ``mcp_server/audit.py``'s docstring:
@@ -224,6 +229,93 @@ def rotate_if_large(path: Path, max_bytes: int, *, dry_run: bool = False) -> Pat
     return gz_path
 
 
+def copytruncate_if_large(path: Path, max_bytes: int, *, dry_run: bool = False) -> Path | None:
+    """Bound an undated log a long-running process holds open, without
+    breaking the writer's file descriptor.
+
+    ``rotate_if_large`` renames the active path away, which is wrong here:
+    launchd's ``StandardOutPath``/``StandardErrorPath`` (``brain-mcp.out.log``
+    and friends) are opened once, for the life of the process, and a rename
+    leaves that fd pointed at a now-unlinked inode — every later line is
+    silently lost until the next restart.
+
+    This does the opposite: gzip the current bytes to a timestamped segment
+    (same fsync-before-anything-else discipline as ``_gzip_segment``), then
+    truncate ``path`` to zero length IN PLACE — same inode, so the writer's
+    open fd is untouched. This only works because launchd/systemd open such
+    streams ``O_APPEND`` (the standard way a supervisor captures a child's
+    stdout to a file that must survive across restarts): with `O_APPEND`,
+    the kernel seeks to the current end of file on every write, so a write
+    landing right after the truncate starts at offset 0 rather than at the
+    fd's old offset, and no zero-filled gap opens up.
+
+    This is the same trade-off ``logrotate``'s ``copytruncate`` option makes,
+    and it has the same one known race: a line the writer emits between the
+    gzip read and the truncate is captured by neither the segment nor the
+    now-empty active file, and is lost. Acceptable here for the reason the
+    JSONL rotation above accepts its own microscopic window: these are
+    best-effort operational logs, not vault writes.
+
+    No-op (returns ``None``) if ``path`` doesn't exist or is at/under
+    ``max_bytes``. ``dry_run=True`` performs no filesystem writes and
+    returns the ``.gz`` path a real run would produce.
+    """
+    if not path.exists():
+        return None
+    if path.stat().st_size <= max_bytes:
+        return None
+
+    ts = _now_stamp()
+    gz_path = path.with_name(f"{path.stem}-{ts}{path.suffix}.gz")
+
+    if dry_run:
+        return gz_path
+
+    if gz_path.exists():
+        # Same-second name collision — only reachable via duplicate or
+        # concurrent scheduling. Never overwrite an existing segment; skip,
+        # and a later run rotates under a fresh timestamp.
+        logging.getLogger("brain.rotate_logs").warning(
+            "segment %s already exists; skipping rotation of %s", gz_path.name, path.name
+        )
+        return None
+
+    tmp = gz_path.with_name(gz_path.name + ".tmp")
+    with path.open("rb") as src, gzip.open(tmp, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    tmp.replace(gz_path)
+    dir_fd = os.open(gz_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    # Truncate the live inode in place — the writer's own fd is unaffected.
+    with path.open("r+b") as fh:
+        fh.truncate(0)
+    return gz_path
+
+
+def rotate_launchd_logs_if_large(
+    logs_dir: Path, max_bytes: int, *, dry_run: bool = False
+) -> list[Path]:
+    """``copytruncate_if_large`` every oversized undated ``*.log`` stream.
+
+    "Undated" means NOT matched by ``_RUN_LOG_RE`` — a per-run log (job 2's
+    job) is left alone here even if it happens to be large; only a stream a
+    supervisor holds open indefinitely (no timestamp in its name) qualifies.
+    Returns the ``.gz`` paths produced, sorted by name."""
+    produced: list[Path] = []
+    for log_file in sorted(logs_dir.glob("*.log")):
+        if _RUN_LOG_RE.match(log_file.name):
+            continue
+        result = copytruncate_if_large(log_file, max_bytes, dry_run=dry_run)
+        if result is not None:
+            produced.append(result)
+    return produced
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     try:
@@ -300,6 +392,14 @@ def main(argv: list[str] | None = None) -> int:
             rotated_any = True
             verb = "would rotate" if args.dry_run else "rotated"
             print(f"rotate-logs: {name}: {verb} -> {result.relative_to(paths.root)}")
+        launchd_gz = rotate_launchd_logs_if_large(paths.logs, max_bytes, dry_run=args.dry_run)
+        if launchd_gz:
+            rotated_any = True
+            verb = "would copy-truncate" if args.dry_run else "copy-truncated"
+            for gz in launchd_gz:
+                print(f"rotate-logs: {verb} -> {gz.relative_to(paths.root)}")
+        else:
+            logger.info("launchd combined logs: none over threshold")
         if not rotated_any and not compressed:
             print("rotate-logs: nothing to rotate")
         return 0

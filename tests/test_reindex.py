@@ -298,6 +298,77 @@ def test_rebuild_derived_commits_with_the_configured_branch(
     assert seen["expected_branch"] == "main"
 
 
+def test_rebuild_derived_holds_the_write_lock_while_the_tree_is_dirty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2026-09-09 #1: the refresher never took the write tools' lock,
+    so a write whose pull-before-write landed during a rebuild saw the
+    half-written derived notes as "uncommitted changes" and refused itself,
+    naming a path no agent could commit or discard.
+
+    Asserted at the lock rather than through a tool call: what the fix has
+    to guarantee is that nobody else can be inside a write while the
+    rebuild's own writes are on disk and uncommitted.
+    """
+    from types import SimpleNamespace
+
+    from ingest_lib import concepts, connections, dashboards
+    from mcp_server.sync import WRITE_LOCK
+
+    paths = _git_vault(tmp_path)
+    derived = paths.root / "knowledge" / "concepts" / "x.md"
+    derived.parent.mkdir(parents=True, exist_ok=True)
+    derived.write_text("committed\n", encoding="utf-8")
+    _git(paths.root, "add", "-A")
+    _git(paths.root, "commit", "-q", "-m", "seed derived")
+
+    observed: dict[str, object] = {}
+    inside = threading.Event()
+    release = threading.Event()
+
+    def slow_dashboards(p: VaultPaths, *, logger: logging.Logger) -> SimpleNamespace:
+        # The window a real rebuild has: derived notes written, not yet
+        # committed. Another thread must not be able to start a write here.
+        derived.write_text("rebuilt\n", encoding="utf-8")
+        inside.set()
+        release.wait(timeout=5.0)
+        return SimpleNamespace(written_paths=())
+
+    monkeypatch.setattr(
+        connections, "rebuild_connections",
+        lambda p, *, logger: SimpleNamespace(related={}),
+    )
+    monkeypatch.setattr(
+        concepts, "rebuild_concepts",
+        lambda p, *, logger, related: SimpleNamespace(
+            written_paths=("knowledge/concepts/x.md",), removed_paths=()
+        ),
+    )
+    monkeypatch.setattr(dashboards, "rebuild_dashboards", slow_dashboards)
+
+    refresher = IndexRefresher(
+        paths.root, audit=AuditLog(paths.root), enabled=False, branch="main"
+    )
+    thread = threading.Thread(target=refresher._rebuild_derived, args=(paths,))
+    thread.start()
+    try:
+        assert inside.wait(timeout=5.0)
+        observed["dirty"] = _git(
+            paths.root, "status", "--porcelain", "--untracked-files=no"
+        )
+        observed["lock_free"] = WRITE_LOCK.acquire(blocking=False)
+        if observed["lock_free"]:
+            WRITE_LOCK.release()
+    finally:
+        release.set()
+        thread.join(timeout=10.0)
+
+    assert "knowledge/concepts/x.md" in str(observed["dirty"])
+    assert observed["lock_free"] is False, \
+        "a write could have started while the rebuild's notes were uncommitted"
+    assert "refresh derived notes" in _git(paths.root, "log", "--format=%s")
+
+
 def test_enqueue_after_stop_reports_skipped(tmp_path: Path) -> None:
     """AUD-041: once stop() has run nothing drains the dirty set, so a write
     landing during shutdown must not be told its reindex is "queued"."""

@@ -106,7 +106,10 @@ def test_disabled_returns_disabled_and_starts_no_thread(tmp_path: Path) -> None:
     worker = PushWorker(work, remote="origin", branch="main", enabled=False)
     assert worker.request_push() == "disabled"
     assert worker._thread is None  # lazy start never happened
-    assert worker.status() == {"state": "idle", "consecutive_failures": 0, "last_error": None}
+    assert worker.status() == {
+        "state": "idle", "consecutive_failures": 0,
+        "last_error": None, "sync_error": None,
+    }
 
 
 def test_failure_retries_then_recovers_after_remote_fixed(tmp_path: Path) -> None:
@@ -217,3 +220,143 @@ def test_final_flush_failure_at_shutdown_is_audited(tmp_path: Path) -> None:
     worker.stop(flush_seconds=0.5)
     assert "unpushed" in _push_outcomes(work), \
         "commits stranded by shutdown were not audited"
+
+
+# AUD-122: the vault has two writers now (this server and the owner's
+# Obsidian clone), so a push can be rejected for being behind. The worker
+# must absorb the other side and retry once — and never resolve a conflict.
+
+def _clone_of(tmp_path: Path, bare: Path, name: str) -> Path:
+    """A second working clone of the same bare repo — the Obsidian side."""
+    clone = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+    _git(clone, "config", "user.email", "hand@example.com")
+    _git(clone, "config", "user.name", "hand")
+    return clone
+
+
+def _subjects(repo: Path, *args: str) -> list[str]:
+    out = _git(repo, "log", "--format=%s", *args)
+    return out.splitlines() if out else []
+
+
+def test_push_rejected_as_non_fast_forward_rebases_and_retries(tmp_path: Path) -> None:
+    work, bare = _make_repos(tmp_path)
+    _git(work, "push", "-q", "origin", "main")
+    obsidian = _clone_of(tmp_path, bare, "obsidian")
+    _commit(obsidian, "hand.md")
+    _git(obsidian, "push", "-q", "origin", "main")
+    _commit(work, "agent.md")
+
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(0.05,),
+    )
+    try:
+        # The first push is rejected; the retry after the rebase is what
+        # puts the agent's commit on the remote, on top of the hand edit.
+        assert _wait_for(lambda: _subjects(bare, "main")[:2] == ["agent.md", "hand.md"]), \
+            "the rejected push never recovered by rebasing"
+        assert _subjects(work)[:2] == ["agent.md", "hand.md"]
+        assert _git(work, "status", "--porcelain") == ""
+        assert _wait_for(lambda: worker.status()["state"] == "idle")
+        assert worker.status()["consecutive_failures"] == 0
+    finally:
+        worker.stop(flush_seconds=1.0)
+
+
+def test_push_conflict_is_surfaced_and_never_resolved(tmp_path: Path) -> None:
+    work, bare = _make_repos(tmp_path)
+    _git(work, "push", "-q", "origin", "main")
+    obsidian = _clone_of(tmp_path, bare, "obsidian")
+    (obsidian / "seed.md").write_text("edited by hand\n", encoding="utf-8")
+    _git(obsidian, "add", "seed.md")
+    _git(obsidian, "commit", "-q", "-m", "hand edit")
+    _git(obsidian, "push", "-q", "origin", "main")
+    remote_head = _bare_head(bare)
+
+    (work / "seed.md").write_text("edited by the agent\n", encoding="utf-8")
+    _git(work, "add", "seed.md")
+    _git(work, "commit", "-q", "-m", "agent edit")
+    local_head = _git(work, "rev-parse", "HEAD")
+
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(5.0,),
+    )
+    try:
+        assert _wait_for(lambda: worker.status()["last_error"] is not None), \
+            "the conflicting push never surfaced an error"
+        error = worker.status()["last_error"]
+        assert error is not None and "seed.md" in error and "conflict" in error
+        # Neither side won: local branch, working tree and remote unchanged.
+        assert _git(work, "rev-parse", "HEAD") == local_head
+        assert _git(work, "status", "--porcelain") == ""
+        assert (work / "seed.md").read_text(encoding="utf-8") == "edited by the agent\n"
+        assert _bare_head(bare) == remote_head
+    finally:
+        worker.stop(flush_seconds=1.0)
+
+
+def test_push_conflict_also_names_the_manual_recovery_in_sync_error(
+    tmp_path: Path
+) -> None:
+    """Review 2026-09-09 #3: a conflict is not a retryable push failure.
+    ``last_error`` reads as one, so the condition a human has to settle
+    gets its own field, with the recovery named."""
+    work, bare = _make_repos(tmp_path)
+    _git(work, "push", "-q", "origin", "main")
+    obsidian = _clone_of(tmp_path, bare, "obsidian")
+    (obsidian / "seed.md").write_text("edited by hand\n", encoding="utf-8")
+    _git(obsidian, "add", "seed.md")
+    _git(obsidian, "commit", "-q", "-m", "hand edit")
+    _git(obsidian, "push", "-q", "origin", "main")
+    (work / "seed.md").write_text("edited by the agent\n", encoding="utf-8")
+    _git(work, "add", "seed.md")
+    _git(work, "commit", "-q", "-m", "agent edit")
+
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(5.0,),
+    )
+    try:
+        assert _wait_for(lambda: worker.status()["sync_error"] is not None), \
+            "the standing conflict was never surfaced in status()"
+        sync_error = worker.status()["sync_error"]
+        assert sync_error is not None
+        assert "seed.md" in sync_error and "git rebase" in sync_error
+    finally:
+        worker.stop(flush_seconds=1.0)
+
+
+def test_the_worker_never_rebases_a_branch_it_was_not_configured_for(
+    tmp_path: Path
+) -> None:
+    """Review 2026-09-09 #4: parked on another branch (a human debugging),
+    the worker rebased THAT branch onto the remote's main — rewriting
+    unrelated history, and leaving main, the branch it meant to fix,
+    untouched so the retry push failed anyway."""
+    work, bare = _make_repos(tmp_path)
+    _git(work, "push", "-q", "origin", "main")
+    obsidian = _clone_of(tmp_path, bare, "obsidian")
+    _commit(obsidian, "hand.md")
+    _git(obsidian, "push", "-q", "origin", "main")
+    _commit(work, "local.md")           # unpushed commit on main
+    main_head = _git(work, "rev-parse", "main")
+    _git(work, "checkout", "-q", "-b", "sidebar")
+    side_head = _commit(work, "side.md")
+
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(5.0,),
+    )
+    try:
+        assert _wait_for(lambda: worker.status()["sync_error"] is not None), \
+            "the refused rebase was never surfaced"
+        sync_error = worker.status()["sync_error"]
+        assert sync_error is not None and "sidebar" in sync_error
+        assert _git(work, "rev-parse", "sidebar") == side_head
+        assert _git(work, "rev-parse", "main") == main_head
+        assert _subjects(work) == ["side.md", "local.md", "seed"]
+    finally:
+        worker.stop(flush_seconds=1.0)

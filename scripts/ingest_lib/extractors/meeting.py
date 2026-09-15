@@ -45,8 +45,8 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 def attendee_slug(name: str) -> str:
     """``people/`` slug for an attendee display name.
 
-    Accents are folded to their base letter first (``Lluís Masanes`` ->
-    ``lluis-masanes``, ``Antoni Wuczyński`` -> ``antoni-wuczynski``) rather
+    Accents are folded to their base letter first (``Lluís Cardona`` ->
+    ``lluis-cardona``, ``Antoni Wuczyński`` -> ``antoni-wuczynski``) rather
     than being punched out as separators: the live vault's person notes are
     slugged the folded way, so the unfolded spelling (``llu-s-masanes``)
     links to — and resolves to — nothing. A name that folds to nothing at

@@ -39,7 +39,15 @@ never silently):
   ``cost-state`` — pure harness bookkeeping.
 - Lines with ``isSidechain: true``, and everything under a session's
   ``subagents/`` folder — delegated subagent work, not the primary
-  human/assistant dialogue.
+  human/assistant dialogue. ``dropped_sidechain_lines`` is permanently 0 on
+  this harness's real data (confirmed against every line of every session
+  under ``~/.claude/projects``, not just conversation lines: ``isSidechain``
+  is never set at all, on any event type) — subagent isolation is carried
+  entirely by the non-recursive ``subagents/`` glob above. The field and its
+  extractor label (``extractors/transcript.py``, out of this connector's
+  file ownership) are vestigial and worth deleting together in one change;
+  left alone here rather than split across an edit this module can make and
+  one it can't (review AUD-118/m1).
 - A bare slash-command invocation (``<command-message>``/``<command-name>``
   wrapper with nothing else) collapses to a one-line marker
   (``_(ran `/dream-pass`)_``) instead of being kept verbatim.
@@ -123,9 +131,25 @@ def _int_env(name: str, default: int) -> int:
 def _iter_candidate_files(base: Path) -> list[Path]:
     """Top-level ``*.jsonl`` files directly under each project directory.
     Deliberately non-recursive: a ``subagents/`` sub-folder's transcripts
-    are delegated work, not a session (see module docstring)."""
+    are delegated work, not a session (see module docstring).
+
+    ``base.iterdir()`` raises ``PermissionError`` (an ``OSError`` subclass)
+    if the projects directory itself is unreadable — reproduced with a
+    chmod-000 directory (review N3/n3) — which would otherwise kill the
+    whole pull the same way an unguarded ``f.stat()`` would (see the
+    ``try/except OSError`` around that call in ``pull()`` below). Treated
+    the same way: skip rather than crash, since a directory a human cannot
+    read is not this connector's job to fix, and the caller has no
+    finer-grained recovery available than "there was nothing to list".
+    A per-project directory's own unreadability is not reproducible the
+    same way: ``Path.glob`` swallows ``OSError`` internally and yields
+    nothing rather than raising, so no guard is needed there."""
+    try:
+        project_dirs = sorted(base.iterdir())
+    except OSError:
+        return []
     files: list[Path] = []
-    for project_dir in sorted(base.iterdir()):
+    for project_dir in project_dirs:
         if project_dir.is_dir():
             files.extend(sorted(project_dir.glob("*.jsonl")))
     return files
@@ -162,7 +186,13 @@ def _parse_session(path: Path, home: str) -> TranscriptPayload | None:
     turns: list[TranscriptTurn] = []
     stats = TranscriptStats()
     project_cwd = ""
-    first_date = ""
+    # Dated by the LAST line's timestamp, not the first (review N3/n2): the
+    # settle-window selection above already keys off mtime (last activity),
+    # and a resumed session opened days before it actually finished should
+    # file and sort as "recent" alongside same-day work, not under its stale
+    # start date — that also matches what a human means by "when did this
+    # session happen" for anything that ran across a calendar-day boundary.
+    last_date = ""
     ai_title = ""
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for raw_line in fh:
@@ -177,8 +207,8 @@ def _parse_session(path: Path, home: str) -> TranscriptPayload | None:
                 continue
 
             ts = obj.get("timestamp")
-            if not first_date and isinstance(ts, str) and len(ts) >= 10:
-                first_date = ts[:10]
+            if isinstance(ts, str) and len(ts) >= 10:
+                last_date = ts[:10]
             cwd = obj.get("cwd")
             if not project_cwd and isinstance(cwd, str):
                 project_cwd = cwd
@@ -272,7 +302,7 @@ def _parse_session(path: Path, home: str) -> TranscriptPayload | None:
         if first_real_user_text is not None:
             title_line = first_real_user_text.strip().splitlines()[0][:80]
         else:
-            title_line = first_date or "session"
+            title_line = last_date or "session"
     project_label = home_relative(project_cwd, home) if project_cwd else ""
     title = f"{project_label}: {title_line}" if project_label else title_line
 
@@ -285,7 +315,7 @@ def _parse_session(path: Path, home: str) -> TranscriptPayload | None:
         return None
 
     return build_transcript_payload(
-        connector="claude_code", native_id=path.stem, title=title, date=first_date,
+        connector="claude_code", native_id=path.stem, title=title, date=last_date,
         context=project_label, turns=turns, stats=stats,
     )
 
