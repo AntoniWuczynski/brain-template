@@ -207,14 +207,12 @@ A FastAPI and FastMCP server exposes the vault over the Model Context Protocol
 (MCP), so Claude, Codex and other agents can use it without knowing where it
 lives on disk. Seventeen typed tools:
 
-- **Read (7)** — search, read, chunk-context, list, metadata query, related
-  concepts, relation query.
-- **Write (5)** — create, replace and append notes, update a concept's user
-  section, drop an inbox file.
+- **Read (8)** — search, read, chunk-context, list, metadata query, related
+  concepts, relation query, recency-weighted memory search.
+- **Write (6)** — create, replace and append notes, update a concept's user
+  section, drop an inbox file, byte-budgeted profile update.
 - **Entity (3)** — upsert a typed relation, append a dated fact, create a
   meeting.
-- **Memory (2)** — recency-weighted memory search, byte-budgeted profile
-  update.
 
 Around those tools:
 
@@ -237,7 +235,9 @@ Around those tools:
   with Cloudflare Access as the intended outer ring for remote use.
 - **Runs anywhere** — a one-command local launcher that mints its own token, a
   hardened systemd unit behind a Cloudflare Tunnel, and a live-checked smoke
-  test that drives all seventeen tools.
+  test that drives fifteen of the seventeen tools (`vault_chunk_context` and
+  `relations_query` are covered by pytest instead, not yet by the live smoke
+  test).
 
 ### Health and maintenance
 
@@ -248,8 +248,10 @@ Around those tools:
   bit-rot. Read-only by default, always exits 0 so it is safe in cron.
 - **The consolidation pass** (`consolidate.py`) described above, with dry-run
   and tunable thresholds.
-- **One scheduler entry point** (`maintain.sh`) that runs both, ready for
-  launchd on macOS or a systemd timer on Linux.
+- **One scheduler entry point** (`maintain.sh`) that runs both, then
+  rotates the MCP telemetry logs once they outgrow a size threshold
+  (`rotate_logs.py` — gzipped segments, kept forever), ready for launchd
+  on macOS or a systemd timer on Linux.
 - **Dream pass** — a nightly LLM session (Claude Code or Codex on
   subscription auth, gated by a deterministic change-volume check so quiet
   days cost nothing) that writes connection notes, digests, memory merges
@@ -283,6 +285,10 @@ environment stanza.
   working in — from any repository — into `knowledge/projects/<slug>/`, keyed by
   git remote so one project maps to one folder. It writes only through MCP and
   grounds every claim in real repository facts.
+- **The `dream-pass` skill** is the LLM memory-consolidation session, gated by
+  a deterministic change-volume check so a quiet day costs nothing. Unlike the
+  other two skills it stays repo-local and scheduled (`scripts/dream.sh`), not
+  installed under `~/.claude` — see `scripts/README.md` → "Dream pass".
 - **A real Obsidian vault.** Committed `.obsidian` config makes the human
   interface reproducible — wikilinks, backlinks, the properties panel and a
   tuned graph view. The Copilot plugin gives in-vault AI chat.
@@ -295,8 +301,9 @@ environment stanza.
 
 - **A local MCP launcher** (`run-local.sh`) that binds localhost, mints a
   persistent token and prints the registration command.
-- **An end-to-end smoke test** that drives every tool and every security
-  boundary through the official MCP client.
+- **An end-to-end smoke test** that drives fifteen of the seventeen tools and
+  every security boundary through the official MCP client; the remaining two
+  (`vault_chunk_context`, `relations_query`) are covered by pytest.
 - **Lean continuous integration** — ruff, mypy and pytest on one runner, path-
   filtered so the constant vault-note commits never burn Actions minutes.
 - **A test suite** that doubles as the executable spec, from extractors and
@@ -422,16 +429,23 @@ Everything is via environment variables in `.env`:
 | `BRAIN_LOCAL_MODEL` | Model name on your local server (e.g. `llama3.1:8b`). |
 | `BRAIN_LOCAL_API_KEY` | Only if your local server enforces auth. |
 | `BRAIN_SKIP_SUMMARY=1` | Skip summarization even with a provider configured. |
-| `MINERU_DEVICE_MODE` | `cpu` / `mps` / `cuda` for MinerU inference. |
-| `BRAIN_EMBED_DEVICE` | Same for the semantic-search embedder. |
+| `MINERU_DEVICE_MODE` | `mps` / `cuda` / `cpu` for MinerU inference (defaults to `mps` on Apple Silicon, else `cuda`, else `cpu`). |
+| `BRAIN_EMBED_DEVICE` | Same options for the semantic-search embedder. |
 | `MINERU_MODEL_SOURCE` | `huggingface` (default) or `modelscope`. |
 | `BRAIN_MINERU_FORMULA` | `true` (default) / `false`. Disable MinerU's formula model (it hallucinates LaTeX on handwriting). |
 | `BRAIN_MINERU_LANG` | OCR language passed to MinerU (default `en`). |
 | `BRAIN_PDF_EXTRACTOR` | Set to `vlm` to route PDFs through the vision-LLM page transcriber (handwritten/scanned notes). |
 | `BRAIN_VLM_MODEL` | Vision model for the `vlm` extractor (default `claude-sonnet-4-6`). |
 | `BRAIN_VLM_SCALE` | Page render resolution for the `vlm` extractor (default 2.0). |
+| `BRAIN_WHISPER_MODEL` | Local Whisper model size for audio transcription (default `base`; needs `faster-whisper` installed). |
 | `BRAIN_AUTO_DESCRIBE=1` | Auto-run concept descriptions after ingest (costs LLM calls; off by default). |
 | `BRAIN_PROFILE_MAX_BYTES` | Byte budget for `knowledge/assistant/PROFILE.md` writes via `profile_update` (default 4096). |
+| `BRAIN_QUERY_INSTRUCTION=0` | Disable the query-side embedding prefix `bge-small-en-v1.5` expects (for A/B testing retrieval). |
+| `BRAIN_EMBED_HEADING_CONTEXT=1` | Prefix each embedded chunk with its title + heading path (needs a reindex to take effect). |
+| `BRAIN_LOG_ROTATE_MB` | Rotate an MCP telemetry log (`logs/mcp-{access,audit}.jsonl`) once it exceeds this many MiB (default 10). |
+| `GRANOLA_API_KEY` | Auth for the Granola meeting connector (`scripts/pull.py`). |
+| `BRAIN_JUSTREC_DIR` | Local justREC export folder for the justREC meeting connector; unset disables it. |
+| `BRAIN_DREAM_THRESHOLD` / `BRAIN_DREAM_STALE_DAYS` / `BRAIN_DREAM_PAIRS` / `BRAIN_DREAM_MAX_TURNS` / `BRAIN_DREAM_RUNNER` | Dream-pass gate tuning — see `scripts/README.md` → "Dream pass". |
 
 ## How agents use it
 

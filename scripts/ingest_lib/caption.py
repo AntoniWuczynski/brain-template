@@ -29,10 +29,10 @@ import json
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .atomic import append_jsonl_line
 from .config import VaultPaths
 from .notes import _atomic_write
 from .summarize import _select_model, _select_provider, is_enabled
@@ -252,43 +252,14 @@ def _load_captions(paths: VaultPaths) -> dict[str, str]:
 
 
 def _append_caption(paths: VaultPaths, image_hash: str, caption: str, model: str) -> None:
-    path = paths.metadata / "captions.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(
         {"hash": image_hash, "caption": caption, "model": model},
         ensure_ascii=False, sort_keys=True,
     ) + "\n"
-    if not path.exists():
-        fd, tmp = tempfile.mkstemp(prefix=".captions-", suffix=".jsonl", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
-    else:
-        # Self-heal a torn tail: if the last write didn't end in '\n', the new
-        # JSON line would concatenate onto it and corrupt two entries. Probe
-        # the last byte in BINARY — captions are written ensure_ascii=False, so
-        # a tail cut mid-UTF-8 would crash a text-mode read before any write.
-        with path.open("rb") as probe:
-            probe.seek(0, os.SEEK_END)
-            needs_nl = probe.tell() > 0
-            if needs_nl:
-                probe.seek(-1, os.SEEK_END)
-                needs_nl = probe.read(1) != b"\n"
-        with path.open("a", encoding="utf-8") as fh:
-            if needs_nl:
-                fh.write("\n")
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    # Atomic create then fsynced append, with the torn-tail self-heal — the
+    # same contract metadata/index.jsonl gets. ``.captions-*.jsonl`` is the
+    # temp prefix .gitignore lists by name, so it stays this caller's.
+    append_jsonl_line(paths.metadata / "captions.jsonl", line, prefix=".captions-")
 
 
 # ---------------------------------------------------------------------------

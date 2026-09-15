@@ -69,11 +69,11 @@ _PROMPT: Final[str] = (
 def _load_png_bytes(src: Path) -> bytes:
     """Decode ``src`` and re-encode as PNG bytes for the vision API. Raises on
     an undecodable/corrupt image; HEIC without the plugin raises too."""
-    from PIL import Image  # type: ignore[import-not-found]
+    from PIL import Image
 
     if src.suffix.lower() in (".heic", ".heif"):
         try:
-            import pillow_heif  # type: ignore[import-not-found]
+            import pillow_heif
             pillow_heif.register_heif_opener()
         except ImportError as exc:  # pragma: no cover - depends on optional dep
             raise RuntimeError(

@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import NoReturn
 
-from ingest_lib.config import paths_for_root
+import pytest
+
+from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.connectors import CONNECTORS, run_connector
 from ingest_lib.extractors import dispatch_extractor
 from ingest_lib.extractors import meeting as meeting_ex
@@ -16,11 +19,11 @@ _AT = "2026-07-12T00:00:00Z"
 
 # ------------------------------------------------------------ extractor
 
-def _snapshot(**kw) -> bytes:
+def _snapshot(**kw: str | list[str]) -> bytes:
     return json.dumps(kw).encode("utf-8")
 
 
-def test_meeting_extractor_renders_note(tmp_path: Path):
+def test_meeting_extractor_renders_note(tmp_path: Path) -> None:
     src = tmp_path / "m.json"
     src.write_bytes(_snapshot(
         connector="granola", id="m1", title="Kern weekly", date="2026-07-12",
@@ -36,7 +39,7 @@ def test_meeting_extractor_renders_note(tmp_path: Path):
     assert "Alice: hello" in res.markdown
 
 
-def test_meeting_without_body_is_partial(tmp_path: Path):
+def test_meeting_without_body_is_partial(tmp_path: Path) -> None:
     src = tmp_path / "m.json"
     src.write_bytes(_snapshot(connector="justrec", id="m2", title="Standup",
                               attendees=["Alice"]))
@@ -45,14 +48,14 @@ def test_meeting_without_body_is_partial(tmp_path: Path):
     assert "_(no transcript captured)_" in res.markdown
 
 
-def test_meeting_bad_json_is_manual_review(tmp_path: Path):
+def test_meeting_bad_json_is_manual_review(tmp_path: Path) -> None:
     src = tmp_path / "m.json"
     src.write_bytes(b"{ not json")
     res = meeting_ex.extract(src, tmp_path / "a")
     assert res.status == "manual_review"
 
 
-def test_meeting_snapshot_routes_by_source_class():
+def test_meeting_snapshot_routes_by_source_class() -> None:
     routed = dispatch_extractor(Path("x.json"), relative_path="meetings/granola/2026-07-12-kern.json")
     assert routed is meeting_ex.extract
     routed2 = dispatch_extractor(Path("x.json"), relative_path="meetings/justrec/a.json")
@@ -61,13 +64,13 @@ def test_meeting_snapshot_routes_by_source_class():
 
 # ------------------------------------------------------------ connectors
 
-def _vault(tmp_path: Path):
+def _vault(tmp_path: Path) -> VaultPaths:
     paths = paths_for_root(tmp_path / "vault")
     paths.ensure()
     return paths
 
 
-def test_granola_connector_pulls_snapshots(tmp_path: Path, monkeypatch):
+def test_granola_connector_pulls_snapshots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "test-key")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
@@ -84,7 +87,7 @@ def test_granola_connector_pulls_snapshots(tmp_path: Path, monkeypatch):
     assert data["connector"] == "granola" and data["attendees"] == ["Alice"]
 
 
-def test_granola_same_day_same_title_do_not_collide(tmp_path: Path, monkeypatch):
+def test_granola_same_day_same_title_do_not_collide(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "k")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
@@ -97,18 +100,18 @@ def test_granola_same_day_same_title_do_not_collide(tmp_path: Path, monkeypatch)
     assert len(list((paths.root / "inbox/meetings/granola").glob("*.json"))) == 2
 
 
-def test_granola_fetch_error_degrades(tmp_path: Path, monkeypatch):
+def test_granola_fetch_error_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "k")
 
-    def _boom(_k):
+    def _boom(_k: str) -> NoReturn:
         raise OSError("network down")
     monkeypatch.setattr(granola, "_fetch_meetings", _boom)
     stats = run_connector(CONNECTORS["granola"](), _vault(tmp_path), pulled_at=_AT, logger=_LOG)
     assert stats.written == 0   # degraded, not crashed
 
 
-def test_granola_attendee_without_name_dropped(tmp_path: Path, monkeypatch):
+def test_granola_attendee_without_name_dropped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "k")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
@@ -121,13 +124,13 @@ def test_granola_attendee_without_name_dropped(tmp_path: Path, monkeypatch):
     assert data["attendees"] == ["Real", "Str"]   # no "None", no name-less dict
 
 
-def test_granola_no_key_pulls_nothing(tmp_path: Path, monkeypatch):
+def test_granola_no_key_pulls_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GRANOLA_API_KEY", raising=False)
     stats = run_connector(CONNECTORS["granola"](), _vault(tmp_path), pulled_at=_AT, logger=_LOG)
     assert stats.written == 0 and stats.skipped == 0
 
 
-def test_justrec_connector_reads_local_folder(tmp_path: Path, monkeypatch):
+def test_justrec_connector_reads_local_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rec_dir = tmp_path / "justrec-out"
     rec_dir.mkdir()
     (rec_dir / "meeting1.json").write_text(json.dumps({
@@ -143,7 +146,7 @@ def test_justrec_connector_reads_local_folder(tmp_path: Path, monkeypatch):
     assert json.loads(snaps[0].read_text())["connector"] == "justrec"
 
 
-def test_justrec_same_stem_different_subdirs_are_distinct(tmp_path: Path, monkeypatch):
+def test_justrec_same_stem_different_subdirs_are_distinct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rec_dir = tmp_path / "rec"
     (rec_dir / "a").mkdir(parents=True)
     (rec_dir / "b").mkdir(parents=True)
@@ -156,7 +159,7 @@ def test_justrec_same_stem_different_subdirs_are_distinct(tmp_path: Path, monkey
     assert stats.written == 2   # a/notes.json and b/notes.json are distinct ids
 
 
-def test_justrec_no_dir_pulls_nothing(tmp_path: Path, monkeypatch):
+def test_justrec_no_dir_pulls_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BRAIN_JUSTREC_DIR", raising=False)
     stats = run_connector(CONNECTORS["justrec"](), _vault(tmp_path), pulled_at=_AT, logger=_LOG)
     assert stats.written == 0

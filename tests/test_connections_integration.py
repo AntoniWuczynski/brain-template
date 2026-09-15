@@ -47,7 +47,7 @@ def _rec(path: str, topics: list[str]) -> IndexRecord:
     )
 
 
-def test_graph_and_related_links_render_and_are_deterministic(tmp_path: Path):
+def test_graph_and_related_links_render_and_are_deterministic(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     paths.ensure()
     for rec in (
@@ -86,7 +86,7 @@ def test_graph_and_related_links_render_and_are_deterministic(tmp_path: Path):
     assert (paths.knowledge / "concepts" / "beta.md").read_text(encoding="utf-8") == beta_note
 
 
-def test_load_edges_skips_malformed_lines(tmp_path: Path):
+def test_load_edges_skips_malformed_lines(tmp_path: Path) -> None:
     # load_edges promises malformed lines are skipped, not fatal. A line that
     # parses as JSON with all keys but a non-numeric weight must be dropped
     # (float() would otherwise raise and crash the whole read), same as a line

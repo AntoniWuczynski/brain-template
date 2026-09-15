@@ -14,12 +14,22 @@ before promoting a candidate into ``retrieval_golden.jsonl``.
 """
 from __future__ import annotations
 
+import gzip
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 _SEARCH_TOOLS = ("vault_search", "memory_search")
+
+
+class _Agg(TypedDict):
+    """Running aggregate for one distinct query while grouping the log."""
+    occurrences: int
+    tools: set[str]
+    paths: set[str]
+    ever_hit: bool
 
 
 @dataclass(frozen=True)
@@ -39,7 +49,7 @@ def mine_access_log(
     Malformed lines and non-search rows are skipped. Output is ordered by
     descending frequency then query text, so it is deterministic given the
     same log."""
-    agg: dict[str, dict] = {}
+    agg: dict[str, _Agg] = {}
     for line in lines:
         line = line.strip()
         if not line:
@@ -82,12 +92,22 @@ def mine_access_log(
 
 
 def load_access_log(path: Path) -> list[MinedQuery]:
-    """Mine the on-disk access log; empty list if it is absent/unreadable."""
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            return mine_access_log(fh)
-    except OSError:
-        return []
+    """Mine the on-disk access log, including segments ``rotate_logs.py`` has
+    already rotated away (``<stem>-<ts>.jsonl`` and their gzipped form) in
+    the same directory. Empty list if none exist/are unreadable."""
+    stem = path.name.split(".", 1)[0]
+    lines: list[str] = []
+    for candidate in sorted(path.parent.glob(f"{stem}*{path.suffix}*")):
+        try:
+            if candidate.suffix == ".gz":
+                with gzip.open(candidate, mode="rt", encoding="utf-8", errors="replace") as fh:
+                    lines.extend(fh)
+            else:
+                with candidate.open("r", encoding="utf-8", errors="replace") as fh:
+                    lines.extend(fh)
+        except OSError:
+            continue
+    return mine_access_log(lines)
 
 
 def candidate_lines(mined: list[MinedQuery]) -> list[str]:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC
 from pathlib import Path
@@ -67,6 +68,11 @@ class IngestStats:
 # Planning
 # ---------------------------------------------------------------------------
 
+# The extractor name a connector snapshot records; the meeting-promotion
+# pass below is gated on one of these having been processed this run.
+_MEETING_EXTRACTOR = "meeting"
+
+
 def plan_ingest(
     paths: VaultPaths,
     *,
@@ -76,7 +82,14 @@ def plan_ingest(
 ) -> IngestPlan:
     """Walk the source(s), filter by registered extensions, dedupe by hash."""
     paths.ensure()
-    known_by_path = latest_records_by_path(paths.metadata_index_jsonl)
+    # NFC on both sides of the lookup: macOS hands back NFD filenames while
+    # git and Obsidian store NFC, so an accented path that crossed a tool
+    # boundary would otherwise miss its own record and be re-planned forever.
+    # NFC is the form the repo (and every other tool) records.
+    known_by_path = {
+        unicodedata.normalize("NFC", key): rec
+        for key, rec in latest_records_by_path(paths.metadata_index_jsonl).items()
+    }
 
     plan = IngestPlan()
     seen_relative: set[str] = set()
@@ -88,9 +101,20 @@ def plan_ingest(
         for f in _iter_files(source):
             rel = _relative_to_logical_root(f, paths, from_archive=from_archive)
             if rel is None:
-                # Outside both inbox and archive/raw — single-file mode.
-                rel = f.name
+                # Outside both inbox and archive/raw (``--path``). Keep the
+                # path relative to the directory the caller named: collapsing
+                # to the basename made a/same.txt and b/same.txt one key, so
+                # the second file was dropped without a word.
+                base = source.parent if source.is_file() else source
+                try:
+                    rel = f.relative_to(base).as_posix()
+                except ValueError:
+                    rel = f.name
+            rel = unicodedata.normalize("NFC", rel)
             if rel in seen_relative:
+                logger.warning(
+                    "skip (another source already claims %s): %s", rel, f
+                )
                 continue
             seen_relative.add(rel)
 
@@ -125,7 +149,13 @@ def _iter_files(root: Path) -> Iterator[Path]:
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if path.name == ".DS_Store" or path.name.startswith("._"):
+        # ".tmp-*": a raw copy torn apart by a kill mid-`_atomic_copy`. It is
+        # not a source, and ingesting it would archive the truncated bytes.
+        if (
+            path.name == ".DS_Store"
+            or path.name.startswith("._")
+            or path.name.startswith(".tmp-")
+        ):
             continue
         yield path
 
@@ -173,10 +203,28 @@ def run_ingest(
     # (the same pattern backfill_summaries uses). Reading it per file made
     # ingest O(files x JSONL size) — a 200-file drop re-parsed the whole
     # multi-MB index 200 times.
-    known = {} if dry_run else latest_records_by_path(paths.metadata_index_jsonl)
+    # NFC on the keys for the same reason plan_ingest normalises them: an
+    # NFD-spelled path from macOS must find its own (NFC) record.
+    known = (
+        {}
+        if dry_run
+        else {
+            unicodedata.normalize("NFC", key): rec
+            for key, rec in latest_records_by_path(paths.metadata_index_jsonl).items()
+        }
+    )
 
     for item in plan.items:
-        outcome = _process_one(paths, item, dry_run=dry_run, logger=logger, known=known)
+        try:
+            outcome = _process_one(paths, item, dry_run=dry_run, logger=logger, known=known)
+        except Exception as exc:  # noqa: BLE001
+            # AGENTS.md rule 6 + "continue processing other files": one bad
+            # file (an unreadable note, a full disk) must be recorded and
+            # stepped over, not abort every file sorted after it.
+            logger.exception("processing crashed for %s", item.relative_path)
+            if not dry_run:
+                _record_crash(paths, item, error=f"processing crashed: {exc!r}")
+            outcome = "manual_review"
         if outcome == "processed":
             stats.processed += 1
         elif outcome == "partial":
@@ -193,6 +241,30 @@ def run_ingest(
     # not on dry-runs). Cheap: just walks the JSONL, no LLM calls.
     wrote_content = stats.processed or stats.partial
     if not dry_run and wrote_content:
+        # Promote meeting snapshots BEFORE the index/concept/dashboard
+        # rebuilds below, so a meeting note this run derives is embedded and
+        # linked by the same run rather than waiting for the next one. Gated
+        # on a snapshot actually having been processed: the pass is a whole
+        # extra scan of knowledge/, and a run that ingested only PDFs has
+        # nothing new for it to find. Non-fatal, like every other derived
+        # rebuild — the nightly `python -m ingest_lib.meetings` picks up
+        # whatever a failure here left behind.
+        if any(
+            (rec := known.get(item.relative_path)) is not None
+            and rec.extractor == _MEETING_EXTRACTOR
+            for item in plan.items
+        ):
+            try:
+                from .meetings import promote_meetings
+                report = promote_meetings(paths)
+                logger.info(
+                    "meetings: notes written=%d proposals=%d skipped=%d",
+                    sum(1 for pr in report.promotions if pr.note_action == "written"),
+                    sum(len(pr.proposals) for pr in report.promotions),
+                    len(report.skipped),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("meetings: promotion failed (%r) — skipping", exc)
         # Build the semantic index first: concept centroids (and thus the
         # connection graph's semantic edges) read fresh vectors from it.
         # Cheap (~1 chunk/ms on MPS); failure is non-fatal — search just
@@ -302,7 +374,19 @@ def _process_one(
         logger.info("  would write index note -> %s", index_note_target)
         return "processed"  # best-effort label for stats; not actually written
 
+    prev = known.get(rel)
+    if prev is not None:
+        _migrate_legacy_note_paths(
+            paths,
+            prev,
+            processed_target=processed_target,
+            index_note_target=index_note_target,
+            assets_dir=assets_dir,
+            logger=logger,
+        )
+
     # 1. Copy raw if needed.
+    copied_now = False
     if not item.is_in_archive:
         if raw_target.exists():
             existing_hash = sha256_of(raw_target)
@@ -314,21 +398,46 @@ def _process_one(
                     existing_hash[:12],
                     src_hash[:12],
                 )
-                # Treat as manual review.
+                # Treat as manual review. The record describes the file it
+                # points at — the archived one — so anything joining
+                # source_hash to raw_path (sweep's integrity check, the
+                # summary cache, inbox hygiene) reads bytes that exist; the
+                # incoming file's hash and size live in the error text.
+                clash_error = (
+                    "raw archive already has a different file at this path "
+                    f"(archived={existing_hash[:12]} size={raw_target.stat().st_size}, "
+                    f"incoming={src_hash[:12]} size={size})"
+                )
+                if (
+                    prev is not None
+                    and prev.extractor == "archive-clash"
+                    and prev.status == "manual_review"
+                    and prev.source_hash == existing_hash
+                    and prev.error == clash_error
+                ):
+                    # Nothing has changed since the clash was recorded: the
+                    # index is append-only, so re-recording the identical
+                    # failure on every run just grows the JSONL (and the
+                    # Manual Review row is already there).
+                    logger.info(
+                        "  manual_review (already recorded): %s — %s", rel, clash_error
+                    )
+                    return "manual_review"
                 _record_failure(
                     paths,
                     rel=rel,
-                    src_hash=src_hash,
-                    size=size,
+                    src_hash=existing_hash,
+                    size=raw_target.stat().st_size,
                     extension=src.suffix.lower(),
-                    error="raw archive already has a different file at this path",
+                    error=clash_error,
                     raw_path=str(raw_target.relative_to(paths.root)),
                     extractor_name="archive-clash",
                 )
                 return "manual_review"
         else:
             raw_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, raw_target)
+            _atomic_copy(src, raw_target)
+            copied_now = True
 
     # 2. Run the extractor into a TEMP assets dir, swapped into place only on
     #    success. A re-ingest (changed hash) whose extraction fails must not
@@ -369,16 +478,22 @@ def _process_one(
             )
         shutil.rmtree(tmp_assets_parent, ignore_errors=True)
 
-    # 3. On manual_review move file to archive/failed and update metadata.
+    # 3. On manual_review move file to archive/failed and update metadata —
+    #    but only when this run put it in archive/raw. A file that was
+    #    already archived is ground truth (AGENTS.md hard rule 1), so a
+    #    failed RE-extraction marks the record and leaves it where it is.
     if result.status == "manual_review":
-        moved = _move_to_failed(raw_target, paths)
-        # Record the ACTUAL destination (which may be a .N suffix), not the
-        # plain path — otherwise the metadata source-of-truth points at the
-        # wrong bytes when a path fails more than once.
-        failed_rel = (
-            str(moved.relative_to(paths.root)) if moved is not None
-            else str((paths.archive_failed / rel).relative_to(paths.root))
-        )
+        if copied_now:
+            moved = _move_to_failed(raw_target, paths)
+            # Record the ACTUAL destination (which may be a .N suffix), not
+            # the plain path — otherwise the metadata source-of-truth points
+            # at the wrong bytes when a path fails more than once.
+            failed_rel = (
+                str(moved.relative_to(paths.root)) if moved is not None
+                else str((paths.archive_failed / rel).relative_to(paths.root))
+            )
+        else:
+            failed_rel = str(raw_target.relative_to(paths.root))
         _record_failure(
             paths,
             rel=rel,
@@ -404,7 +519,9 @@ def _process_one(
         logger=logger,
         known=known,
     )
-    full_notes = list(result.notes) + summary_notes
+    full_notes = list(result.notes) + summary_notes + _duplicate_source_notes(
+        rel=rel, src_hash=src_hash, known=known
+    )
 
     # 5. Write the processed Markdown.
     # Figures: the image assets this extraction produced (e.g. MinerU's
@@ -434,13 +551,17 @@ def _process_one(
 
     # 7. Append metadata record.
     now = _utc_now_iso()
+    # created_at is the record's birthday: keep the first one so Now.md's
+    # "Recently added sources" stays a list of new sources, not of whatever
+    # was re-extracted last night. (backfill_summaries already does this.)
+    created = prev.created_at if prev is not None and prev.created_at else now
     record = IndexRecord(
         relative_path=rel,
         source_hash=src_hash,
         size_bytes=size,
         extension=src.suffix.lower(),
         extractor=result.extractor,
-        status=result.status,  # type: ignore[arg-type]
+        status=result.status,
         raw_path=str(raw_target.relative_to(paths.root)),
         processed_path=str(processed_target.relative_to(paths.root)),
         index_note_path=str(index_note_target.relative_to(paths.root)),
@@ -448,7 +569,7 @@ def _process_one(
             str(p.relative_to(paths.root))
             for p in result.assets
         ],
-        created_at=now,
+        created_at=created,
         updated_at=now,
         error=result.error,
         notes=full_notes,
@@ -473,6 +594,154 @@ def _process_one(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _atomic_copy(src: Path, dest: Path) -> None:
+    """Copy a source file into the immutable tree atomically.
+
+    A plain ``copy2`` that dies mid-write leaves a truncated file at
+    ``dest`` — and since ``archive/raw`` is never overwritten, that torn
+    file reads as a permanent ``archive-clash`` on every later run. Write
+    to a temp name in the same directory, fsync, then rename.
+    """
+    tmp = dest.parent / (".tmp-" + dest.name)
+    try:
+        shutil.copy2(src, tmp)
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _migrate_legacy_note_paths(
+    paths: VaultPaths,
+    prev: IndexRecord,
+    *,
+    processed_target: Path,
+    index_note_target: Path,
+    assets_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    """Move a record's notes onto today's derived names before re-ingesting.
+
+    The derived name gained the source's own extension in 6e015a63
+    (``report.pdf`` -> ``report.pdf.md``), but the targets are computed from
+    the source path alone, so a re-ingest of a note written under the old
+    scheme wrote a ``report.pdf.md`` twin beside ``report.md``: the old note
+    kept its user frontmatter (rule 9's merge reads the NEW path), its
+    assets dir was left behind, and both notes embedded into the search
+    index. Renaming the recorded paths onto the current ones first makes the
+    re-ingest refresh the note the user has been editing. Only ever renames
+    onto a free name, and never touches ``archive/raw``.
+    """
+    moves: list[tuple[Path, Path]] = []
+    if prev.processed_path:
+        old_processed = paths.root / prev.processed_path
+        moves.append((old_processed, processed_target))
+        # The assets dir sits next to the processed note and carries its name
+        # (minus ".md") — true under both the old and the current scheme.
+        moves.append((
+            old_processed.parent / (old_processed.name.removesuffix(".md") + "_assets"),
+            assets_dir,
+        ))
+    if prev.index_note_path:
+        moves.append((paths.root / prev.index_note_path, index_note_target))
+    for old_path, new_path in moves:
+        if old_path == new_path or new_path.exists() or not old_path.exists():
+            continue
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(old_path, new_path)
+        logger.info(
+            "  migrated legacy note path: %s -> %s",
+            old_path.relative_to(paths.root),
+            new_path.relative_to(paths.root),
+        )
+
+
+def _duplicate_source_notes(
+    *, rel: str, src_hash: str, known: dict[str, IndexRecord]
+) -> list[str]:
+    """Cross-reference an identical file already ingested under another path.
+
+    Same bytes under two paths are archived, extracted and indexed twice
+    (only the summary is deduplicated), with nothing in either note saying
+    so. Name the first one, alphabetically, so the note is deterministic.
+    """
+    others = sorted(
+        r.relative_path
+        for r in known.values()
+        if r.source_hash == src_hash
+        and r.relative_path != rel
+        and r.status in ("processed", "partial")
+    )
+    if not others:
+        return []
+    return [f"duplicate of `{others[0]}` (identical content, same source_hash)"]
+
+
+def _write_failure_index_note(
+    paths: VaultPaths,
+    *,
+    rel: str,
+    src_hash: str,
+    error: str,
+    extractor_name: str,
+    raw_path: str,
+) -> str | None:
+    """Give a failed source an index note, so ``status: manual_review`` is
+    visible in ``knowledge/index/`` (AGENTS.md rule 6 lists it as a note
+    status, and rule 3 wants every source to have a note linking it).
+
+    Returns the repo-relative path written, or None if a note already exists
+    there: a failed RE-extraction must keep the previous good note rather
+    than blanking it — the same reasoning that keeps the previous assets.
+    """
+    target = paths.knowledge_index / derived_note_relpath(rel)
+    if target.exists():
+        return None
+    write_index_note(
+        target=target,
+        content=NoteContent(
+            title=_title_from_relpath(rel),
+            source_relative_path=rel,
+            source_hash=src_hash,
+            status="manual_review",
+            extracted_markdown="",
+            processing_notes=[error, f"file: `{raw_path}`"],
+            extractor=extractor_name,
+        ),
+    )
+    return str(target.relative_to(paths.root))
+
+
+def _record_crash(paths: VaultPaths, item: PlannedItem, *, error: str) -> None:
+    """Record an unexpected per-file failure as ``manual_review``.
+
+    Describes whichever copy of the file actually exists, so the record's
+    hash and ``raw_path`` agree (see ``_record_failure``'s callers).
+    """
+    raw_target = paths.archive_raw / item.relative_path
+    described = raw_target if raw_target.exists() else item.src
+    try:
+        size = described.stat().st_size
+        src_hash = sha256_of(described)
+    except OSError:
+        size = 0
+        src_hash = ""
+    _record_failure(
+        paths,
+        rel=item.relative_path,
+        src_hash=src_hash,
+        size=size,
+        extension=Path(item.relative_path).suffix.lower(),
+        error=error,
+        raw_path=(
+            str(described.relative_to(paths.root))
+            if described.is_relative_to(paths.root) else str(described)
+        ),
+        extractor_name="crashed",
+    )
+
 
 def _title_from_relpath(rel: str) -> str:
     stem = Path(rel).stem
@@ -571,7 +840,7 @@ def backfill_summaries(
             size_bytes=rec.size_bytes,
             extension=rec.extension,
             extractor=rec.extractor,
-            status=rec.status,  # type: ignore[arg-type]
+            status=rec.status,
             raw_path=rec.raw_path,
             processed_path=rec.processed_path,
             index_note_path=rec.index_note_path,
@@ -776,6 +1045,21 @@ def _record_failure(
     extractor_name: str,
 ) -> None:
     now = _utc_now_iso()
+    try:
+        index_note_path = _write_failure_index_note(
+            paths,
+            rel=rel,
+            src_hash=src_hash,
+            error=error,
+            extractor_name=extractor_name,
+            raw_path=raw_path,
+        )
+    except Exception:  # noqa: BLE001
+        # The record is the source of truth: losing it because the note could
+        # not be written would hide the failure entirely — and this write is
+        # the very operation that fails on a hand-broken index note (the
+        # crash path routes here).
+        index_note_path = None
     record = IndexRecord(
         relative_path=rel,
         source_hash=src_hash,
@@ -785,7 +1069,7 @@ def _record_failure(
         status="manual_review",
         raw_path=raw_path,
         processed_path=None,
-        index_note_path=None,
+        index_note_path=index_note_path,
         assets=[],
         created_at=now,
         updated_at=now,

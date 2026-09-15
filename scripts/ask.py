@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Load .env at the repo root before any ingest_lib import sees env vars.
 try:
-    from dotenv import load_dotenv  # type: ignore[import-not-found]
+    from dotenv import load_dotenv
     _repo_root = Path(__file__).resolve().parent.parent
     load_dotenv(_repo_root / ".env", override=False)
 except ImportError:

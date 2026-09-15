@@ -46,7 +46,7 @@ def _seed(paths: VaultPaths) -> None:
     rebuild_connections(paths, logger=_LOG)  # writes metadata/connections.jsonl
 
 
-def test_load_edges_reads_persisted_graph(tmp_path: Path):
+def test_load_edges_reads_persisted_graph(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _seed(paths)
     edges = load_edges(paths)
@@ -56,13 +56,13 @@ def test_load_edges_reads_persisted_graph(tmp_path: Path):
     assert ("alpha", "beta") in pairs
 
 
-def test_load_edges_absent_graph_is_empty(tmp_path: Path):
+def test_load_edges_absent_graph_is_empty(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     paths.ensure()
     assert load_edges(paths) == []
 
 
-def test_related_concepts_resolves_slug_or_display(tmp_path: Path):
+def test_related_concepts_resolves_slug_or_display(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _seed(paths)
     # Beta co-occurs with both Alpha and Gamma.
@@ -75,7 +75,7 @@ def test_related_concepts_resolves_slug_or_display(tmp_path: Path):
     assert {r.slug for r in rels2} == {"alpha", "gamma"}
 
 
-def test_related_concepts_unknown_returns_empty(tmp_path: Path):
+def test_related_concepts_unknown_returns_empty(tmp_path: Path) -> None:
     paths = _vault(tmp_path)
     _seed(paths)
     slug, rels = related_concepts(paths, "Nonexistent Topic", top_n=8)

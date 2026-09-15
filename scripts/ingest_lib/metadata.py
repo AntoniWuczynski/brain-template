@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 from collections.abc import Iterator
+
+from .atomic import append_jsonl_line
+
+_LOGGER = logging.getLogger(__name__)
 
 Status = Literal["processed", "partial", "manual_review", "skipped"]
 
@@ -56,16 +59,26 @@ def iter_records(jsonl_path: Path) -> Iterator[IndexRecord]:
     # crash the read — the mojibaked line fails json.loads below and is
     # skipped like any other malformed line, keeping the valid records.
     with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 data = json.loads(line)
-            except json.JSONDecodeError:
-                # Skip malformed lines but don't lose the others.
+            except json.JSONDecodeError as exc:
+                # Skip malformed lines but don't lose the others — and say so:
+                # a silently dropped record makes its source look un-ingested,
+                # which costs a re-extraction, an LLM call and a duplicate
+                # record with no trace anywhere.
+                _LOGGER.warning(
+                    "%s line %d: unparseable JSON (%s) — record skipped",
+                    jsonl_path, line_no, exc,
+                )
                 continue
             if not isinstance(data, dict):
+                _LOGGER.warning(
+                    "%s line %d: not a JSON object — record skipped", jsonl_path, line_no
+                )
                 continue
             # Drop unknown keys rather than crashing: the schema has grown
             # twice already (summary/key_points, then topics), and a single
@@ -75,8 +88,12 @@ def iter_records(jsonl_path: Path) -> Iterator[IndexRecord]:
             known = {k: v for k, v in data.items() if k in _RECORD_FIELDS}
             try:
                 yield IndexRecord(**known)
-            except TypeError:
+            except TypeError as exc:
                 # e.g. a required field is absent: skip this line, keep the rest.
+                _LOGGER.warning(
+                    "%s line %d: does not match the record schema (%s) — record skipped",
+                    jsonl_path, line_no, exc,
+                )
                 continue
 
 
@@ -91,47 +108,11 @@ def latest_records_by_path(jsonl_path: Path) -> dict[str, IndexRecord]:
 def append_record(jsonl_path: Path, record: IndexRecord) -> None:
     """Append a record to the JSONL. Creates the file if missing.
 
-    Uses a tempfile + os.replace dance only when the file doesn't yet
-    exist; subsequent writes append with fsync. Records routinely exceed
-    the PIPE_BUF (4 KiB) single-write atomicity window — asset-heavy
-    MinerU records reach hundreds of KB — so before appending we ensure
-    the file ends in a newline: if a previous write was torn (crash /
-    concurrent run left a partial line), this starts the new record on its
-    own line instead of concatenating onto the stub, so at most one record
-    is lost to a torn tail rather than two silently merging.
+    Delegates to ``atomic.append_jsonl_line``: atomic create when the file
+    doesn't exist, otherwise an fsync'd append that first self-heals a torn
+    tail. Records routinely exceed the PIPE_BUF (4 KiB) single-write
+    atomicity window — asset-heavy MinerU records reach hundreds of KB — so
+    a previous write can have been cut short.
     """
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    line = record.to_json_line() + "\n"
-    if not jsonl_path.exists():
-        # Atomic create: write to temp and rename.
-        fd, tmp = tempfile.mkstemp(prefix=".index-", suffix=".jsonl", dir=str(jsonl_path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, jsonl_path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
-    else:
-        # Self-heal a torn tail: if the file doesn't end in '\n', add one
-        # before appending so a partial prior line can't swallow this one.
-        # Probe the last byte in BINARY — a text-mode read of a tail cut
-        # mid-UTF-8 (index.jsonl uses ensure_ascii=False) would raise
-        # UnicodeDecodeError before any write, crashing every retry.
-        with jsonl_path.open("rb") as probe:
-            probe.seek(0, os.SEEK_END)
-            needs_nl = probe.tell() > 0
-            if needs_nl:
-                probe.seek(-1, os.SEEK_END)
-                needs_nl = probe.read(1) != b"\n"
-        with jsonl_path.open("a", encoding="utf-8") as fh:
-            if needs_nl:
-                fh.write("\n")
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    append_jsonl_line(jsonl_path, record.to_json_line() + "\n", prefix=".index-")

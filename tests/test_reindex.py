@@ -13,8 +13,11 @@ import hashlib
 import json
 import logging
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import numpy as np
 import pytest
@@ -97,7 +100,7 @@ _KEPT = ("An unrelated archived source paragraph that must survive every "
          "refresh completely untouched, byte for byte.")
 
 
-def _wait_for(cond, timeout: float = 8.0, interval: float = 0.02) -> bool:
+def _wait_for(cond: Callable[[], bool], timeout: float = 8.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if cond():
@@ -119,30 +122,36 @@ def test_burst_of_enqueues_coalesces_into_one_batch(
     calls: list[list[str]] = []
     real_upsert = semantic.upsert_notes
 
-    def recording_upsert(p, rels, **kwargs):
+    def recording_upsert(
+        p: VaultPaths,
+        rels: list[str],
+        *,
+        logger: logging.Logger,
+        encode: Callable[[list[str]], np.ndarray] | None = None,
+    ) -> int:
         calls.append(list(rels))
-        return real_upsert(p, rels, **kwargs)
+        return real_upsert(p, rels, logger=logger, encode=encode)
 
     monkeypatch.setattr(semantic, "upsert_notes", recording_upsert)
-    audit = AuditLog(paths.root)
-    # 0.2s debounce: long enough that the two enqueues below can't be
-    # split into separate batches by scheduler jitter, short enough to
-    # keep the test fast.
+    # AUD-071: the batch boundary must not be decided by the wall clock. A
+    # 0.2s debounce made `calls` depend on whether the OS descheduled this
+    # process between the two enqueues (a >200 ms stall splits them into two
+    # single-path batches and fails a test whose code is correct). A debounce
+    # far longer than the test can never fire, so the ONLY thing that drains
+    # the dirty set is stop()'s explicit flush — the deterministic signal.
     refresher = IndexRefresher(
-        paths.root, audit=audit, debounce_seconds=0.2, encode=_fake_encode
+        paths.root, audit=AuditLog(paths.root), debounce_seconds=60.0,
+        encode=_fake_encode,
     )
-    try:
-        assert refresher.enqueue("knowledge/notes/a.md", graph_changed=False) == "queued"
-        assert refresher.enqueue("knowledge/people/b.md", graph_changed=False) == "queued"
-        assert _wait_for(
-            lambda: {"knowledge/notes/a.md", "knowledge/people/b.md"}
-            <= _meta_sources(paths)
-        ), "upsert never reflected both notes in the meta jsonl"
-    finally:
-        refresher.stop(flush_seconds=2.0)
+    assert refresher.enqueue("knowledge/notes/a.md", graph_changed=False) == "queued"
+    assert refresher.enqueue("knowledge/people/b.md", graph_changed=False) == "queued"
+    # Both paths are in ONE dirty set, and no batch has been drained yet.
+    assert refresher.pending() == 2
+    refresher.stop(flush_seconds=5.0)
 
-    # The 0.2s debounce coalesced both enqueues into exactly one batch.
+    # Both enqueues coalesced into exactly one batch, one upsert call.
     assert calls == [["knowledge/notes/a.md", "knowledge/people/b.md"]]
+    assert {"knowledge/notes/a.md", "knowledge/people/b.md"} <= _meta_sources(paths)
     assert "uni/lecture.md" in _meta_sources(paths)  # untouched row survives
     # No graph_changed entry: no rebuild ran, so no concept notes appeared.
     assert not list((paths.knowledge / "concepts").glob("*.md"))
@@ -204,7 +213,7 @@ def test_poisoned_batch_keeps_thread_alive_and_audits(
     _seed_index(paths, [("uni/lecture.md", 0, _KEPT)])
     _write_note(paths, "knowledge/notes/ok.md", "recovers fine")
 
-    def boom(*args, **kwargs):
+    def boom(*args: object, **kwargs: object) -> NoReturn:
         raise RuntimeError("poisoned batch")
 
     monkeypatch.setattr(semantic, "upsert_notes", boom)
@@ -247,3 +256,105 @@ def test_stop_drains_pending_work(tmp_path: Path) -> None:
     refresher.stop(flush_seconds=5.0)
     assert "knowledge/notes/late.md" in _meta_sources(paths)
     assert refresher.pending() == 0
+
+
+def test_rebuild_derived_commits_with_the_configured_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IMP-015: the refresher's derived-notes commit carries the same branch
+    guard as the write tools."""
+    from types import SimpleNamespace
+
+    from ingest_lib import concepts, connections, dashboards
+    from mcp_server import reindex as reindex_mod
+    from mcp_server.git_ops import CommitOutcome
+
+    paths = _git_vault(tmp_path)
+    seen: dict[str, str | None] = {}
+
+    def fake_commit(
+        vault_root: Path, *, paths: list[Path], message: str, expected_branch: str | None = None
+    ) -> CommitOutcome:
+        seen["expected_branch"] = expected_branch
+        return CommitOutcome(None, False, False, "fake")
+
+    monkeypatch.setattr(reindex_mod, "commit_paths", fake_commit)
+    monkeypatch.setattr(
+        connections, "rebuild_connections",
+        lambda p, *, logger: SimpleNamespace(related={}),
+    )
+    monkeypatch.setattr(
+        concepts, "rebuild_concepts",
+        lambda p, *, logger, related: SimpleNamespace(
+            written_paths=("knowledge/concepts/x.md",), removed_paths=()
+        ),
+    )
+    monkeypatch.setattr(
+        dashboards, "rebuild_dashboards",
+        lambda p, *, logger: SimpleNamespace(written_paths=()),
+    )
+    refresher = IndexRefresher(paths.root, audit=AuditLog(paths.root), enabled=False, branch="main")
+    refresher._rebuild_derived(paths)
+    assert seen["expected_branch"] == "main"
+
+
+def test_enqueue_after_stop_reports_skipped(tmp_path: Path) -> None:
+    """AUD-041: once stop() has run nothing drains the dirty set, so a write
+    landing during shutdown must not be told its reindex is "queued"."""
+    paths = _vault(tmp_path)
+    refresher = IndexRefresher(
+        paths.root, audit=AuditLog(paths.root), debounce_seconds=0.05,
+        encode=_fake_encode,
+    )
+    refresher.stop(flush_seconds=1.0)
+    assert refresher.enqueue("knowledge/notes/late.md", graph_changed=False) == "skipped"
+    assert refresher.pending() == 0
+
+
+def test_stop_reports_the_batch_still_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AUD-041: a batch the worker has drained but not finished used to be
+    invisible to stop() (pending() is already 0) and died with the daemon
+    thread unlogged."""
+    paths = _vault(tmp_path)
+    _seed_index(paths, [("uni/lecture.md", 0, _KEPT)])
+    _write_note(paths, "knowledge/notes/slow.md", "slow note")
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_upsert(
+        p: VaultPaths,
+        rels: list[str],
+        *,
+        logger: logging.Logger,
+        encode: Callable[[list[str]], np.ndarray] | None = None,
+    ) -> int:
+        started.set()
+        release.wait(10.0)
+        return 0
+
+    monkeypatch.setattr(semantic, "upsert_notes", blocking_upsert)
+    audit_path = paths.root / "logs" / "mcp-audit.jsonl"
+    refresher = IndexRefresher(
+        paths.root, audit=AuditLog(paths.root), debounce_seconds=0.01,
+        encode=_fake_encode,
+    )
+    try:
+        assert refresher.enqueue("knowledge/notes/slow.md", graph_changed=False) == "queued"
+        assert started.wait(10.0), "worker never entered the batch"
+        assert refresher.pending() == 0  # drained already: the old blind spot
+        refresher.stop(flush_seconds=0.2)
+        assert audit_path.exists(), "in-flight batch vanished without an audit row"
+        rows = [
+            json.loads(ln)
+            for ln in audit_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        dropped = [r for r in rows if r["outcome"] == "dropped"]
+        assert len(dropped) == 1, rows
+        assert dropped[0]["tool"] == "reindex"
+        assert "1 path(s)" in dropped[0]["detail"]
+    finally:
+        release.set()

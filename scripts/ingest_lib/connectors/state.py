@@ -8,11 +8,10 @@ atomically (temp + fsync + rename), like every other metadata file.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..atomic import atomic_write_text, umask_mode
 from ..config import VaultPaths
 from .base import Snapshot
 
@@ -34,10 +33,13 @@ class ConnectorState:
         prior = self.entries.get(snap.native_id)
         return prior is not None and prior.get("content_hash") == snap.content_hash
 
-    def record(self, snap: Snapshot, *, pulled_at: str) -> None:
+    def record(self, snap: Snapshot, *, pulled_at: str, inbox_relpath: str | None = None) -> None:
+        """Record ``snap`` as pulled. ``inbox_relpath`` overrides the
+        connector's stable ``snap.inbox_relpath`` when the runner routed a
+        changed re-pull to a versioned sibling path instead."""
         self.entries[snap.native_id] = {
             "content_hash": snap.content_hash,
-            "inbox_path": snap.inbox_relpath,
+            "inbox_path": inbox_relpath if inbox_relpath is not None else snap.inbox_relpath,
             "pulled_at": pulled_at,
         }
 
@@ -68,22 +70,13 @@ def load_state(paths: VaultPaths, name: str) -> ConnectorState:
 
 
 def save_state(paths: VaultPaths, state: ConnectorState) -> None:
-    path = _state_path(paths, state.name)
-    path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(
         {"name": state.name, "cursor": state.cursor, "entries": state.entries},
         ensure_ascii=False, indent=2, sort_keys=True,
     )
-    fd, tmp = tempfile.mkstemp(prefix=f".{state.name}-", suffix=".json", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(body)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+    # State is vault content under version control alongside 0644 files, so
+    # honour the umask rather than keeping mkstemp's 0600.
+    atomic_write_text(
+        _state_path(paths, state.name), body,
+        prefix=f".{state.name}-", suffix=".json", mode=umask_mode(),
+    )

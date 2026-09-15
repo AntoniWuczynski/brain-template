@@ -5,26 +5,38 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.hashing import sha256_of
 from ingest_lib.metadata import IndexRecord, append_record
-from ingest_lib.sweep import SweepReport, render_report, run_sweep
+from ingest_lib.sweep import (
+    SweepReport,
+    find_duplicate_entity_pairs,
+    render_report,
+    run_sweep,
+)
 
 _LOG = logging.getLogger("test")
 AS_OF = date(2026, 6, 12)
 
 EXPECTED_CATEGORIES = (
+    "alias-collision",
     "archive-orphan-file",
     "archive-orphan-record",
     "concept-fragmentation",
+    "entity-duplicate",
     "dangling-wikilink",
     "dream-stalled",
     "index-drift-missing",
     "index-drift-stale",
     "index-drift-unindexed",
+    "memory-unconsolidatable",
     "missing-artifact",
     "relation-bad-date",
     "relation-dangling-target",
@@ -32,6 +44,8 @@ EXPECTED_CATEGORIES = (
     "relation-overlap",
     "relation-problem",
     "stale-unconsolidated",
+    "wikilink-ambiguous",
+    "wikilink-not-canonical",
 )
 
 # Body wikilinks: one dangling, one self-link with anchor (resolves), one
@@ -47,6 +61,30 @@ topics: [rng, rngs]
 
 See [[knowledge/people/missing-person|Missing]], [[knowledge/notes/links#top]],
 [[https://example.com]], and ![[archive/processed/asset.png]].
+"""
+
+# Short (Obsidian-style) links: `unique-stem` names exactly one note in
+# the vault -> not canonical but resolvable; `twinned` names two ->
+# ambiguous. Both are body links, so no relation/topic side effects.
+SHORT_LINKS_NOTE = """---
+title: Shortcuts
+type: note
+---
+
+# Shortcuts
+
+See [[unique-stem]] and [[twinned]].
+"""
+
+# Unconsolidated but undated, and outside consolidate's flat inbox: the
+# staleness check cannot age it and consolidate never sees it (F13).
+UNDATED_SESSION = """---
+title: Session
+type: note
+memory_status: unconsolidated
+---
+
+A session note nothing can act on.
 """
 
 # One relation entry per relation-finding category. Every dated entry
@@ -78,6 +116,36 @@ relations:
 ---
 
 # Anna
+"""
+
+# Two live notes claiming one alias: every lookup for `twin` is ambiguous.
+TWIN_NOTE = """---
+title: Twinned
+type: note
+aliases: [twin]
+---
+
+# twin
+"""
+
+# An attendee whose calendar payload carried an address, not a name — the
+# same person as `dana-scott`, split into a second node.
+EMAIL_PERSON = """---
+title: dana@example.com
+type: person
+aliases: []
+---
+
+# dana@example.com
+"""
+
+NAMED_PERSON = """---
+title: Dana Scott
+type: person
+aliases: []
+---
+
+# Dana Scott
 """
 
 ORG_NOTE = """---
@@ -159,6 +227,21 @@ def _seed(tmp_path: Path) -> VaultPaths:
     links = _write(tmp_path, "knowledge/notes/links.md", LINKS_NOTE)
     _write(tmp_path, "archive/processed/asset.png", "png")
 
+    # wikilink-not-canonical + wikilink-ambiguous.
+    shortcuts = _write(tmp_path, "knowledge/notes/shortcuts.md", SHORT_LINKS_NOTE)
+    unique = _write(tmp_path, "knowledge/research/unique-stem.md", "# unique\n")
+    twin_a = _write(tmp_path, "knowledge/people/twinned.md", TWIN_NOTE)
+    twin_b = _write(tmp_path, "knowledge/organisations/twinned.md", TWIN_NOTE)
+
+    # entity-duplicate: an email-titled node beside the named one.
+    email_person = _write(tmp_path, "knowledge/people/danaexamplecom.md", EMAIL_PERSON)
+    named_person = _write(tmp_path, "knowledge/people/dana-scott.md", NAMED_PERSON)
+
+    # memory-unconsolidatable.
+    session = _write(
+        tmp_path, "knowledge/assistant/sessions/undated.md", UNDATED_SESSION
+    )
+
     # relation-* findings, all on one person note.
     anna = _write(tmp_path, "knowledge/people/anna.md", PERSON_NOTE)
     _write(tmp_path, "knowledge/organisations/acme.md", ORG_NOTE)
@@ -182,6 +265,23 @@ def _seed(tmp_path: Path) -> VaultPaths:
         _meta_row("knowledge/people/anna.md", sha256_of(anna), "knowledge-note"),
         _meta_row(
             "knowledge/assistant/inbox/fact-old.md", sha256_of(fact), "knowledge-note"
+        ),
+        _meta_row("knowledge/notes/shortcuts.md", sha256_of(shortcuts), "knowledge-note"),
+        _meta_row("knowledge/research/unique-stem.md", sha256_of(unique), "knowledge-note"),
+        _meta_row("knowledge/people/twinned.md", sha256_of(twin_a), "knowledge-note"),
+        _meta_row(
+            "knowledge/organisations/twinned.md", sha256_of(twin_b), "knowledge-note"
+        ),
+        _meta_row(
+            "knowledge/assistant/sessions/undated.md", sha256_of(session),
+            "knowledge-note",
+        ),
+        _meta_row(
+            "knowledge/people/danaexamplecom.md", sha256_of(email_person),
+            "knowledge-note",
+        ),
+        _meta_row(
+            "knowledge/people/dana-scott.md", sha256_of(named_person), "knowledge-note"
         ),
     ]
     assert sha256_of(links) != "0" * 64
@@ -224,6 +324,22 @@ def test_each_category_fires_exactly_once(tmp_path: Path) -> None:
         "knowledge/assistant/inbox/fact-old.md"
     )
     assert "72 day(s)" in by_category["stale-unconsolidated"].detail
+    assert by_category["wikilink-not-canonical"].path == "knowledge/notes/shortcuts.md"
+    assert "knowledge/research/unique-stem.md" in (
+        by_category["wikilink-not-canonical"].detail
+    )
+    assert by_category["wikilink-ambiguous"].path == "knowledge/notes/shortcuts.md"
+    assert "knowledge/organisations/twinned.md, knowledge/people/twinned.md" in (
+        by_category["wikilink-ambiguous"].detail
+    )
+    assert by_category["entity-duplicate"].path == "knowledge/people/danaexamplecom.md"
+    assert "knowledge/people/dana-scott.md" in by_category["entity-duplicate"].detail
+    assert by_category["alias-collision"].path == "knowledge/organisations/twinned.md"
+    assert "'twin'" in by_category["alias-collision"].detail
+    assert by_category["memory-unconsolidatable"].path == (
+        "knowledge/assistant/sessions/undated.md"
+    )
+    assert "created:" in by_category["memory-unconsolidatable"].detail
     assert by_category["dream-stalled"].path == "metadata/dream.pending"
     assert "11 days ago" in by_category["dream-stalled"].detail
 
@@ -249,6 +365,87 @@ def test_extensionless_link_to_binary_is_not_dangling(tmp_path: Path) -> None:
     assert [f.detail for f in dangling] == [
         "[[archive/raw/uni/nothing]] resolves to no note or file"
     ]
+
+
+def test_short_link_prefers_the_linking_notes_own_folder(tmp_path: Path) -> None:
+    """F8/AUD-027: Obsidian resolves [[name]] by name across the vault,
+    preferring the linking note's own folder — so a same-folder match is
+    resolvable (not ambiguous) even when the name is used twice."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(tmp_path, "knowledge/projects/agent/floors.md", "# floors\n")
+    _write(tmp_path, "knowledge/projects/kern/floors.md", "# floors\n")
+    _write(
+        tmp_path, "knowledge/projects/agent/plan.md",
+        "# plan\n\nSee [[floors]] and [[log/2026-06-01]] and [[nowhere]].\n",
+    )
+    _write(tmp_path, "knowledge/projects/agent/log/2026-06-01.md", "# log\n")
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    by_category = {f.category: f for f in report.findings}
+    assert "wikilink-ambiguous" not in by_category
+    assert by_category["dangling-wikilink"].detail == (
+        "[[nowhere]] resolves to no note or file"
+    )
+    # Both the same-folder name and the relative subpath resolve.
+    not_canonical = sorted(
+        f.detail for f in report.findings if f.category == "wikilink-not-canonical"
+    )
+    assert not_canonical == [
+        "[[floors]] is a short link — Obsidian resolves it to "
+        "knowledge/projects/agent/floors.md; AGENTS.md asks for the "
+        "full vault-relative path",
+        "[[log/2026-06-01]] is a short link — Obsidian resolves it to "
+        "knowledge/projects/agent/log/2026-06-01.md; AGENTS.md asks for the "
+        "full vault-relative path",
+    ]
+
+
+def test_archived_assistant_notes_are_not_relation_linted(tmp_path: Path) -> None:
+    """AUD-095: entity_notes excludes assistant archive/ and digests/, so
+    the sweep must too — otherwise the linter reports a broken graph edge
+    that the graph itself will never contain."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    archived = (
+        "---\n"
+        "title: Promoted fact\n"
+        "relations:\n"
+        "  - rel: works_at\n"
+        "    target: organisations/ghost\n"
+        "---\n"
+    )
+    _write(tmp_path, "knowledge/assistant/archive/2026-04/done.md", archived)
+    _write(tmp_path, "knowledge/assistant/digests/2026-04.md", archived)
+    _write(tmp_path, "knowledge/assistant/inbox/live.md", archived)
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    dangling = [
+        f for f in report.findings if f.category == "relation-dangling-target"
+    ]
+    assert [f.path for f in dangling] == ["knowledge/assistant/inbox/live.md"]
+
+
+def test_inbox_note_consolidate_skips_is_reported(tmp_path: Path) -> None:
+    """AUD-031: a note in the inbox with neither a promote mapping nor a
+    memory_status is skipped by consolidate on every run and is invisible
+    to the staleness check — the sweep is the only thing that can say so."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(tmp_path, "knowledge/assistant/inbox/stray.md", "# just a note\n")
+    _write(tmp_path, "knowledge/assistant/inbox/fact.md", STALE_FACT)
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+
+    unconsolidatable = [
+        f for f in report.findings if f.category == "memory-unconsolidatable"
+    ]
+    assert [f.path for f in unconsolidatable] == [
+        "knowledge/assistant/inbox/stray.md"
+    ]
+    assert "consolidate skips it" in unconsolidatable[0].detail
 
 
 def test_rerun_is_deterministic(tmp_path: Path) -> None:
@@ -435,7 +632,9 @@ def test_archive_processed_size_tripwire(tmp_path: Path) -> None:
     assert "git-lfs" in findings[0].detail
 
 
-def test_run_sweep_wires_archive_processed_size(tmp_path: Path, monkeypatch):
+def test_run_sweep_wires_archive_processed_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Pin the wiring in run_sweep (not just the helper): a big processed tree
     # produces the finding through the full sweep.
     import ingest_lib.sweep as sweep_mod
@@ -459,3 +658,254 @@ def test_dream_pending_fresh_marker_not_flagged(tmp_path: Path) -> None:
     )
     report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
     assert "dream-stalled" not in report.counts
+
+
+def test_placeholder_wikilink_is_not_dangling(tmp_path: Path) -> None:
+    """`Note Template.md` documents the note format with
+    `[[archive/raw/<rel/path>]]`. An angle-bracketed segment can never name a
+    file, so it is a placeholder, not a broken link (AUD-082)."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(
+        tmp_path, "knowledge/index/Note Template.md",
+        "---\ntitle: Note Template\n---\n\n- Source: [[archive/raw/<rel/path>]]\n",
+    )
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+
+    assert [f for f in report.findings if f.category == "dangling-wikilink"] == []
+
+
+def test_entity_duplicate_clears_once_the_pair_is_merged(tmp_path: Path) -> None:
+    """The vault merges by superseding, never deleting (AGENTS.md): the
+    address becomes an alias on the named note, the two are joined by
+    `related_to`, and the email node is marked `superseded_by`. The check
+    must go quiet on all three shapes and stay loud without them."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    email = _write(tmp_path, "knowledge/people/danaexamplecom.md", EMAIL_PERSON)
+    _write(tmp_path, "knowledge/people/dana-scott.md", NAMED_PERSON)
+
+    def categories() -> list[str]:
+        report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+        return [f.category for f in report.findings if f.category == "entity-duplicate"]
+
+    assert categories() == ["entity-duplicate"]
+
+    email.write_text(
+        "---\ntitle: dana@example.com\ntype: person\naliases: []\n"
+        "superseded_by: knowledge/people/dana-scott\n---\n\n# dana@example.com\n",
+        encoding="utf-8",
+    )
+    assert categories() == []
+
+
+def test_entity_duplicate_accepts_an_alias_or_a_related_to_edge(tmp_path: Path) -> None:
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(tmp_path, "knowledge/people/danaexamplecom.md", EMAIL_PERSON)
+    named = _write(tmp_path, "knowledge/people/dana-scott.md", NAMED_PERSON)
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+    assert [f.category for f in report.findings] == ["entity-duplicate"]
+
+    named.write_text(
+        "---\ntitle: Dana Scott\ntype: person\naliases: [dana@example.com]\n---\n\n"
+        "# Dana Scott\n",
+        encoding="utf-8",
+    )
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+    assert [f for f in report.findings if f.category == "entity-duplicate"] == []
+
+    named.write_text(
+        "---\ntitle: Dana Scott\ntype: person\naliases: []\nrelations:\n"
+        "  - rel: related_to\n    target: people/danaexamplecom\n---\n\n# Dana Scott\n",
+        encoding="utf-8",
+    )
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+    assert [f for f in report.findings if f.category == "entity-duplicate"] == []
+
+
+def test_find_duplicate_entity_pairs_matches_the_sweep_finding(tmp_path: Path) -> None:
+    """ingest_lib.duplicates builds proposals off this function directly, so
+    it must report exactly the pair the entity-duplicate check flags."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(tmp_path, "knowledge/people/danaexamplecom.md", EMAIL_PERSON)
+    _write(tmp_path, "knowledge/people/dana-scott.md", NAMED_PERSON)
+
+    pairs = find_duplicate_entity_pairs(paths)
+    assert len(pairs) == 1
+    assert pairs[0].email_node.rel_path == "knowledge/people/danaexamplecom.md"
+    assert [c.rel_path for c in pairs[0].named_candidates] == [
+        "knowledge/people/dana-scott.md"
+    ]
+
+    named = paths.root / "knowledge/people/dana-scott.md"
+    named.write_text(
+        "---\ntitle: Dana Scott\ntype: person\naliases: [dana@example.com]\n"
+        "---\n\n# Dana Scott\n",
+        encoding="utf-8",
+    )
+    assert find_duplicate_entity_pairs(paths) == []
+
+
+def test_alias_collision_ignores_notes_that_are_no_longer_live(tmp_path: Path) -> None:
+    """Three project notes shared the alias `randeval` (AUD-087). Marking the
+    two non-canonical ones complete/superseded is the fix, so the check must
+    only count notes that are still live."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(
+        tmp_path, "knowledge/projects/one/one.md",
+        "---\ntitle: One\ntype: project\nstatus: active\naliases: [shared]\n---\n\n# One\n",
+    )
+    two = _write(
+        tmp_path, "knowledge/projects/two/two.md",
+        "---\ntitle: Two\ntype: project\nstatus: active\naliases: [Shared]\n---\n\n# Two\n",
+    )
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+    collisions = [f for f in report.findings if f.category == "alias-collision"]
+    assert len(collisions) == 1
+    assert collisions[0].path == "knowledge/projects/one/one.md"
+
+    two.write_text(
+        "---\ntitle: Two\ntype: project\nstatus: complete\naliases: [Shared]\n---\n\n"
+        "# Two\n",
+        encoding="utf-8",
+    )
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+    assert [f for f in report.findings if f.category == "alias-collision"] == []
+
+
+def test_fragmentation_skips_reviewed_and_version_numbered_pairs(tmp_path: Path) -> None:
+    """Four of the five nightly `concept-fragmentation` findings were
+    distinct concepts (AUD-086): version pairs are excluded by shape, and a
+    reviewed pair is silenced by `distinct_from:` on either note."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(
+        tmp_path, "knowledge/notes/topics.md",
+        "---\ntitle: Topics\ntype: note\n"
+        "topics: [android-16, android-17, csprng, prng]\n---\n\n# Topics\n",
+    )
+
+    def pairs() -> list[str]:
+        report = run_sweep(paths, logger=_LOG, as_of=AS_OF, stale_days=30)
+        return [
+            f.detail for f in report.findings if f.category == "concept-fragmentation"
+        ]
+
+    # android-16/-17 differ only in a number -> never reported.
+    assert len(pairs()) == 1
+    assert "'csprng' and 'prng'" in pairs()[0]
+
+    _write(
+        tmp_path, "knowledge/concepts/csprng.md",
+        "---\ntitle: CSPRNG\ntype: concept\ndistinct_from: [prng]\n---\n\n# CSPRNG\n",
+    )
+    assert pairs() == []
+
+
+# `archive-source-local-only` needs a real repository to ask, so it lives
+# here rather than in the one-of-everything fixture above.
+_needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+
+
+def _git_vault(root: Path, gitignore: str) -> VaultPaths:
+    """A throwaway vault that is its own git repository (never the real one)."""
+    paths = paths_for_root(root)
+    paths.ensure()
+    subprocess.run(
+        ["git", "init", "-q", str(paths.root)], check=True, capture_output=True
+    )
+    _write(paths.root, ".gitignore", gitignore)
+    return paths
+
+
+def _absent_source(rel: str, src_hash: str) -> IndexRecord:
+    """A record whose raw file is not on disk, and which owns no artifacts
+    (so only the archive check can speak about it)."""
+    return _record(rel, src_hash, processed_path=None, index_note_path=None)
+
+
+@_needs_git
+def test_gitignored_absent_source_is_its_own_category(tmp_path: Path) -> None:
+    """IMP-020: six ELEC0031 slide decks exceed GitHub's per-file limit and
+    .gitignore keeps them local, so every other checkout is missing them by
+    design. That must read as its own category, not as six lost sources —
+    while a source nothing excludes stays an orphan record."""
+    paths = _git_vault(tmp_path, "/archive/raw/big deck.pdf\n")
+    append_record(paths.metadata_index_jsonl, _absent_source("big deck.pdf", "a" * 64))
+    append_record(paths.metadata_index_jsonl, _absent_source("lost.txt", "b" * 64))
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    assert report.counts == {
+        "archive-orphan-record": 1,
+        "archive-source-local-only": 1,
+    }
+    by_category = {f.category: f for f in report.findings}
+    local_only = by_category["archive-source-local-only"]
+    assert local_only.path == "big deck.pdf"
+    # The space in the filename survives the NUL-delimited git exchange.
+    assert "archive/raw/big deck.pdf" in local_only.detail
+    assert "git-ignored" in local_only.detail
+    assert by_category["archive-orphan-record"].path == "lost.txt"
+
+
+@_needs_git
+def test_tracked_absent_source_is_still_an_orphan_record(tmp_path: Path) -> None:
+    """A file git tracks cannot be excused by an ignore rule that also
+    matches it: git answers from the index first, so a committed source
+    that vanished is still a real loss."""
+    paths = _git_vault(tmp_path, "/archive/raw/tracked.pdf\n")
+    raw = _write(paths.root, "archive/raw/tracked.pdf", "slides")
+    subprocess.run(
+        ["git", "-C", str(paths.root), "add", "-f", "archive/raw/tracked.pdf"],
+        check=True, capture_output=True,
+    )
+    raw.unlink()
+    append_record(paths.metadata_index_jsonl, _absent_source("tracked.pdf", "a" * 64))
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    assert report.counts == {"archive-orphan-record": 1}
+
+
+def test_absent_source_outside_a_git_repo_is_still_reported(tmp_path: Path) -> None:
+    """No repository to ask (an exported tree, a plain directory): the
+    ignore rules cannot be trusted, so the absent source stays a finding."""
+    paths = paths_for_root(tmp_path)
+    paths.ensure()
+    _write(paths.root, ".gitignore", "/archive/raw/lost.txt\n")
+    append_record(paths.metadata_index_jsonl, _absent_source("lost.txt", "a" * 64))
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    assert report.counts == {"archive-orphan-record": 1}
+
+
+@_needs_git
+def test_absent_git_binary_leaves_absent_sources_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git not installed: the sweep neither crashes nor excuses anything."""
+    paths = _git_vault(tmp_path, "/archive/raw/lost.txt\n")
+    append_record(paths.metadata_index_jsonl, _absent_source("lost.txt", "a" * 64))
+    monkeypatch.setenv("PATH", "")
+
+    report = run_sweep(paths, logger=_LOG, as_of=AS_OF)
+
+    assert report.counts == {"archive-orphan-record": 1}
+
+
+def test_gitignore_inbox_rule_is_anchored() -> None:
+    """The drop-zone rule must ignore only the top-level inbox/. An unanchored
+    ``inbox/`` also swallowed knowledge/assistant/inbox/, the fact inbox every
+    proposer and agent writes into, so new proposals landed untracked."""
+    root = Path(__file__).resolve().parents[1]
+    rules = [ln.strip() for ln in (root / ".gitignore").read_text().splitlines()]
+    assert "/inbox/" in rules
+    assert "inbox/" not in rules

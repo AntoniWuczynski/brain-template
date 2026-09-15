@@ -72,6 +72,12 @@ def _mineru_on_path() -> bool:
     return shutil.which("mineru") is not None
 
 
+def mineru_available() -> bool:
+    """Whether the ``mineru`` CLI is on PATH (public for callers that want
+    to warn up-front, e.g. the ingest CLI's run summary)."""
+    return _mineru_on_path()
+
+
 # --------------------------------------------------------------------------
 # MinerU implementation (CLI-based)
 # --------------------------------------------------------------------------
@@ -245,7 +251,7 @@ def _locate_mineru_outputs(tmp_root: Path, stem: str) -> tuple[Path | None, Path
 def _default_device() -> str:
     """Pick a sensible default device. User can override via MINERU_DEVICE_MODE."""
     try:
-        import torch  # type: ignore[import-not-found]
+        import torch
     except ImportError:
         return "cpu"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -261,8 +267,8 @@ def _default_device() -> str:
 
 def _extract_with_pypdf(src: Path) -> ExtractionResult:
     try:
-        from pypdf import PdfReader  # type: ignore[import-not-found]
-        from pypdf.errors import PdfReadError  # type: ignore[import-not-found]
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
     except ImportError as exc:
         return ExtractionResult(
             status="manual_review",

@@ -6,9 +6,11 @@ and fast. Timeouts are kept tight; the whole module adds a few seconds.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 # mcp_server is not an installed package (only ingest_lib is). The full
@@ -59,7 +61,7 @@ def _bare_head(bare: Path) -> str | None:
         return None  # branch not pushed yet
 
 
-def _wait_for(cond, timeout: float = 8.0, interval: float = 0.02) -> bool:
+def _wait_for(cond: Callable[[], bool], timeout: float = 8.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if cond():
@@ -138,3 +140,80 @@ def test_failure_retries_then_recovers_after_remote_fixed(tmp_path: Path) -> Non
         assert status["last_error"] is None
     finally:
         worker.stop(flush_seconds=1.0)
+
+
+def test_startup_push_flushes_a_commit_stranded_by_a_crash(tmp_path: Path) -> None:
+    """AUD-040: a commit left unpushed by a crash must reach the remote when
+    the worker is next constructed, without waiting for another write."""
+    work, bare = _make_repos(tmp_path)
+    stranded = _commit(work, "stranded.md")
+    worker = PushWorker(work, remote="origin", branch="main", enabled=True)
+    try:
+        # No request_push() call: construction alone must flush the branch.
+        assert _wait_for(lambda: _bare_head(bare) == stranded), \
+            "startup never pushed the stranded commit"
+        assert _wait_for(lambda: worker.status()["state"] == "idle")
+    finally:
+        worker.stop(flush_seconds=1.0)
+
+
+# AUD-099: a vault that has silently stopped being backed up must show up
+# somewhere a human or an agent looks. status() is not exposed over MCP, so
+# the audit log is the surface.
+
+def _audit_rows(work: Path) -> list[dict[str, object]]:
+    path = work / "logs" / "mcp-audit.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            parsed: dict[str, object] = json.loads(line)
+            rows.append(parsed)
+    return rows
+
+
+def _push_outcomes(work: Path) -> list[object]:
+    return [r["outcome"] for r in _audit_rows(work) if r["tool"] == "push"]
+
+
+def test_repeated_push_failures_are_audited_and_the_alarm_clears(tmp_path: Path) -> None:
+    work, bare = _make_repos(tmp_path)
+    missing = tmp_path / "missing.git"
+    _git(work, "remote", "set-url", "origin", str(missing))
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(0.02,),
+    )
+    try:
+        sha = _git(work, "rev-parse", "HEAD")
+        assert _wait_for(lambda: "failing" in _push_outcomes(work)), \
+            "a run of failed pushes was never audited"
+        alarm = [r for r in _audit_rows(work) if r["outcome"] == "failing"][0]
+        assert alarm["agent"] == "system"
+        detail = alarm["detail"]
+        assert isinstance(detail, str) and str(missing) not in detail
+
+        # Only one alarm per run of failures, not one per retry.
+        assert _push_outcomes(work).count("failing") == 1
+
+        _git(work, "remote", "set-url", "origin", str(bare))
+        assert _wait_for(lambda: _bare_head(bare) == sha), "push never recovered"
+        assert _wait_for(lambda: "recovered" in _push_outcomes(work)), \
+            "recovery was never audited"
+    finally:
+        worker.stop(flush_seconds=1.0)
+
+
+def test_final_flush_failure_at_shutdown_is_audited(tmp_path: Path) -> None:
+    work, _bare = _make_repos(tmp_path)
+    missing = tmp_path / "missing.git"
+    _git(work, "remote", "set-url", "origin", str(missing))
+    worker = PushWorker(
+        work, remote="origin", branch="main", enabled=True,
+        retry_schedule=(5.0,),
+    )
+    assert _wait_for(lambda: worker.status()["state"] == "retrying")
+    worker.stop(flush_seconds=0.5)
+    assert "unpushed" in _push_outcomes(work), \
+        "commits stranded by shutdown were not audited"

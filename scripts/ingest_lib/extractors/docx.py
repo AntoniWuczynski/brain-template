@@ -1,16 +1,30 @@
 """DOCX extractor (paragraphs + tables, in document order)."""
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from .base import ExtractionResult
 
 
+class _OxmlElement(Protocol):
+    """python-docx's ``Document`` itself is typed, but the underlying lxml
+    oxml element tree it exposes (``doc.element``) is not — only the
+    traversal surface this module actually walks."""
+    tag: str
+    text: str | None
+
+    def iterchildren(self) -> Iterator[_OxmlElement]: ...
+    def iter(self, tag: str) -> Iterator[_OxmlElement]: ...
+    def find(self, tag: str) -> _OxmlElement | None: ...
+    def findall(self, tag: str) -> list[_OxmlElement]: ...
+
+
 def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     try:
-        from docx import Document  # type: ignore[import-not-found]
-        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+        from docx import Document
+        from docx.oxml.ns import qn
     except ImportError as exc:
         return ExtractionResult(
             status="manual_review",
@@ -61,7 +75,9 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
     )
 
 
-def _walk_block_children(container, qn, parts: list[str]) -> None:
+def _walk_block_children(
+    container: _OxmlElement, qn: Callable[[str], str], parts: list[str]
+) -> None:
     """Append Markdown for a container's block children in document order.
 
     Descends into ``w:sdt`` content controls (TOCs, structured-document
@@ -81,15 +97,15 @@ def _walk_block_children(container, qn, parts: list[str]) -> None:
                 _walk_block_children(content, qn, parts)
 
 
-def _cell_text(cell, qn) -> str:
+def _cell_text(cell: _OxmlElement, qn: Callable[[str], str]) -> str:
     """Cell text, escaped for a Markdown table cell: a literal '|' would add
     a phantom column, a newline would break the row."""
     text = "".join(t.text or "" for t in cell.iter(qn("w:t"))).strip()
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def _table_to_markdown(tbl_elem) -> str:
-    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+def _table_to_markdown(tbl_elem: _OxmlElement) -> str:
+    from docx.oxml.ns import qn
 
     rows: list[list[str]] = []
     # DIRECT children only (findall, not iter): a nested table's rows/cells

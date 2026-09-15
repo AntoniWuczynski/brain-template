@@ -1,16 +1,23 @@
 """Unit tests for the deterministic concept-relationship logic.
 
-These cover the pure functions only — co-occurrence counting, semantic
-thresholding, and related-map ranking. The numpy/embeddings glue and the
-file I/O are exercised by running the real pipeline, not here.
+These cover the pure functions — co-occurrence counting, semantic
+thresholding, related-map ranking — plus the connections.jsonl writer's
+atomicity and row format. The numpy/embeddings glue is exercised by
+running the real pipeline, not here.
 """
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 
+import pytest
+
+from ingest_lib.config import paths_for_root
 from ingest_lib.connections import (
     Edge,
     Related,
+    _write_connections_jsonl,
     build_related_map,
     cooccurrence_edges,
     semantic_edges,
@@ -43,7 +50,7 @@ def _normalize(vec: tuple[float, ...]) -> tuple[float, ...]:
 # co-occurrence
 # ---------------------------------------------------------------------------
 
-def test_cooccurrence_counts_shared_topics_across_documents():
+def test_cooccurrence_counts_shared_topics_across_documents() -> None:
     recs = [
         _rec("a.md", ["Alpha", "Beta"]),
         _rec("b.md", ["Beta", "Gamma"]),
@@ -59,18 +66,18 @@ def test_cooccurrence_counts_shared_topics_across_documents():
     assert all(e.kind == "cooccurrence" for e in by_pair.values())
 
 
-def test_cooccurrence_edges_are_sorted_and_deterministic():
+def test_cooccurrence_edges_are_sorted_and_deterministic() -> None:
     edges = cooccurrence_edges([_rec("a.md", ["Zeta", "Alpha", "Mu"])])
     pairs = [(e.a, e.b) for e in edges]
     assert pairs == [("alpha", "mu"), ("alpha", "zeta"), ("mu", "zeta")]
 
 
-def test_single_or_zero_topic_documents_yield_no_edges():
+def test_single_or_zero_topic_documents_yield_no_edges() -> None:
     assert cooccurrence_edges([_rec("a.md", ["Solo"])]) == []
     assert cooccurrence_edges([_rec("a.md", [])]) == []
 
 
-def test_topic_case_and_punctuation_collapse_to_one_concept():
+def test_topic_case_and_punctuation_collapse_to_one_concept() -> None:
     recs = [
         _rec("a.md", ["Packet Switching", "TCP"]),
         _rec("b.md", ["packet-switching", "TCP"]),
@@ -79,7 +86,7 @@ def test_topic_case_and_punctuation_collapse_to_one_concept():
     assert by_pair[("packet-switching", "tcp")].weight == 2.0
 
 
-def test_duplicate_topic_within_one_document_does_not_inflate_weight():
+def test_duplicate_topic_within_one_document_does_not_inflate_weight() -> None:
     # Same concept twice in one doc (case drift) must not create a self-pair
     # or double-count.
     recs = [_rec("a.md", ["Graphs", "graphs", "Trees"])]
@@ -92,7 +99,7 @@ def test_duplicate_topic_within_one_document_does_not_inflate_weight():
 # semantic (cosine on normalized concept vectors)
 # ---------------------------------------------------------------------------
 
-def test_semantic_edges_link_nearest_neighbours_above_floor():
+def test_semantic_edges_link_nearest_neighbours_above_floor() -> None:
     vecs = {
         "a": _normalize((1.0, 0.0)),
         "b": _normalize((0.99, 0.05)),   # very close to a
@@ -106,7 +113,7 @@ def test_semantic_edges_link_nearest_neighbours_above_floor():
     assert all(e.kind == "semantic" for e in edges)
 
 
-def test_semantic_edges_keep_only_top_k_per_concept():
+def test_semantic_edges_keep_only_top_k_per_concept() -> None:
     # Collinear-ish points on a line: a closest to b, b to a/c, c to b/d, d to c.
     vecs = {
         "a": _normalize((1.0, 0.0)),
@@ -122,7 +129,7 @@ def test_semantic_edges_keep_only_top_k_per_concept():
     assert ("a", "d") not in pairs       # never mutual-nearest
 
 
-def test_semantic_edges_carry_cosine_weight_and_are_sorted():
+def test_semantic_edges_carry_cosine_weight_and_are_sorted() -> None:
     vecs = {"a": _normalize((1.0, 0.0)), "b": _normalize((1.0, 0.0))}
     edges = semantic_edges(vecs, top_k=5, min_cosine=0.0)
     assert [(e.a, e.b) for e in edges] == [("a", "b")]
@@ -135,7 +142,7 @@ def test_semantic_edges_carry_cosine_weight_and_are_sorted():
 # related-map ranking
 # ---------------------------------------------------------------------------
 
-def test_related_map_merges_signals_and_ranks_multi_signal_first():
+def test_related_map_merges_signals_and_ranks_multi_signal_first() -> None:
     edges = [
         Edge("a", "b", "cooccurrence", 3.0, ("x.md",)),
         Edge("a", "b", "semantic", 0.9, ()),
@@ -155,7 +162,7 @@ def test_related_map_merges_signals_and_ranks_multi_signal_first():
     assert rel["c"][0].slug == "a"
 
 
-def test_related_map_caps_neighbors_to_top_n():
+def test_related_map_caps_neighbors_to_top_n() -> None:
     edges = [
         Edge("a", "b", "cooccurrence", 5.0, ()),
         Edge("a", "c", "cooccurrence", 3.0, ()),
@@ -165,8 +172,55 @@ def test_related_map_caps_neighbors_to_top_n():
     assert [r.slug for r in rel["a"]] == ["b", "c"]
 
 
-def test_related_falls_back_to_slug_when_display_missing():
+def test_related_falls_back_to_slug_when_display_missing() -> None:
     edges = [Edge("a", "b", "cooccurrence", 1.0, ())]
     rel = build_related_map(edges, {}, top_n=5)
     assert rel["a"][0].display == "b"
     assert isinstance(rel["a"][0], Related)
+
+
+# ---------------------------------------------------------------------------
+# metadata/connections.jsonl writer (AUD-079: shared atomic helper)
+# ---------------------------------------------------------------------------
+
+def test_connections_jsonl_write_is_interrupt_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer used to clean up in `except Exception`, which does not catch
+    KeyboardInterrupt: a Ctrl-C between mkstemp and os.replace left a
+    `.connections-*.jsonl` in metadata/ for the next run to trip over."""
+    paths = paths_for_root(tmp_path)
+    paths.metadata.mkdir(parents=True)
+
+    def interrupt(src: object, dst: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _write_connections_jsonl(paths, [Edge("a", "b", "cooccurrence", 1.0, ())])
+
+    assert list(paths.metadata.iterdir()) == []
+
+
+def test_connections_jsonl_rows_are_unchanged_by_the_shared_writer(tmp_path: Path) -> None:
+    """Buffering the rows instead of streaming them into the temp file must
+    not move a byte: untyped kinds keep the five-key shape, typed lines alone
+    carry rel/valid_from/valid_until, and the ordering is the sort key."""
+    paths = paths_for_root(tmp_path)
+    paths.metadata.mkdir(parents=True)
+    _write_connections_jsonl(
+        paths,
+        [
+            Edge("z/1", "y/2", "typed", 1.0, ("k/z.md",), "works_at", "2020-01-01", ""),
+            Edge("a", "b", "cooccurrence", 2.0, ("archive/processed/d.md",)),
+        ],
+    )
+
+    written = (paths.metadata / "connections.jsonl").read_text(encoding="utf-8")
+    assert written == (
+        '{"a": "a", "b": "b", "kind": "cooccurrence", '
+        '"sources": ["archive/processed/d.md"], "weight": 2.0}\n'
+        '{"a": "z/1", "b": "y/2", "kind": "typed", "rel": "works_at", '
+        '"sources": ["k/z.md"], "valid_from": "2020-01-01", "valid_until": "", '
+        '"weight": 1.0}\n'
+    )

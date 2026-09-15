@@ -32,12 +32,15 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .config import VaultPaths
 from .hashing import sha256_of
 from .metadata import IndexRecord, latest_records_by_path
-from .notes import _atomic_write
+from .notes import _atomic_write, md_cell
+
+if TYPE_CHECKING:
+    from .pipeline import IngestStats
 
 _AUTO_START = "<!-- AUTO-GENERATED-START -->"
 _AUTO_END = "<!-- AUTO-GENERATED-END -->"
@@ -57,6 +60,7 @@ class StatusStats:
     inbox_pending: int = 0
     inbox_ingested: int = 0
     needs_review: int = 0
+    summary_failed: int = 0
     written_paths: tuple[str, ...] = ()
 
 
@@ -70,21 +74,55 @@ def _table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
         "| " + " | ".join("---" for _ in header) + " |",
     ]
     for r in rows:
-        out.append("| " + " | ".join(_cell(c) for c in r) + " |")
+        out.append("| " + " | ".join(md_cell(c) for c in r) + " |")
     return out
 
 
-def _cell(text: str) -> str:
-    return " ".join(str(text).split()).replace("|", "\\|")
+def _scan_inbox(paths: VaultPaths) -> list[tuple[str, str | None]]:
+    """``(inbox-relative path, sha256 or None if unreadable)`` for every inbox
+    file, sorted. Both dashboards need it, and hashing a multi-GB inbox mirror
+    twice per run doubled the cost of a single-file drop — so scan once and
+    hand the result to each renderer."""
+    out: list[tuple[str, str | None]] = []
+    if not paths.inbox.is_dir():
+        return out
+    for f in sorted(paths.inbox.rglob("*")):
+        if not f.is_file() or f.name == ".DS_Store" or f.name.startswith("._"):
+            continue
+        rel = f.relative_to(paths.inbox).as_posix()
+        try:
+            out.append((rel, sha256_of(f)))
+        except OSError:
+            out.append((rel, None))
+    return out
 
 
-def _dashboard_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]:
+def _summary_failed(records: list[IndexRecord]) -> int:
+    """Records whose summariser call failed: `processed`, no summary, and the
+    note ``_maybe_summarize`` leaves behind. They are never revisited by
+    ingestion (idempotency skips a processed record), so without a count here
+    nothing tells the operator to run ``--backfill-summaries``."""
+    return sum(
+        1
+        for r in records
+        if r.status == "processed"
+        and not r.summary
+        and any(n.startswith("summary: skipped") for n in r.notes)
+    )
+
+
+def _dashboard_body(
+    paths: VaultPaths,
+    records: list[IndexRecord],
+    *,
+    inbox: list[tuple[str, str | None]],
+) -> tuple[str, dict[str, int]]:
     by_status = Counter(r.status for r in records)
     by_extractor = Counter(r.extractor for r in records)
     by_ext = Counter(r.extension for r in records)
 
     # Per-folder counts (the containing directory of each source).
-    folder_status: dict[str, Counter] = {}
+    folder_status: dict[str, Counter[str]] = {}
     for r in records:
         folder = str(Path(r.relative_path).parent) or "."
         folder_status.setdefault(folder, Counter())[r.status] += 1
@@ -122,23 +160,15 @@ def _dashboard_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str,
     known_hashes = {r.source_hash for r in records}
     pending_rows: list[tuple[str, ...]] = []
     pending = ingested = 0
-    total_inbox = 0
-    if paths.inbox.is_dir():
-        for f in sorted(paths.inbox.rglob("*")):
-            if not f.is_file() or f.name == ".DS_Store" or f.name.startswith("._"):
-                continue
-            total_inbox += 1
-            rel = f.relative_to(paths.inbox).as_posix()
-            try:
-                h = sha256_of(f)
-            except OSError:
-                pending_rows.append((rel, "unreadable"))
-                continue
-            if h in known_hashes:
-                ingested += 1
-            else:
-                pending_rows.append((rel, "pending"))
-                pending += 1
+    total_inbox = len(inbox)
+    for rel, h in inbox:
+        if h is None:
+            pending_rows.append((rel, "unreadable"))
+        elif h in known_hashes:
+            ingested += 1
+        else:
+            pending_rows.append((rel, "pending"))
+            pending += 1
     lines += ["", f"## Inbox ({pending} pending, {ingested} already ingested)", ""]
     if total_inbox == 0:
         lines += ["_(inbox is empty)_"]
@@ -203,7 +233,12 @@ def _unconsolidated_fact_count(paths: VaultPaths) -> int:
     return sum(1 for f in inbox.glob("*.md") if f.is_file())
 
 
-def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]:
+def _now_body(
+    paths: VaultPaths,
+    records: list[IndexRecord],
+    *,
+    inbox: list[tuple[str, str | None]],
+) -> tuple[str, dict[str, int]]:
     """A landing view: what's recent and what needs attention. Derived from
     ``index.jsonl`` + the filesystem (``created_at`` is a stable record field),
     so a rebuild over unchanged state is a byte-for-byte no-op."""
@@ -215,18 +250,11 @@ def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]
     needs_review = sum(1 for r in records if r.status in ("partial", "manual_review"))
     unconsolidated = _unconsolidated_fact_count(paths)
 
-    # Inbox pending (files not yet matching an ingested hash).
+    # Inbox pending (files not yet matching an ingested hash; an unreadable
+    # file counts as pending too).
     known_hashes = {r.source_hash for r in records}
-    pending = 0
-    if paths.inbox.is_dir():
-        for f in paths.inbox.rglob("*"):
-            if not f.is_file() or f.name == ".DS_Store" or f.name.startswith("._"):
-                continue
-            try:
-                if sha256_of(f) not in known_hashes:
-                    pending += 1
-            except OSError:
-                pending += 1
+    pending = sum(1 for _rel, h in inbox if h is None or h not in known_hashes)
+    summary_failed = _summary_failed(records)
 
     lines: list[str] = ["## Needs attention", ""]
     lines += _table(
@@ -236,6 +264,8 @@ def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]
             ("Inbox files pending ingestion", str(pending), "[[Processing Dashboard]]"),
             ("Assistant facts unconsolidated", str(unconsolidated),
              "`knowledge/assistant/inbox/`"),
+            ("Sources whose summary failed", str(summary_failed),
+             "`uv run python scripts/ingest.py --backfill-summaries`"),
         ],
     )
 
@@ -250,7 +280,7 @@ def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]
         lines += ["_(no sources ingested yet — drop files in `inbox/` and run ingest.)_"]
 
     # At a glance: total + by top-level folder.
-    by_top: Counter = Counter()
+    by_top: Counter[str] = Counter()
     for r in records:
         top = Path(r.relative_path).parts[0] if Path(r.relative_path).parts else "."
         by_top[top] += 1
@@ -260,7 +290,11 @@ def _now_body(paths: VaultPaths, records: list[IndexRecord]) -> tuple[str, dict]
         [(k, str(v)) for k, v in sorted(by_top.items())],
     )
 
-    return "\n".join(lines), {"needs_review": needs_review, "inbox_pending": pending}
+    return "\n".join(lines), {
+        "needs_review": needs_review,
+        "inbox_pending": pending,
+        "summary_failed": summary_failed,
+    }
 
 
 def _retry_command(r: IndexRecord) -> str:
@@ -335,9 +369,10 @@ def rebuild_status(paths: VaultPaths, *, logger: logging.Logger) -> StatusStats:
     paths.ensure()
     records = list(latest_records_by_path(paths.metadata_index_jsonl).values())
 
-    dash_body, counts = _dashboard_body(paths, records)
+    inbox = _scan_inbox(paths)
+    dash_body, counts = _dashboard_body(paths, records, inbox=inbox)
     review_body, needs = _review_body(paths, records)
-    now_body, _now_counts = _now_body(paths, records)
+    now_body, now_counts = _now_body(paths, records, inbox=inbox)
 
     dash_target = paths.knowledge_index / _DASHBOARD_NAME
     review_target = paths.knowledge_index / _REVIEW_NAME
@@ -368,11 +403,12 @@ def rebuild_status(paths: VaultPaths, *, logger: logging.Logger) -> StatusStats:
         inbox_pending=counts["inbox_pending"],
         inbox_ingested=counts["inbox_ingested"],
         needs_review=needs,
+        summary_failed=now_counts["summary_failed"],
         written_paths=tuple(written_paths),
     )
 
 
-def retry_partial(paths: VaultPaths, *, logger: logging.Logger, dry_run: bool):
+def retry_partial(paths: VaultPaths, *, logger: logging.Logger, dry_run: bool) -> IngestStats:
     """Re-run extraction for every ``partial`` record (e.g. after installing
     MinerU). archive/processed is regenerable, so this is contract-safe."""
     from .pipeline import plan_ingest, run_ingest  # local: avoid import cycle

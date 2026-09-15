@@ -8,22 +8,30 @@ torch, or a vision API.
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
 
+import pytest
 
 from ingest_lib.extractors.base import fence
 from ingest_lib.extractors import dataset as ds
 from ingest_lib.extractors import text as text_ex
+from ingest_lib.notes import NoteContent, write_index_note
+
+if TYPE_CHECKING:
+    from types import SimpleNamespace
+    from google.genai.types import FinishReason
 
 
 # --------------------------------------------------------------- fence()
 
-def test_fence_plain_uses_three_backticks():
+def test_fence_plain_uses_three_backticks() -> None:
     out = fence("hello", "py")
     assert out == "```py\nhello\n```"
 
 
-def test_fence_grows_past_inner_backtick_run():
+def test_fence_grows_past_inner_backtick_run() -> None:
     # Content containing ``` must be wrapped in a LONGER fence, else it
     # closes early.
     content = "before\n```\ninner\n```\nafter"
@@ -36,7 +44,7 @@ def test_fence_grows_past_inner_backtick_run():
 
 # ---------------------------------------------------------------- text.py
 
-def test_text_extractor_survives_embedded_code_fence(tmp_path: Path):
+def test_text_extractor_survives_embedded_code_fence(tmp_path: Path) -> None:
     src = tmp_path / "note.md"
     src.write_text("# Title\n\n```python\nprint('x')\n```\n", encoding="utf-8")
     res = text_ex.extract(src, tmp_path / "assets")
@@ -46,7 +54,7 @@ def test_text_extractor_survives_embedded_code_fence(tmp_path: Path):
     assert "print('x')" in res.markdown
 
 
-def test_text_extractor_byte_cap_is_true_bytes(tmp_path: Path, monkeypatch):
+def test_text_extractor_byte_cap_is_true_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(text_ex, "_MAX_BYTES", 8)
     src = tmp_path / "big.txt"
     src.write_text("abcdefghijklmnop", encoding="utf-8")  # 16 bytes
@@ -57,7 +65,7 @@ def test_text_extractor_byte_cap_is_true_bytes(tmp_path: Path, monkeypatch):
 
 # ------------------------------------------------------------- dataset.py
 
-def test_dataset_csv_escapes_pipe_in_header(tmp_path: Path):
+def test_dataset_csv_escapes_pipe_in_header(tmp_path: Path) -> None:
     src = tmp_path / "d.csv"
     src.write_text("price|usd,name\n10,widget\n", encoding="utf-8")
     res = ds.extract(src, tmp_path / "a")
@@ -66,7 +74,7 @@ def test_dataset_csv_escapes_pipe_in_header(tmp_path: Path):
     assert "price\\|usd" in res.markdown
 
 
-def test_dataset_jsonl_marks_partial_on_unparseable_lines(tmp_path: Path):
+def test_dataset_jsonl_marks_partial_on_unparseable_lines(tmp_path: Path) -> None:
     src = tmp_path / "d.jsonl"
     src.write_text('{"a": 1}\nnot json\n{"a": 2}\n', encoding="utf-8")
     res = ds.extract(src, tmp_path / "a")
@@ -75,7 +83,7 @@ def test_dataset_jsonl_marks_partial_on_unparseable_lines(tmp_path: Path):
     assert "**Records:** 2" in res.markdown
 
 
-def test_dataset_csv_strips_excel_bom_from_header(tmp_path: Path):
+def test_dataset_csv_strips_excel_bom_from_header(tmp_path: Path) -> None:
     # Excel's "CSV UTF-8" export prepends a BOM; it must not leak into the
     # first column name of the schema table.
     src = tmp_path / "d.csv"
@@ -86,7 +94,7 @@ def test_dataset_csv_strips_excel_bom_from_header(tmp_path: Path):
     assert "﻿" not in res.markdown
 
 
-def test_dataset_jsonl_bom_does_not_drop_first_record(tmp_path: Path):
+def test_dataset_jsonl_bom_does_not_drop_first_record(tmp_path: Path) -> None:
     src = tmp_path / "d.jsonl"
     src.write_bytes(b'\xef\xbb\xbf{"a": 1}\n{"a": 2}\n')
     res = ds.extract(src, tmp_path / "a")
@@ -95,7 +103,7 @@ def test_dataset_jsonl_bom_does_not_drop_first_record(tmp_path: Path):
     assert "**Records:** 2" in res.markdown
 
 
-def test_dataset_csv_quoted_crlf_cell_stays_on_one_preview_row(tmp_path: Path):
+def test_dataset_csv_quoted_crlf_cell_stays_on_one_preview_row(tmp_path: Path) -> None:
     # A quoted multiline cell (Excel Alt+Enter) reaches _clip with \r\n
     # intact; a bare CR surviving into the note splits the table row.
     src = tmp_path / "d.csv"
@@ -106,7 +114,7 @@ def test_dataset_csv_quoted_crlf_cell_stays_on_one_preview_row(tmp_path: Path):
     assert "| alice | line1 line2 |" in res.markdown
 
 
-def test_dataset_csv_oversized_field_is_manual_review(tmp_path: Path):
+def test_dataset_csv_oversized_field_is_manual_review(tmp_path: Path) -> None:
     import csv
     src = tmp_path / "d.csv"
     big = "x" * (csv.field_size_limit() + 10)
@@ -114,6 +122,174 @@ def test_dataset_csv_oversized_field_is_manual_review(tmp_path: Path):
     res = ds.extract(src, tmp_path / "a")
     assert res.status == "manual_review"
     assert "csv parse failed" in (res.error or "")
+
+
+# ------------------------------------------------------------- notebook.py
+
+def _nb_json(cells: list[dict[str, object]], *, language: str = "python") -> str:
+    # `id` on every cell: nbformat >= 5.1 warns (and will eventually error)
+    # on v4.5 cells without one.
+    stamped = [{**c, "id": f"c{i}"} for i, c in enumerate(cells)]
+    return json.dumps({
+        "cells": stamped,
+        "metadata": {"kernelspec": {"language": language, "name": language}},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    })
+
+
+def test_notebook_extracts_cells_and_reports_omitted_outputs(tmp_path: Path) -> None:
+    from ingest_lib.extractors import notebook as nb_ex
+    src = tmp_path / "analysis.ipynb"
+    src.write_text(_nb_json([
+        {"cell_type": "markdown", "metadata": {}, "source": "# Heading\n\ntext"},
+        {
+            "cell_type": "code", "metadata": {}, "execution_count": 1,
+            "source": "print('x')",
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": "x\n"},
+                {"output_type": "display_data", "metadata": {},
+                 "data": {"text/plain": "<Figure>"}},
+            ],
+        },
+        {"cell_type": "raw", "metadata": {}, "source": "raw body"},
+    ], language="julia"), encoding="utf-8")
+
+    res = nb_ex.extract(src, tmp_path / "assets")
+
+    assert res.status == "processed"
+    assert res.extractor == "notebook"
+    assert "# Heading" in res.markdown
+    # Code cells are fenced with the kernel language, raw cells bare.
+    assert "```julia\nprint('x')\n```" in res.markdown
+    assert "```\nraw body\n```" in res.markdown
+    # Honesty: outputs are dropped, and the note says exactly how many.
+    assert res.notes == [
+        "omitted 2 cell output(s) (images/text/streams) — see source notebook for them"
+    ]
+
+
+def test_notebook_without_outputs_adds_no_omission_note(tmp_path: Path) -> None:
+    from ingest_lib.extractors import notebook as nb_ex
+    src = tmp_path / "clean.ipynb"
+    src.write_text(_nb_json([
+        {"cell_type": "code", "metadata": {}, "execution_count": None,
+         "source": "y = 1", "outputs": []},
+    ]), encoding="utf-8")
+
+    res = nb_ex.extract(src, tmp_path / "assets")
+    assert res.status == "processed"
+    assert res.notes == []
+    assert "```python\ny = 1\n```" in res.markdown
+
+
+def test_notebook_v3_is_upgraded_in_memory(tmp_path: Path) -> None:
+    # v3 exposes `worksheets`, not `cells`: without as_version=4 this file
+    # would AttributeError instead of extracting.
+    from ingest_lib.extractors import notebook as nb_ex
+    src = tmp_path / "legacy.ipynb"
+    src.write_text(json.dumps({
+        "metadata": {"name": "legacy"},
+        "nbformat": 3,
+        "nbformat_minor": 0,
+        "worksheets": [{"cells": [
+            {"cell_type": "markdown", "source": ["old markdown"], "metadata": {}},
+            {"cell_type": "code", "language": "python", "collapsed": False,
+             "input": ["z = 2"], "outputs": [], "metadata": {}},
+        ], "metadata": {}}],
+    }), encoding="utf-8")
+
+    res = nb_ex.extract(src, tmp_path / "assets")
+    assert res.status == "processed"
+    assert "old markdown" in res.markdown
+    assert "z = 2" in res.markdown
+
+
+def test_notebook_corrupt_file_is_manual_review(tmp_path: Path) -> None:
+    from ingest_lib.extractors import notebook as nb_ex
+    src = tmp_path / "broken.ipynb"
+    src.write_text("{not json at all", encoding="utf-8")
+
+    res = nb_ex.extract(src, tmp_path / "assets")
+    assert res.status == "manual_review"
+    assert res.extractor == "notebook"
+    assert res.markdown == ""
+    assert (res.error or "").startswith("open failed:")
+
+
+def test_notebook_missing_nbformat_is_manual_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # nbformat is a declared dependency, but the extractor still has to
+    # degrade honestly rather than crash the run if it is not importable.
+    import builtins
+    from collections.abc import Mapping, Sequence
+    from types import ModuleType
+
+    from ingest_lib.extractors import notebook as nb_ex
+    real_import = builtins.__import__
+
+    def no_nbformat(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "nbformat":
+            raise ImportError("no module named nbformat")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", no_nbformat)
+    src = tmp_path / "x.ipynb"
+    src.write_text(_nb_json([]), encoding="utf-8")
+    res = nb_ex.extract(src, tmp_path / "assets")
+    assert res.status == "manual_review"
+    assert "nbformat missing" in (res.error or "")
+
+
+# --------------------------------------------------- registry / parquet stub
+
+def test_notebook_and_dataset_extensions_are_registered() -> None:
+    from ingest_lib.extractors import dispatch_extractor, registered_extensions
+    from ingest_lib.extractors import notebook as nb_ex
+    assert dispatch_extractor(Path("a.ipynb")) is nb_ex.extract
+    assert dispatch_extractor(Path("A.IPYNB")) is nb_ex.extract
+    assert dispatch_extractor(Path("rows.csv")) is ds.extract
+    assert dispatch_extractor(Path("cube.parquet")) is ds.extract_parquet_stub
+    # Nothing is registered for an unknown extension.
+    assert dispatch_extractor(Path("x.unknownext")) is None
+
+    exts = registered_extensions()
+    assert exts == sorted(exts) and len(exts) == len(set(exts))
+    assert {".ipynb", ".csv", ".tsv", ".jsonl", ".parquet", ".pdf"} <= set(exts)
+    assert all(e.startswith(".") and e == e.lower() for e in exts)
+
+
+def test_parquet_stub_is_honest_manual_review(tmp_path: Path) -> None:
+    src = tmp_path / "cube.parquet"
+    src.write_bytes(b"PAR1" + b"\0" * 12)
+    res = ds.extract_parquet_stub(src, tmp_path / "assets")
+    assert res.status == "manual_review"
+    assert res.extractor == "dataset-parquet"
+    assert res.error == "parquet extractor not implemented"
+    assert res.notes == ["file size: 16 bytes"]
+    # No invented content: the markdown says only that it is unimplemented.
+    assert "not implemented yet" in res.markdown
+
+
+def test_parquet_stub_reports_a_failed_stat(tmp_path: Path) -> None:
+    res = ds.extract_parquet_stub(tmp_path / "gone.parquet", tmp_path / "assets")
+    assert res.status == "manual_review"
+    assert len(res.notes) == 1 and res.notes[0].startswith("stat failed:")
+
+
+def test_dataset_extract_rejects_an_unrecognised_extension(tmp_path: Path) -> None:
+    src = tmp_path / "rows.dat"
+    src.write_text("a,b\n", encoding="utf-8")
+    res = ds.extract(src, tmp_path / "assets")
+    assert res.status == "manual_review"
+    assert res.error == "unrecognised dataset extension: .dat"
 
 
 # ------------------------------------------------------- docx (D8/F110)
@@ -124,7 +300,7 @@ _PNG = base64.b64decode(
 )
 
 
-def test_docx_extracts_table_and_flags_embedded_image(tmp_path: Path):
+def test_docx_extracts_table_and_flags_embedded_image(tmp_path: Path) -> None:
     from docx import Document
     from docx.oxml import OxmlElement
     doc = Document()
@@ -153,7 +329,7 @@ def test_docx_extracts_table_and_flags_embedded_image(tmp_path: Path):
 
 # ------------------------------------------------------- pptx (D8/F036)
 
-def test_pptx_extracts_table_and_flags_picture(tmp_path: Path):
+def test_pptx_extracts_table_and_flags_picture(tmp_path: Path) -> None:
     from pptx import Presentation
     from pptx.util import Inches
     prs = Presentation()
@@ -181,29 +357,29 @@ def test_pptx_extracts_table_and_flags_picture(tmp_path: Path):
 
 # ------------------------------------------------------------------ vlm.py
 
-def _gemini_resp(text, finish_reason):
+def _gemini_resp(text: str, finish_reason: FinishReason) -> SimpleNamespace:
     from types import SimpleNamespace
     return SimpleNamespace(
         text=text, candidates=[SimpleNamespace(finish_reason=finish_reason)]
     )
 
 
-def _patch_gemini(monkeypatch, resp):
+def _patch_gemini(monkeypatch: pytest.MonkeyPatch, resp: SimpleNamespace) -> None:
     from google import genai
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
     class FakeModels:
-        def generate_content(self, **_kw):
+        def generate_content(self, **_kw: object) -> SimpleNamespace:
             return resp
 
     class FakeClient:
-        def __init__(self, **_kw):
+        def __init__(self, **_kw: object) -> None:
             self.models = FakeModels()
 
     monkeypatch.setattr(genai, "Client", FakeClient)
 
 
-def test_vlm_gemini_blank_page_is_success_not_failure(monkeypatch):
+def test_vlm_gemini_blank_page_is_success_not_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     # Contract (stated three times in vlm.py): "" == blank page (success),
     # None only on failure. The gemini helper must not coerce "" to None.
     from google.genai import types
@@ -216,7 +392,7 @@ def test_vlm_gemini_blank_page_is_success_not_failure(monkeypatch):
     assert res.truncated is False
 
 
-def test_vlm_gemini_reports_max_tokens_truncation(monkeypatch):
+def test_vlm_gemini_reports_max_tokens_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
     from google.genai import types
     from ingest_lib.extractors import vlm
 
@@ -228,7 +404,7 @@ def test_vlm_gemini_reports_max_tokens_truncation(monkeypatch):
     assert res.truncated is True
 
 
-def test_vlm_anthropic_reports_max_tokens_truncation(monkeypatch):
+def test_vlm_anthropic_reports_max_tokens_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
     import anthropic
     from types import SimpleNamespace
     from ingest_lib.extractors import vlm
@@ -237,11 +413,11 @@ def test_vlm_anthropic_reports_max_tokens_truncation(monkeypatch):
     resp = SimpleNamespace(content=[block], stop_reason="max_tokens")
 
     class FakeMessages:
-        def create(self, **_kw):
+        def create(self, **_kw: object) -> SimpleNamespace:
             return resp
 
     class FakeClient:
-        def __init__(self, **_kw):
+        def __init__(self, **_kw: object) -> None:
             self.messages = FakeMessages()
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
@@ -251,7 +427,7 @@ def test_vlm_anthropic_reports_max_tokens_truncation(monkeypatch):
     assert res.truncated is True
 
 
-def test_vlm_openai_reports_length_truncation(monkeypatch):
+def test_vlm_openai_reports_length_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
     import openai
     from types import SimpleNamespace
     from ingest_lib.extractors import vlm
@@ -265,11 +441,11 @@ def test_vlm_openai_reports_length_truncation(monkeypatch):
     )
 
     class FakeCompletions:
-        def create(self, **_kw):
+        def create(self, **_kw: object) -> SimpleNamespace:
             return resp
 
     class FakeClient:
-        def __init__(self, **_kw):
+        def __init__(self, **_kw: object) -> None:
             self.chat = SimpleNamespace(completions=FakeCompletions())
 
     monkeypatch.setattr(openai, "OpenAI", FakeClient)
@@ -280,14 +456,16 @@ def test_vlm_openai_reports_length_truncation(monkeypatch):
     assert res.truncated is True
 
 
-def test_vlm_extract_marks_truncated_pages_partial(monkeypatch, tmp_path: Path):
+def test_vlm_extract_marks_truncated_pages_partial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import vlm
 
     monkeypatch.setattr(_summ, "_select_provider", lambda: "anthropic")
     monkeypatch.setattr(vlm, "_render_pages", lambda _src: [b"p1", b"p2"])
 
-    def fake_transcribe(*, png, provider, model, page_no):
+    def fake_transcribe(
+        *, png: bytes, provider: str, model: str, page_no: int
+    ) -> vlm._VisionText | vlm._PageFailure:
         if page_no == 1:
             return vlm._VisionText("dense page", truncated=True)
         return vlm._VisionText("fine page", truncated=False)
@@ -304,7 +482,7 @@ def test_vlm_extract_marks_truncated_pages_partial(monkeypatch, tmp_path: Path):
     assert len(res.assets) == 2
 
 
-def test_vlm_extract_blank_page_stays_processed(monkeypatch, tmp_path: Path):
+def test_vlm_extract_blank_page_stays_processed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import vlm
 
@@ -320,7 +498,7 @@ def test_vlm_extract_blank_page_stays_processed(monkeypatch, tmp_path: Path):
     assert "_(blank page)_" in res.markdown
 
 
-def test_vlm_extract_all_failed_reports_first_cause(monkeypatch, tmp_path: Path):
+def test_vlm_extract_all_failed_reports_first_cause(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # When every page fails, the manual_review error must carry the first
     # page's underlying cause, not just a bare count — otherwise the failure
     # is undiagnosable from index.jsonl / the log.
@@ -345,7 +523,7 @@ def test_vlm_extract_all_failed_reports_first_cause(monkeypatch, tmp_path: Path)
     assert res.assets == []
 
 
-def test_vlm_extract_local_model_env_read_at_call_time(monkeypatch, tmp_path: Path):
+def test_vlm_extract_local_model_env_read_at_call_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # BRAIN_LOCAL_MODEL is read when extract() runs, not at import — setting it
     # after the module is imported must still be honoured (matches summarize).
     from ingest_lib import summarize as _summ
@@ -358,7 +536,7 @@ def test_vlm_extract_local_model_env_read_at_call_time(monkeypatch, tmp_path: Pa
 
     seen: dict[str, str] = {}
 
-    def fake_transcribe(*, png, provider, model, page_no):
+    def fake_transcribe(*, png: bytes, provider: str, model: str, page_no: int) -> vlm._VisionText:
         seen["model"] = model
         return vlm._VisionText("ok", truncated=False)
 
@@ -367,18 +545,35 @@ def test_vlm_extract_local_model_env_read_at_call_time(monkeypatch, tmp_path: Pa
     assert seen["model"] == "my-local-vision:custom"
 
 
-def test_mineru_output_handling_crash_degrades_to_manual_review(monkeypatch, tmp_path: Path):
+def test_vlm_anthropic_default_model_is_sonnet_5(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The anthropic vision default is pinned to the current Sonnet: same 1M
+    # context as sonnet-4-6 at a lower price. An unknown provider falls back
+    # to the same anthropic default.
+    from ingest_lib.extractors import vlm
+
+    monkeypatch.delenv("BRAIN_VLM_MODEL", raising=False)
+    assert vlm._default_vlm_model("anthropic") == "claude-sonnet-5"
+    assert vlm._default_vlm_model("nonesuch") == "claude-sonnet-5"
+
+
+def test_mineru_output_handling_crash_degrades_to_manual_review(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     # An unexpected exception while gathering MinerU's outputs must degrade to
     # manual_review (so extract() falls back to pypdf), not abort ingestion.
+    # Patched via the directly-imported `subprocess` module (the same module
+    # object `pdf.py` calls through), rather than `pdf.subprocess`, since the
+    # latter isn't an attribute `pdf` explicitly re-exports.
+    import subprocess
     from types import SimpleNamespace
     from ingest_lib.extractors import pdf
 
     monkeypatch.setattr(
-        pdf.subprocess, "run",
+        subprocess, "run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
 
-    def boom(*_a, **_k):
+    def boom(_tmp_root: Path, _stem: str) -> NoReturn:
         raise RuntimeError("locate exploded")
 
     monkeypatch.setattr(pdf, "_locate_mineru_outputs", boom)
@@ -399,7 +594,7 @@ def _png_bytes() -> bytes:
     return buf.getvalue()
 
 
-def test_image_extension_is_registered():
+def test_image_extension_is_registered() -> None:
     from ingest_lib.extractors import dispatch_extractor
     from ingest_lib.extractors import image as image_ex
     from pathlib import Path
@@ -407,7 +602,7 @@ def test_image_extension_is_registered():
     assert dispatch_extractor(Path("scan.HEIC")) is image_ex.extract
 
 
-def test_image_no_vision_provider_is_manual_review(tmp_path: Path, monkeypatch):
+def test_image_no_vision_provider_is_manual_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import image as image_ex
     monkeypatch.setattr(_summ, "_select_provider", lambda: None)
@@ -418,7 +613,7 @@ def test_image_no_vision_provider_is_manual_review(tmp_path: Path, monkeypatch):
     assert "no vision" in (res.error or "").lower()
 
 
-def test_image_transcription_becomes_processed(tmp_path: Path, monkeypatch):
+def test_image_transcription_becomes_processed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import image as image_ex
     from ingest_lib.extractors import vlm
@@ -434,7 +629,7 @@ def test_image_transcription_becomes_processed(tmp_path: Path, monkeypatch):
     assert "Sprint goals" in res.markdown
 
 
-def test_image_transcription_failure_is_manual_review(tmp_path: Path, monkeypatch):
+def test_image_transcription_failure_is_manual_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import image as image_ex
     from ingest_lib.extractors import vlm
@@ -450,7 +645,7 @@ def test_image_transcription_failure_is_manual_review(tmp_path: Path, monkeypatc
     assert "rate limited" in (res.error or "")
 
 
-def test_image_undecodable_file_is_manual_review(tmp_path: Path, monkeypatch):
+def test_image_undecodable_file_is_manual_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ingest_lib import summarize as _summ
     from ingest_lib.extractors import image as image_ex
     monkeypatch.setattr(_summ, "_select_provider", lambda: "anthropic")
@@ -463,7 +658,7 @@ def test_image_undecodable_file_is_manual_review(tmp_path: Path, monkeypatch):
 
 # ------------------------------------------------------------------ audio.py
 
-def test_srt_transcript_extracted(tmp_path: Path):
+def test_srt_transcript_extracted(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     srt = (
         "1\n00:00:01,000 --> 00:00:03,000\nHello and welcome.\n\n"
@@ -480,7 +675,7 @@ def test_srt_transcript_extracted(tmp_path: Path):
     assert "**[0:01]**" in res.markdown and "**[1:10]**" in res.markdown  # segment markers
 
 
-def test_vtt_with_tags_and_dot_times(tmp_path: Path):
+def test_vtt_with_tags_and_dot_times(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     vtt = (
         "WEBVTT\n\n"
@@ -495,7 +690,7 @@ def test_vtt_with_tags_and_dot_times(tmp_path: Path):
     assert "<v" not in res.markdown and "<b>" not in res.markdown
 
 
-def test_unparseable_subtitle_is_manual_review(tmp_path: Path):
+def test_unparseable_subtitle_is_manual_review(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     src = tmp_path / "bad.srt"
     src.write_text("this has no timing lines at all\n", encoding="utf-8")
@@ -504,16 +699,24 @@ def test_unparseable_subtitle_is_manual_review(tmp_path: Path):
     assert "no parseable subtitle cues" in (res.error or "")
 
 
-def test_audio_without_asr_backend_is_manual_review(tmp_path: Path, monkeypatch):
+def test_audio_without_asr_backend_is_manual_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # No faster-whisper installed -> honest manual_review with the install cmd.
     import builtins
+    from collections.abc import Mapping, Sequence
+    from types import ModuleType
     from ingest_lib.extractors import audio as audio_ex
     real_import = builtins.__import__
 
-    def _no_whisper(name, *args, **kw):
+    def _no_whisper(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] | None = (),
+        level: int = 0,
+    ) -> ModuleType:
         if name == "faster_whisper":
             raise ImportError("no faster_whisper")
-        return real_import(name, *args, **kw)
+        return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _no_whisper)
     src = tmp_path / "lecture.m4a"
@@ -523,7 +726,7 @@ def test_audio_without_asr_backend_is_manual_review(tmp_path: Path, monkeypatch)
     assert "faster-whisper" in (res.error or "") and "ffmpeg" in (res.error or "")
 
 
-def test_audio_extensions_registered():
+def test_audio_extensions_registered() -> None:
     from ingest_lib.extractors import dispatch_extractor
     from ingest_lib.extractors import audio as audio_ex
     from pathlib import Path as P
@@ -532,7 +735,7 @@ def test_audio_extensions_registered():
     assert dispatch_extractor(P("x.vtt")) is audio_ex.extract
 
 
-def test_vtt_note_and_header_blocks_skipped(tmp_path: Path):
+def test_vtt_note_and_header_blocks_skipped(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     vtt = (
         "WEBVTT\n\n"
@@ -547,7 +750,7 @@ def test_vtt_note_and_header_blocks_skipped(tmp_path: Path):
     assert "this is a comment" not in res.markdown   # NOTE block not a cue
 
 
-def test_subtitle_unparseable_timing_marks_partial(tmp_path: Path):
+def test_subtitle_unparseable_timing_marks_partial(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     srt = (
         "1\n00:00:01,000 --> 00:00:02,000\nGood cue.\n\n"
@@ -561,10 +764,78 @@ def test_subtitle_unparseable_timing_marks_partial(tmp_path: Path):
     assert "Good cue." in res.markdown
 
 
-def test_subtitle_tag_strip_keeps_literal_angle_brackets(tmp_path: Path):
+def test_subtitle_tag_strip_keeps_literal_angle_brackets(tmp_path: Path) -> None:
     from ingest_lib.extractors import audio as audio_ex
     srt = "1\n00:00:01,000 --> 00:00:02,000\nif x < 3 and y > 2 then done\n"
     src = tmp_path / "e.srt"
     src.write_text(srt, encoding="utf-8")
     res = audio_ex.extract(src, tmp_path / "a")
     assert "x < 3 and y > 2" in res.markdown           # not eaten as a tag
+
+
+# --------------------------------------------- write_index_note frontmatter merge
+
+def _note_content(*, status: str = "partial") -> NoteContent:
+    return NoteContent(
+        title="T",
+        source_relative_path="a/b.txt",
+        source_hash="h1",
+        status=status,
+        extracted_markdown="body",
+        processing_notes=[],
+        extractor="text",
+    )
+
+
+def test_reingest_over_unparseable_frontmatter_leaves_note_untouched(tmp_path: Path) -> None:
+    # F5: a hand-corrupted YAML block (unclosed bracket) must never be
+    # silently treated as "no user keys" and overwritten with generated
+    # frontmatter only — that discards every user-added key with no trace.
+    target = tmp_path / "note.md"
+    write_index_note(target=target, content=_note_content())
+    corrupted = target.read_text(encoding="utf-8").replace(
+        "aliases: []", "aliases: []\nmy_key: important user note\nbroken: [unclosed"
+    )
+    target.write_text(corrupted, encoding="utf-8")
+
+    write_index_note(target=target, content=_note_content())
+
+    assert target.read_text(encoding="utf-8") == corrupted
+
+
+def test_reingest_preserves_user_keys_when_frontmatter_is_valid(tmp_path: Path) -> None:
+    # Sanity check alongside the corruption case above: a *valid* user block
+    # is still merged in as before (rule 9's ordinary path is untouched).
+    target = tmp_path / "note.md"
+    write_index_note(target=target, content=_note_content())
+    edited = target.read_text(encoding="utf-8").replace(
+        "aliases: []", "aliases: []\nmy_key: important user note"
+    )
+    target.write_text(edited, encoding="utf-8")
+
+    write_index_note(target=target, content=_note_content())
+
+    assert "my_key: important user note" in target.read_text(encoding="utf-8")
+
+
+def test_reingest_preserves_user_scalar_spelling_not_yaml11_coercion(tmp_path: Path) -> None:
+    # F6: PyYAML is YAML 1.1 — round-tripping a user value through
+    # safe_load/safe_dump silently rewrites `yes` -> `true`, `010` -> `8`,
+    # `12:30` -> `750`, `0101` -> `65`. The user's keys are not owned by the
+    # pipeline, so their original source text must survive verbatim.
+    target = tmp_path / "note.md"
+    write_index_note(target=target, content=_note_content())
+    edited = target.read_text(encoding="utf-8").replace(
+        "aliases: []",
+        "aliases: []\ncourse: 0101\nmy_aliases: [yes, 010, 1e3, 12:30, 'Y']",
+    )
+    target.write_text(edited, encoding="utf-8")
+
+    write_index_note(target=target, content=_note_content())
+
+    text = target.read_text(encoding="utf-8")
+    assert "course: 0101" in text
+    assert "my_aliases: [yes, 010, 1e3, 12:30, 'Y']" in text
+    # None of the YAML 1.1 coercions leaked through.
+    assert "course: 65" not in text
+    assert "750" not in text

@@ -8,8 +8,10 @@ import json
 import logging
 from pathlib import Path
 
+import pytest
+
 from ingest_lib.concepts import rebuild_concepts
-from ingest_lib.config import paths_for_root
+from ingest_lib.config import VaultPaths, paths_for_root
 from ingest_lib.connections import rebuild_connections, related_concepts
 
 _LOG = logging.getLogger("test")
@@ -25,7 +27,7 @@ def _vault(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _ingested_record() -> dict:
+def _ingested_record() -> dict[str, object]:
     return {
         "relative_path": "uni/lec.txt",
         "source_hash": "a" * 64,
@@ -60,7 +62,7 @@ A randomness evaluation harness.
 """
 
 
-def _setup(tmp_path: Path):
+def _setup(tmp_path: Path) -> VaultPaths:
     root = _vault(tmp_path)
     (root / "metadata/index.jsonl").write_text(
         json.dumps(_ingested_record()) + "\n", encoding="utf-8"
@@ -112,7 +114,7 @@ def test_case_variant_topics_count_source_once(tmp_path: Path) -> None:
 
 
 def test_transient_read_error_does_not_remove_orphan_concepts(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = _setup(tmp_path)
     rebuild_concepts(paths, logger=_LOG)
@@ -123,10 +125,12 @@ def test_transient_read_error_does_not_remove_orphan_concepts(
     # orphan-removal pass must NOT treat its concepts as orphaned.
     real = Path.read_text
 
-    def flaky(self: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def flaky(
+        self: Path, encoding: str | None = None, errors: str | None = None,
+    ) -> str:
         if self.name == "randeval.md" and "knowledge/projects" in str(self):
             raise OSError(5, "simulated EIO")
-        return real(self, *args, **kwargs)
+        return real(self, encoding, errors)
 
     monkeypatch.setattr(Path, "read_text", flaky)
     rebuild_concepts(paths, logger=_LOG)

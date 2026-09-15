@@ -1,10 +1,11 @@
-"""All MCP tools, plus their input/output models.
+"""The six write MCP tools, plus shared infrastructure both this module
+and ``tools_read`` build on.
 
 The tools share helpers from this module's siblings (safety, git_ops,
-provenance) and reuse the ingest_lib package for search + metadata reads.
-Every tool takes ``(cfg, runtime, ...)``: cfg is pure env-derived data,
-runtime carries the stateful collaborators (audit log, async push
-worker, background index refresher).
+provenance) and reuse the ingest_lib package for metadata reads. Every
+tool takes ``(cfg, runtime, ...)``: cfg is pure env-derived data, runtime
+carries the stateful collaborators (audit log, async push worker,
+background index refresher).
 
 Each tool runs through this contract:
   1. Validate inputs (Pydantic does most of this).
@@ -17,6 +18,15 @@ Each tool runs through this contract:
 
 Errors raised from inside a tool are caught by FastMCP and surfaced
 as MCP error responses. No stack traces leak.
+
+The read tools (``vault_search``, ``vault_chunk_context``, ``vault_read``,
+``vault_list``, ``vault_metadata_query``, ``vault_related``) live in
+``mcp_server.tools_read``; this module keeps ``vault_create_note``,
+``vault_replace_note``, ``vault_append_to_note``,
+``vault_update_concept_user_section``, ``vault_update_compiled_truth``,
+``vault_drop_inbox_file``, the
+``WriteResult`` model, and the rate-bucket / write-commit primitives
+``tools_read`` and ``entity_tools``/``memory_tools`` import back from here.
 """
 from __future__ import annotations
 
@@ -25,29 +35,35 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # Make the ingest_lib package importable. Same shim the CLI scripts use.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from ingest_lib import (  # type: ignore[import-not-found]  # noqa: E402
-    chunks_for_source as _chunks_for_source,
-    latest_records_by_path as _latest_records_by_path,
-    paths_for_root as _paths_for_root,
-    related_concepts as _related_concepts,
-    semantic_search as _semantic_search,
+from ingest_lib.atomic import atomic_write_bytes  # noqa: E402
+from ingest_lib.dream import (  # noqa: E402 — one definition of the fence
+    COMPILED_TRUTH_END,
+    COMPILED_TRUTH_START,
+    compiled_truth_span,
+    marker_state,
 )
-from ingest_lib.knowledge import (  # type: ignore[import-not-found]  # noqa: E402
-    KNOWLEDGE_EXTRACTOR as _KNOWLEDGE_EXTRACTOR,
+from ingest_lib.notes import (  # noqa: E402
+    _split_frontmatter,
+    _split_frontmatter_raw,
 )
-from ingest_lib.notes import (  # type: ignore[import-not-found]  # noqa: E402
-    derived_note_relpath as _derived_note_relpath,
+from ingest_lib.relations import (  # noqa: E402
+    _HEADING_RE,
+    _LOG_HEADING,
+    Relation,
+    parse_relations,
 )
 
+from .errors import ToolError
 from .config import (
     MAX_INBOX_BYTES,
     MAX_NOTE_BYTES,
@@ -55,14 +71,13 @@ from .config import (
     ServerConfig,
     WRITE_RATE_PER_MINUTE,
 )
-from .git_ops import CommitOutcome, GitError, commit_paths
+from .git_ops import CommitOutcome, GitError, commit_paths, current_branch
 from .identity import current_agent
 from .provenance import frontmatter_signature, stamp_provenance
 from .runtime import Runtime
 from .safety import (
     SafetyError,
     resolve_inbox,
-    resolve_read,
     resolve_write_concept,
     resolve_write_under_allowlist,
 )
@@ -75,82 +90,44 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class _RateBucket:
-    """Sliding-window rate limiter. One instance for the whole server."""
+    """Sliding-window rate limiter. Per-agent windows: one deque per agent
+    name, so a runaway or compromised agent only starves its own budget."""
 
     def __init__(self, max_per_minute: int) -> None:
         self._max = max_per_minute
-        self._hits: deque[float] = deque()
+        self._hits: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
 
-    def allow(self) -> bool:
-        # Tool calls run in a threadpool; the deque must not be mutated
-        # from multiple workers concurrently.
+    def allow(self, key: str) -> bool:
+        # Tool calls run in a threadpool; the dict/deques must not be
+        # mutated from multiple workers concurrently.
         with self._lock:
             now = time.monotonic()
             cutoff = now - 60.0
-            while self._hits and self._hits[0] < cutoff:
-                self._hits.popleft()
-            if len(self._hits) >= self._max:
+            hits = self._hits.get(key)
+            if hits is not None:
+                while hits and hits[0] < cutoff:
+                    hits.popleft()
+                if not hits:
+                    # Window is clear: drop the empty deque so the dict
+                    # doesn't grow unboundedly across distinct agent names.
+                    del self._hits[key]
+                    hits = None
+            if hits is not None and len(hits) >= self._max:
                 return False
-            self._hits.append(now)
+            self._hits.setdefault(key, deque()).append(now)
             return True
 
 
 _write_bucket = _RateBucket(WRITE_RATE_PER_MINUTE)
-# Search runs a model encode + matmul in a threadpool worker; an
-# authenticated agent firing many searches could otherwise exhaust the
-# pool and wedge all tools. Plain reads are cheaper and get a higher
-# bucket of their own (_READ_RATE_PER_MINUTE below).
-_SEARCH_RATE_PER_MINUTE: int = 60
-_search_bucket = _RateBucket(_SEARCH_RATE_PER_MINUTE)
 
 
 def _rate_check_write() -> None:
-    if not _write_bucket.allow():
+    if not _write_bucket.allow(current_agent()):
         raise ToolError(
             f"write rate limit exceeded ({WRITE_RATE_PER_MINUTE}/minute); back off and retry"
         )
 
-
-def _rate_check_search() -> None:
-    if not _search_bucket.allow():
-        raise ToolError(
-            f"search rate limit exceeded ({_SEARCH_RATE_PER_MINUTE}/minute); back off and retry"
-        )
-
-
-_READ_RATE_PER_MINUTE: int = 120
-_read_bucket = _RateBucket(_READ_RATE_PER_MINUTE)
-
-
-def _rate_check_read() -> None:
-    if not _read_bucket.allow():
-        raise ToolError(
-            f"read rate limit exceeded ({_READ_RATE_PER_MINUTE}/minute); back off and retry"
-        )
-
-
-class _ConcurrencyGuard:
-    """Fail-fast bounded concurrency. Rate buckets cap calls-per-minute but
-    not how many run at once; without this a burst of slow ops (torch encode,
-    large reads) parks every threadpool worker and wedges all tools. Acquire
-    is non-blocking: over the limit, fail immediately rather than queue."""
-
-    def __init__(self, n: int, label: str) -> None:
-        self._sem = threading.BoundedSemaphore(n)
-        self._label = label
-
-    def __enter__(self) -> _ConcurrencyGuard:
-        if not self._sem.acquire(blocking=False):
-            raise ToolError(f"server busy ({self._label}); retry shortly")
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._sem.release()
-
-
-_search_guard = _ConcurrencyGuard(4, "search")
-_read_guard = _ConcurrencyGuard(8, "read")
 
 # Serializes the read-modify-write-commit critical section of every write
 # tool. Writes are rate-limited (30/min) and git is already serialized, so a
@@ -164,87 +141,8 @@ _write_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Tool error type — converted to MCP error by FastMCP automatically
-# ---------------------------------------------------------------------------
-
-class ToolError(Exception):
-    """Raised for any user-visible tool error (safety, size, rate, etc.)."""
-
-
-# ---------------------------------------------------------------------------
 # Input / output schemas
 # ---------------------------------------------------------------------------
-
-class SearchHitOut(BaseModel):
-    score: float
-    source_relative_path: str
-    title: str
-    chunk_idx: int
-    snippet: str
-
-
-class SearchOut(BaseModel):
-    hits: list[SearchHitOut]
-
-
-class ChunkOut(BaseModel):
-    chunk_idx: int
-    text: str
-    is_target: bool
-
-
-class ChunkContextOut(BaseModel):
-    source_relative_path: str
-    total_chunks: int
-    chunks: list[ChunkOut]
-
-
-class ReadOut(BaseModel):
-    path: str
-    content: str
-    size_bytes: int
-
-
-class ListEntry(BaseModel):
-    name: str
-    is_dir: bool
-    size_bytes: int | None = None
-
-
-class ListOut(BaseModel):
-    path: str
-    entries: list[ListEntry]
-
-
-class RecordOut(BaseModel):
-    relative_path: str
-    source_hash: str
-    status: str
-    extractor: str
-    extension: str
-    size_bytes: int
-    summary: str | None = None
-    topics: list[str] = Field(default_factory=list)
-    processed_path: str | None = None
-    index_note_path: str | None = None
-
-
-class MetadataQueryOut(BaseModel):
-    records: list[RecordOut]
-
-
-class RelatedConceptOut(BaseModel):
-    slug: str
-    display: str
-    kinds: list[str]              # which signals link them: cooccurrence, semantic
-    cooccurrence: float           # shared-document count (0 if none)
-    semantic: float               # centroid cosine (0 if none)
-
-
-class RelatedOut(BaseModel):
-    concept: str                  # the resolved concept slug
-    related: list[RelatedConceptOut]
-
 
 class WriteResult(BaseModel):
     path: str
@@ -257,340 +155,6 @@ class WriteResult(BaseModel):
     push_state: str = ""           # "queued" | "disabled" | "skipped"
     index_refresh: str = ""        # "queued" | "off" | "skipped"
     warning: str | None = None     # set when committed is False
-
-
-# ---------------------------------------------------------------------------
-# Read tools
-# ---------------------------------------------------------------------------
-
-# The embedding model truncates to ~512 tokens anyway, so a legitimate
-# query is never more than a few hundred chars. Cap it well above that so a
-# hostile client can't tie up a search worker tokenizing a multi-MB string
-# (note bodies cap at 5 MB, the request at 160 MB — without this a query
-# could ride that ceiling straight into model.encode).
-MAX_QUERY_CHARS: int = 4096
-
-
-def _check_query_len(query: str) -> None:
-    if len(query) > MAX_QUERY_CHARS:
-        raise ToolError(
-            f"query is {len(query)} characters; max is {MAX_QUERY_CHARS} "
-            "(the embedder truncates to a few hundred tokens anyway)"
-        )
-
-
-def tool_search(
-    cfg: ServerConfig, runtime: Runtime, query: str, top_k: int = 10,
-    mode: str = "hybrid",
-) -> SearchOut:
-    """Search over the vault. Returns the top-k matching chunks. ``mode`` is
-    dense (embeddings), lexical (BM25, exact identifiers), or hybrid (both)."""
-    if not query or not query.strip():
-        raise ToolError("query must be non-empty")
-    _check_query_len(query)
-    if not 1 <= top_k <= 50:
-        raise ToolError("top_k must be in [1, 50]")
-    if mode not in ("dense", "lexical", "hybrid"):
-        raise ToolError("mode must be one of: dense, lexical, hybrid")
-    _rate_check_search()
-
-    paths = _paths_for_root(cfg.vault_root)
-    # Distinguish "no index built" (fresh clone — gitignored) from "no
-    # matches": returning [] for both makes agents conclude the vault is
-    # empty. Fail loudly like tool_related does for its graph file.
-    if not (paths.metadata / "embeddings.npy").exists() or not (
-        paths.metadata / "embeddings_meta.jsonl"
-    ).exists():
-        raise ToolError(
-            "search index not built; run "
-            "'python scripts/ingest.py --rebuild-search-index' first"
-        )
-    with _search_guard:
-        hits = _semantic_search(paths, query, top_k=top_k, mode=mode, logger=log)
-    # Gate hits by the read policy: only return a hit whose backing
-    # artifact the agent could read directly (see _hit_gate_path).
-    safe = []
-    for h in hits:
-        try:
-            resolve_read(
-                cfg.vault_root,
-                _hit_gate_path(h.source_relative_path, getattr(h, "origin", "")),
-            )
-        except SafetyError:
-            # The hit's backing artifact isn't readable under the policy —
-            # drop that one hit, don't fail the whole search. (_hit_gate_path
-            # is pure string ops and resolve_read only raises SafetyError, so
-            # no other exception reaches here.)
-            continue
-        safe.append(h)
-    hits = safe
-    # Audit the query plus the GATED hit paths — what the agent actually saw.
-    runtime.audit.access_event(
-        agent=current_agent(),
-        tool="vault_search",
-        paths=[h.source_relative_path for h in hits],
-        query=query,
-    )
-    return SearchOut(
-        hits=[
-            SearchHitOut(
-                score=h.score,
-                source_relative_path=h.source_relative_path,
-                title=h.title,
-                chunk_idx=h.chunk_idx,
-                snippet=h.snippet,
-            )
-            for h in hits
-        ]
-    )
-
-
-def _hit_gate_path(source_relative_path: str, origin: str) -> str:
-    """Map a search hit's source label to the path the read policy gates on.
-
-    Curated knowledge/ notes are embedded directly — the note IS the
-    readable artifact, so gate on it as-is. Ingested sources are labelled
-    by their raw source path; their readable artifact is the processed
-    markdown twin under archive/processed/.
-
-    ``origin`` (the indexing record's extractor, stored per meta row)
-    decides which case applies — NOT the path prefix: an ingested source
-    dropped at inbox/knowledge/x.pdf is labelled "knowledge/x.pdf" but is
-    not a vault note. Rows from indexes built before ``origin`` existed
-    carry "" and degrade to the prefix heuristic until the next rebuild.
-    """
-    if origin == _KNOWLEDGE_EXTRACTOR or (
-        not origin and source_relative_path.startswith("knowledge/")
-    ):
-        return source_relative_path
-    # Same derivation the pipeline uses (keeps the source extension), so the
-    # gate path matches the real processed twin. Gating only checks the read
-    # POLICY (archive/processed is an allowed area), so old-convention notes
-    # still pass regardless — this just keeps the two in sync.
-    return "archive/processed/" + _derived_note_relpath(source_relative_path)
-
-
-def tool_chunk_context(
-    cfg: ServerConfig,
-    runtime: Runtime,
-    source_relative_path: str,
-    chunk_idx: int,
-    before: int = 1,
-    after: int = 1,
-) -> ChunkContextOut:
-    """Return a search hit's neighbouring chunks — cheaper than reading the
-    whole backing file just to see the context around one snippet. Gated by
-    the same read policy as ``vault_search``: a hit whose backing artifact you
-    could not read directly returns nothing here either."""
-    if not source_relative_path or not source_relative_path.strip():
-        raise ToolError("source_relative_path must be non-empty")
-    if chunk_idx < 0:
-        raise ToolError("chunk_idx must be >= 0")
-    if not 0 <= before <= 20 or not 0 <= after <= 20:
-        raise ToolError("before/after must be in [0, 20]")
-    _rate_check_read()
-
-    paths = _paths_for_root(cfg.vault_root)
-    rows = _chunks_for_source(paths, source_relative_path)
-    if not rows:
-        raise ToolError("no indexed chunks for that source (rebuild the index?)")
-    # Gate on the read policy, keyed by the source's own origin (as search does).
-    origin = str(rows[0].get("origin", ""))
-    try:
-        resolve_read(cfg.vault_root, _hit_gate_path(source_relative_path, origin))
-    except SafetyError:
-        raise ToolError("not found or not readable") from None
-
-    lo, hi = chunk_idx - before, chunk_idx + after
-    window = [
-        ChunkOut(
-            chunk_idx=int(r.get("chunk_idx", 0)),
-            text=str(r.get("text", "")),
-            is_target=int(r.get("chunk_idx", 0)) == chunk_idx,
-        )
-        for r in rows
-        if lo <= int(r.get("chunk_idx", 0)) <= hi
-    ]
-    runtime.audit.access_event(
-        agent=current_agent(),
-        tool="vault_chunk_context",
-        paths=[source_relative_path],
-        query=f"chunk {chunk_idx} ±({before},{after})",
-    )
-    return ChunkContextOut(
-        source_relative_path=source_relative_path,
-        total_chunks=len(rows),
-        chunks=window,
-    )
-
-
-def tool_read(cfg: ServerConfig, runtime: Runtime, path: str) -> ReadOut:
-    """Read a UTF-8 text file from the vault. Reads are allowlist-based: only
-    paths under READ_ALLOW_PREFIXES (knowledge/, archive/, inbox/, metadata/)
-    or the READ_ALLOW_ROOT_FILES vault docs are permitted, with the DENY_*
-    lists (secrets, logs, the embeddings index) applied on top. Everything
-    else — and any refusal — returns the same opaque 'not found or not
-    readable'. Binary and oversize files are refused."""
-    _rate_check_read()
-    resolved = resolve_read(cfg.vault_root, path)
-    if not resolved.is_file():
-        raise ToolError("not found or not readable")
-    try:
-        size = resolved.stat().st_size
-    except OSError:
-        raise ToolError("not found or not readable") from None
-    if size > MAX_NOTE_BYTES:
-        raise ToolError(f"file is {size} bytes; reads are capped at {MAX_NOTE_BYTES}")
-    with _read_guard:
-        try:
-            data = resolved.read_bytes()
-        except OSError:
-            raise ToolError("read failed") from None
-    if b"\x00" in data[:4096]:
-        raise ToolError(
-            "refusing to return binary content; use semantic search or list+filename"
-        )
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ToolError("file is not valid UTF-8") from None
-    runtime.audit.access_event(agent=current_agent(), tool="vault_read", paths=[path])
-    return ReadOut(path=path, content=text, size_bytes=len(data))
-
-
-def tool_list(cfg: ServerConfig, runtime: Runtime, path: str = "") -> ListOut:
-    """List entries under a directory. Empty path lists the vault root."""
-    _rate_check_read()
-    if path:
-        resolved = resolve_read(cfg.vault_root, path)
-    else:
-        resolved = cfg.vault_root
-    if not resolved.is_dir():
-        raise ToolError("not found or not readable")
-    entries: list[ListEntry] = []
-    # iterdir on an unreadable directory raises OSError carrying the absolute
-    # path; convert to the same opaque error tool_read uses so the filesystem
-    # layout never leaks to the agent.
-    try:
-        children = sorted(resolved.iterdir())
-    except OSError:
-        raise ToolError("not found or not readable") from None
-    for child in children:
-        if child.name.startswith("."):
-            continue
-        # Only list entries the read allowlist would accept, so the root
-        # listing can't reveal the names of non-readable trees (scripts/,
-        # mcp_server/, etc.) that a subdir listing would refuse.
-        try:
-            resolve_read(cfg.vault_root, child.relative_to(cfg.vault_root).as_posix())
-        except SafetyError:
-            continue
-        if child.is_dir():
-            entries.append(ListEntry(name=child.name, is_dir=True))
-        elif child.is_file():
-            try:
-                size = child.stat().st_size
-            except OSError:
-                size = None
-            entries.append(ListEntry(name=child.name, is_dir=False, size_bytes=size))
-    runtime.audit.access_event(agent=current_agent(), tool="vault_list", paths=[path])
-    return ListOut(path=path, entries=entries)
-
-
-def tool_metadata_query(
-    cfg: ServerConfig,
-    runtime: Runtime,
-    by: str = "status",
-    value: str | None = None,
-    limit: int = 50,
-) -> MetadataQueryOut:
-    """Query metadata/index.jsonl. Filter by status, extension, or extractor."""
-    _rate_check_read()
-    if by not in {"status", "extension", "extractor", "path_prefix", "all"}:
-        raise ToolError(
-            "by must be one of: status, extension, extractor, path_prefix, all"
-        )
-    if by != "all" and not value:
-        raise ToolError(f"value is required when by={by!r}")
-    if not 1 <= limit <= 500:
-        raise ToolError("limit must be in [1, 500]")
-
-    paths = _paths_for_root(cfg.vault_root)
-    records = list(_latest_records_by_path(paths.metadata_index_jsonl).values())
-
-    def matches(r) -> bool:
-        if by == "all":
-            return True
-        if by == "status":
-            return r.status == value
-        if by == "extension":
-            return r.extension == value
-        if by == "extractor":
-            return r.extractor == value
-        if by == "path_prefix":
-            return r.relative_path.startswith(value or "")
-        return False
-
-    filtered = [r for r in records if matches(r)][:limit]
-    runtime.audit.access_event(
-        agent=current_agent(),
-        tool="vault_metadata_query",
-        paths=[],
-        query=f"by={by} value={value or ''}",
-    )
-    return MetadataQueryOut(
-        records=[
-            RecordOut(
-                relative_path=r.relative_path,
-                source_hash=r.source_hash,
-                status=r.status,
-                extractor=r.extractor,
-                extension=r.extension,
-                size_bytes=r.size_bytes,
-                summary=r.summary or None,
-                topics=list(r.topics or []),
-                processed_path=r.processed_path,
-                index_note_path=r.index_note_path,
-            )
-            for r in filtered
-        ]
-    )
-
-
-def tool_related(cfg: ServerConfig, runtime: Runtime, concept: str, limit: int = 8) -> RelatedOut:
-    """Return the concepts most related to ``concept`` (slug or display name),
-    from the persisted relationship graph (co-occurrence + semantic)."""
-    if not concept or not concept.strip():
-        raise ToolError("concept must be non-empty")
-    _check_query_len(concept)
-    if not 1 <= limit <= 50:
-        raise ToolError("limit must be in [1, 50]")
-    _rate_check_read()
-    paths = _paths_for_root(cfg.vault_root)
-    if not (paths.metadata / "connections.jsonl").exists():
-        raise ToolError(
-            "connection graph not built; run "
-            "'python scripts/ingest.py --rebuild-connections' first"
-        )
-    slug, rels = _related_concepts(paths, concept, top_n=limit)
-    if not slug:
-        raise ToolError(f"unknown concept {concept!r}; not a topic in the vault")
-    runtime.audit.access_event(
-        agent=current_agent(), tool="vault_related", paths=[], query=concept
-    )
-    return RelatedOut(
-        concept=slug,
-        related=[
-            RelatedConceptOut(
-                slug=r.slug,
-                display=r.display,
-                kinds=list(r.kinds),
-                cooccurrence=r.cooccurrence,
-                semantic=r.semantic,
-            )
-            for r in rels
-        ],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +178,7 @@ def tool_create_note(cfg: ServerConfig, runtime: Runtime, path: str, content: st
         body = content
         graph_changed = False
         if _is_knowledge_md(rel):
+            _refuse_bad_relations(content)
             # Stamping adds ~100 bytes over the size check above — slack
             # the 5 MB cap absorbs without a second error path.
             body = stamp_provenance(
@@ -663,10 +228,15 @@ def tool_replace_note(cfg: ServerConfig, runtime: Runtime, path: str, content: s
                 raise ToolError(f"file does not exist: {path!r} (use create_note for a new note)")
             graph_changed = False
             if _is_knowledge_md(rel):
+                _refuse_bad_relations(content)
                 try:
                     old: str | None = resolved.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
                     old = None  # unreadable old text: assume the graph moved
+                if old is not None:
+                    # Before anything reaches disk: a rewrite may add and
+                    # supersede, never drop relation intervals or Log lines.
+                    _refuse_history_loss(old, content)
                 # Stamp with the OLD note as prior so author/memory_status
                 # are re-asserted from what the server last wrote, never
                 # from the client's (forgeable) new content.
@@ -807,6 +377,151 @@ def tool_update_concept_user_section(
     )
 
 
+def _with_first_compiled_truth_fence(full: str, block: str) -> str:
+    """``full`` with its first compiled-truth fence inserted directly below
+    the frontmatter, carrying ``block``.
+
+    Above the note's own prose, never appended: an entity note's last
+    section is usually ``## Log``, and ``dream._log_bullets`` reads a
+    section to the next heading — a fence appended at end of file therefore
+    lands inside the Log, and its lines read back as Log bullets.
+    """
+    raw = _split_frontmatter_raw(full)
+    if raw is None:
+        head, rest = "", full
+    else:
+        _yaml_block, rest = raw
+        head = full[: len(full) - len(rest)]
+        if not head.endswith("\n"):
+            head += "\n"
+        head += "\n"
+    fence = f"{COMPILED_TRUTH_START}\n{block}\n{COMPILED_TRUTH_END}\n"
+    body = rest.lstrip("\n")
+    return f"{head}{fence}\n{body}" if body else f"{head}{fence}"
+
+
+def tool_update_compiled_truth(
+    cfg: ServerConfig,
+    runtime: Runtime,
+    path: str,
+    content: str,
+) -> WriteResult:
+    """Replace the compiled-truth block of an entity note — the text
+    between the COMPILED-TRUTH markers, and nothing else.
+
+    The dream pass's compiled-truth job owns that block and only that
+    block. Sent through ``vault_replace_note`` the promise was prose: the
+    history guard catches a dropped relation entry or ``## Log`` bullet,
+    but a rewrite that ate the note's hand-written Overview / Stack /
+    Architecture sections was accepted, committed and pushed. Here the
+    scope is mechanical — the server splices the new text between the
+    markers and every other byte of the note is the one already on disk,
+    bar the provenance keys it stamps on every write (below).
+
+    A note with NO fence gets its first one here, inserted directly after
+    the frontmatter and above the hand-written body — the server picks the
+    place because the alternative (an append, which is all a skill can do)
+    lands the fence at end of file, i.e. inside whatever the last section
+    happens to be, and a fence inside ``## Log`` makes the pass read its
+    own summary back as Log evidence. An AMBIGUOUS fence (one marker
+    without the other, out of order, duplicated) is still refused: there is
+    no safe place to write, and guessing where the block ends is how a
+    hand-written section gets eaten. Refuses the assistant memory areas
+    outright — a memory-fact note has no compiled truth, and its lifecycle
+    keys are consolidate's.
+
+    ``content`` may not itself contain either marker, and the composed note
+    is re-checked before anything reaches disk: a payload carrying a marker
+    (the skill's own example block, copied) would otherwise splice a second
+    fence into the note, and a note with two fences is one this tool refuses
+    for ever after — permanently unwritable, and permanently counted as a
+    real change by the dream gate.
+
+    Provenance is stamped like every other write
+    (``last_written_by``/``written_via``, AGENTS.md's server contract). The
+    values are derived from the agent, not the clock, so a nightly refresh
+    by the same agent leaves the frontmatter byte-identical and
+    ``dream._only_compiled_truth_changed`` still sees a compiled-truth-only
+    edit.
+    """
+    def _do() -> WriteResult:
+        _rate_check_write()
+        _check_note_size(content)
+        agent = current_agent()
+        resolved = resolve_write_under_allowlist(cfg.vault_root, path)
+        rel = resolved.relative_to(cfg.vault_root).as_posix()
+        _refuse_if_profile(rel)
+        if not _is_knowledge_md(rel):
+            raise ToolError(
+                f"{path!r} is not a knowledge/ Markdown note; compiled truth "
+                "lives on entity notes (people/, organisations/, projects/)"
+            )
+        if _is_memory_area(rel):
+            raise ToolError(
+                "knowledge/assistant/ notes carry the memory lifecycle, not a "
+                "compiled-truth block; propose a fact note instead"
+            )
+        if COMPILED_TRUTH_START in content or COMPILED_TRUTH_END in content:
+            raise ToolError(
+                "the compiled-truth body must not contain the fence markers "
+                f"({COMPILED_TRUTH_START} / {COMPILED_TRUTH_END}) — send the "
+                "block's text only; the server owns the markers"
+            )
+        with _write_lock:
+            if not resolved.is_file():
+                raise ToolError(f"file does not exist: {path!r}")
+            try:
+                full = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                raise ToolError("note could not be read") from None
+            block = content.strip("\n")
+            span = compiled_truth_span(full)
+            if span is None:
+                if marker_state(full) != "absent":
+                    raise ToolError(
+                        f"{path!r} has an ambiguous compiled-truth fence (one "
+                        "marker without the other, out of order, or duplicated); "
+                        "refusing to write — a human repairs the markers"
+                    )
+                new_full = _with_first_compiled_truth_fence(full, block)
+            else:
+                start, end = span
+                new_full = full[:start] + "\n" + block + "\n" + full[end:]
+            new_full = stamp_provenance(
+                new_full, agent=agent, mode="replace",
+                memory_area=False, prior=full,
+            )
+            if marker_state(new_full) != "ok":
+                raise ToolError(
+                    "the composed note would not have exactly one compiled-truth "
+                    "fence; refusing to write (nothing on disk was changed)"
+                )
+            if len(new_full.encode()) > MAX_NOTE_BYTES:
+                raise ToolError(
+                    f"composed note would exceed {MAX_NOTE_BYTES} bytes; "
+                    "trim the compiled-truth block"
+                )
+            _atomic_write_text(resolved, new_full)
+            outcome = _commit(
+                cfg, [resolved], _commit_message(agent, f"update compiled truth {path}")
+            )
+        # Only provenance keys can have moved in the frontmatter — the
+        # splice never reaches it and stamping touches nothing else — so
+        # relations/topics are unchanged and the graph cannot have moved;
+        # the body did change, so reindex.
+        push_state, index_refresh = _finish_write(
+            runtime, rel=rel, outcome=outcome, graph_changed=False, reindex=True,
+        )
+        return _write_result(
+            rel, len(content.encode()), outcome,
+            push_state=push_state, index_refresh=index_refresh,
+        )
+
+    return _audited_write(
+        runtime, tool="vault_update_compiled_truth", path=path, fn=_do
+    )
+
+
 def tool_drop_inbox_file(
     cfg: ServerConfig,
     runtime: Runtime,
@@ -819,11 +534,15 @@ def tool_drop_inbox_file(
     reindex — the ingest pipeline owns inbox content."""
     def _do() -> WriteResult:
         import base64
+        import binascii
 
         _rate_check_write()
         try:
             data = base64.b64decode(content_base64, validate=True)
-        except Exception:
+        except (binascii.Error, ValueError):
+            # Only the bad-input error. A bare `except Exception` here
+            # relabelled MemoryError on a huge payload as "not valid
+            # base64", sending the caller to fix input that was fine.
             raise ToolError("content_base64 is not valid base64") from None
         if len(data) > MAX_INBOX_BYTES:
             raise ToolError(
@@ -894,6 +613,124 @@ def _refuse_if_profile(rel: str) -> None:
         )
 
 
+def _refuse_bad_relations(content: str) -> None:
+    """Refuse a client-supplied ``relations:`` block that parse_relations
+    (the reader every consumer uses) would silently drop edges from —
+    the generic write tools must not persist what entity_upsert_relation
+    would refuse to write."""
+    frontmatter, _body = _split_frontmatter(content)
+    if "relations" not in frontmatter:
+        return
+    _relations, problems = parse_relations(frontmatter)
+    if problems:
+        raise ToolError(
+            "relations frontmatter rejected: " + "; ".join(problems) +
+            " — see AGENTS.md 'Relations frontmatter shape': a list of "
+            "{rel, target} mappings, rel from the closed vocabulary, target "
+            "a node id like projects/<slug> (no knowledge/ prefix, no .md)"
+        )
+
+
+def _log_section(text: str) -> tuple[bool, list[str]]:
+    """``(has_log_section, bullet_lines)`` for a note's ``## Log``.
+
+    Same section detection ``relations.append_fact_to_log`` writes with:
+    the first line that is exactly ``## Log``, ending at the next heading
+    of any level. Bullets are compared stripped (and with a trailing
+    ``\\r`` dropped, as the append path does) so re-indentation or CRLF
+    endings do not read as a deleted line.
+    """
+    lines = text.split("\n")
+    heading_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip() == _LOG_HEADING:
+            heading_idx = i
+            break
+    if heading_idx < 0:
+        return False, []
+    end = len(lines)
+    for j in range(heading_idx + 1, len(lines)):
+        if _HEADING_RE.match(lines[j]):
+            end = j
+            break
+    bullets = []
+    for j in range(heading_idx + 1, end):
+        stripped = lines[j].rstrip("\r").strip()
+        if stripped.startswith("- "):
+            bullets.append(stripped)
+    return True, bullets
+
+
+def _edge_key(relation: Relation) -> tuple[str, str, str, str]:
+    """The fields that identify one interval of one typed edge. ``source``
+    is provenance, not identity — re-sourcing an entry is not a deletion."""
+    return (relation.rel, relation.target, relation.valid_from, relation.valid_until)
+
+
+def _describe(relation: Relation) -> str:
+    span = relation.valid_from or "(open start)"
+    span += f"..{relation.valid_until}" if relation.valid_until else ".. (open)"
+    return f"{relation.rel} -> {relation.target} [{span}]"
+
+
+def _refuse_history_loss(old: str, new: str) -> None:
+    """Refuse a full-note replace that would drop relation history or
+    ``## Log`` lines the note already carries.
+
+    AGENTS.md is explicit that the closed intervals ARE the queryable
+    history and that ``## Log`` is append-only, but those rules were
+    enforced only by the typed tools (``entity_upsert_relation``,
+    ``entity_append_fact``). The dream pass rewrites entity notes through
+    ``vault_replace_note``, regenerating the relation block freehand — a
+    dropped entry or bullet was silent, and the tool reported success.
+
+    Superseding still passes: adding entries is free, and an entry that
+    was open may come back carrying a ``valid_until`` (closing an interval
+    is history, not loss). Only notes that ARE entity notes (relations or
+    a ``## Log``) are guarded; an ordinary note is untouched.
+    """
+    old_fm, _old_body = _split_frontmatter(old)
+    old_relations, _old_problems = parse_relations(old_fm)
+    has_log, old_bullets = _log_section(old)
+    if not old_relations and not has_log:
+        return   # not an entity note: nothing to preserve
+
+    new_fm, _new_body = _split_frontmatter(new)
+    new_relations, _new_problems = parse_relations(new_fm)
+    new_edges = {_edge_key(r) for r in new_relations}
+    # (rel, target, valid_from) triples the new content closes: an OLD open
+    # entry showing up here has been superseded, not deleted.
+    superseded = {
+        (r.rel, r.target, r.valid_from) for r in new_relations if r.valid_until
+    }
+    lost_relations = [
+        r for r in old_relations
+        if _edge_key(r) not in new_edges
+        and not (not r.valid_until and (r.rel, r.target, r.valid_from) in superseded)
+    ]
+    _new_has_log, new_bullets = _log_section(new)
+    kept = set(new_bullets)
+    lost_bullets = [b for b in old_bullets if b not in kept]
+    if not lost_relations and not lost_bullets:
+        return
+
+    parts = []
+    if lost_relations:
+        parts.append(
+            "relation entries: " + "; ".join(_describe(r) for r in lost_relations)
+        )
+    if lost_bullets:
+        parts.append("## Log lines: " + "; ".join(repr(b) for b in lost_bullets))
+    raise ToolError(
+        "refusing to replace: the new content drops history already on the note — "
+        + " | ".join(parts)
+        + " — AGENTS.md 'supersede, never delete': closed intervals are the "
+        "queryable history and ## Log lines are never rewritten. Append to the "
+        "note (vault_append_to_note / entity_append_fact) or supersede the entry "
+        "(entity_upsert_relation with valid_until) rather than rewriting it."
+    )
+
+
 def _commit_message(agent: str, action: str) -> str:
     """``mcp(<agent>): <action>``. The agent name is slug-validated at
     config load and the path inside ``action`` already passed safety's
@@ -905,7 +742,24 @@ def _commit_message(agent: str, action: str) -> str:
     )
 
 
-def _audited_write(runtime: Runtime, *, tool: str, path: str | None, fn) -> WriteResult:
+def _require_configured_branch(runtime: Runtime) -> None:
+    """Refuse BEFORE any disk write when the vault has a branch other than
+    the configured one checked out. ``commit_paths`` guards the commit too,
+    but by then the file is on disk and the tool would report a
+    written-but-uncommitted result; refusing up front keeps the shared
+    working tree clean and makes the cause visible to the client."""
+    expected = runtime.push_worker.branch
+    current = current_branch(runtime.push_worker.vault_root)
+    if current != expected:
+        raise ToolError(
+            f"refusing to write: the vault has {current!r} checked out, not the "
+            f"configured {expected!r}; a write now would be stranded off {expected!r}"
+        )
+
+
+def _audited_write(
+    runtime: Runtime, *, tool: str, path: str | None, fn: Callable[[], WriteResult]
+) -> WriteResult:
     """Run one write-tool body and record how it ended in the audit log.
 
     Refusals (rate limit, safety, size, exists/missing) are part of the
@@ -913,6 +767,7 @@ def _audited_write(runtime: Runtime, *, tool: str, path: str | None, fn) -> Writ
     as ``error``. Both re-raise so FastMCP surfaces them unchanged."""
     agent = current_agent()
     try:
+        _require_configured_branch(runtime)
         result = fn()
     except (ToolError, SafetyError) as exc:
         runtime.audit.tool_event(
@@ -994,11 +849,12 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
-    """Atomic write with no symlink-prediction window.
+    """Atomic write with no symlink-prediction window, plus error redaction.
 
-    Uses ``tempfile.mkstemp`` in the target's parent directory, which
-    creates the temp file with ``O_CREAT|O_EXCL`` and a random suffix.
-    Three properties matter:
+    The mechanics are ``ingest_lib.atomic.atomic_write_bytes`` — mkdir,
+    ``tempfile.mkstemp`` in the target's parent, write → flush → fsync →
+    ``os.replace``, unlink-and-re-raise on any ``BaseException``. Three
+    properties of that mkstemp matter to the server:
 
     - Random suffix → an attacker can't pre-create a symlink at the
       temp path waiting to be opened.
@@ -1010,48 +866,22 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     if the target was a symlink, the rename swaps the directory entry,
     leaving whatever the symlink pointed to untouched. So this routine
     is safe even when the destination path is or becomes a symlink.
-    """
-    import os
-    import tempfile
 
-    parent = target.parent
+    What this wrapper adds is redaction. Every ``OSError`` — from the mkdir
+    and mkstemp setup as much as from the write itself — carries the
+    absolute vault path, the temp naming scheme, or both; none of that may
+    reach the agent, so it is logged server-side and re-raised as a generic
+    ``ToolError``. The mode stays mkstemp's 0600, matching every other note
+    writer in the vault (``ingest_lib.notes._atomic_write``), so a note's
+    permissions don't flip depending on which writer touched it last.
+    """
     try:
-        # mkdir + mkstemp are INSIDE the try: a disk-full/permission failure
-        # here raised a raw OSError carrying the absolute vault path and temp
-        # naming scheme straight to the agent, which the generic 'write
-        # failed' below is meant to prevent.
-        parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            dir=str(parent),
+        atomic_write_bytes(
+            target, data, prefix=f".{target.name}.", suffix=".tmp"
         )
     except OSError as exc:
-        log.warning("atomic write setup failed for %s: %s", target.name, exc)
-        raise ToolError("write failed") from None
-    tmp_path = Path(tmp_path_str)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, target)
-    except OSError as exc:
-        # Clean up, then return a generic error. The raw OSError carries
-        # the random temp path and absolute fs paths; neither should reach
-        # the agent. Log the detail server-side instead.
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
         log.warning("atomic write failed for %s: %s", target.name, exc)
         raise ToolError("write failed") from None
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def _commit(cfg: ServerConfig, paths: list[Path], message: str) -> CommitOutcome:
@@ -1059,7 +889,9 @@ def _commit(cfg: ServerConfig, paths: list[Path], message: str) -> CommitOutcome
     The old synchronous push could hold the write path for up to 15s on a
     black-holed network; the worker moves that latency off every write."""
     try:
-        return commit_paths(cfg.vault_root, paths=paths, message=message)
+        return commit_paths(
+            cfg.vault_root, paths=paths, message=message, expected_branch=cfg.git_branch
+        )
     except GitError as exc:
         # The file is already written to disk, but git refused. Report the
         # truth rather than a fake success. Detail (which may carry remote

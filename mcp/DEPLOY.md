@@ -64,6 +64,9 @@ BRAIN_MCP_BIND_PORT=8765
 # fails the write — check the server log and logs/mcp-audit.jsonl.
 BRAIN_MCP_GIT_PUSH_ON_WRITE=1
 BRAIN_MCP_GIT_REMOTE=origin
+# Must equal the branch actually checked out at BRAIN_MCP_VAULT_ROOT — every
+# write's commit step compares the two and refuses (committed:false, note
+# still written to disk) on a mismatch, including detached HEAD.
 BRAIN_MCP_GIT_BRANCH=main
 
 # SSH key for git push. Kept OUTSIDE the vault (see step 3) so a
@@ -268,5 +271,5 @@ sudo journalctl -u cloudflared -f        # tunnel
 ## What this deploy does NOT do
 
 - **No automated ingestion.** PDFs dropped via `vault_drop_inbox_file` land in `inbox/`; ingestion happens on your laptop (where MinerU + its 14 GB of model weights live) when you run `scripts/ingest.py --inbox`. The MCP server's job ends at the drop.
-- **No remote summarisation.** If you want LLM summaries on the server side (so a Linux box without an internet API key can still tag topics), wire `local` provider against an Ollama instance running on the box. See `_template/README.md` → "LLM provider".
+- **No remote summarisation.** If you want LLM summaries on the server side (so a Linux box without an internet API key can still tag topics), wire `local` provider against an Ollama instance running on the box. See `_template/README.md` (this is `README.md` at the root of the public template) → "Requirements" for the provider list, "Switch LLM provider" for how to change it.
 - **No multi-user.** `BRAIN_MCP_TOKENS` gives each *agent* its own identity over the shared vault (attributed commits + audit lines), but every token has the same full read/write access — this is one person's vault, a single trust domain. If multiple humans need different identities or permissions, put per-person policies in Cloudflare Access; per-agent tokens are "machine credentials", not user accounts.

@@ -42,11 +42,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 # Module (not function) imports so tests can monkeypatch e.g.
 # ``semantic.upsert_notes`` and the patch is visible through here.
-from ingest_lib import concepts as _concepts  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib import connections as _connections  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib import dashboards as _dashboards  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib import semantic as _semantic  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib.config import paths_for_root  # type: ignore[import-not-found]  # noqa: E402
+from ingest_lib import concepts as _concepts  # noqa: E402
+from ingest_lib import connections as _connections  # noqa: E402
+from ingest_lib import dashboards as _dashboards  # noqa: E402
+from ingest_lib import semantic as _semantic  # noqa: E402
+from ingest_lib.config import VaultPaths, paths_for_root  # noqa: E402
 
 from .audit import AuditLog
 from .git_ops import commit_paths
@@ -66,8 +66,10 @@ class IndexRefresher:
         debounce_seconds: float = 2.0,
         encode: Callable[[list[str]], np.ndarray] | None = None,
         request_push: Callable[[], str] | None = None,
+        branch: str | None = None,
     ) -> None:
         self._vault_root = vault_root
+        self._branch = branch
         self._audit = audit
         self._enabled = enabled
         self._debounce = debounce_seconds
@@ -83,16 +85,25 @@ class IndexRefresher:
         # rel_path -> graph_changed; re-enqueueing a path ORs the flag so
         # a graph-relevant edit can't be downgraded by a later body edit.
         self._dirty: dict[str, bool] = {}
+        # The batch currently inside _process_batch, kept visible so stop()
+        # can report work the worker has already drained but not finished.
+        self._inflight: dict[str, bool] = {}
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------- API
 
-    def enqueue(self, rel_path: str, *, graph_changed: bool) -> Literal["queued", "off"]:
+    def enqueue(
+        self, rel_path: str, *, graph_changed: bool
+    ) -> Literal["queued", "off", "skipped"]:
         """Mark a vault-relative note path dirty. Returns the resulting
-        index_refresh state: "off" when refreshing is disabled, else
-        "queued"."""
+        index_refresh state: "off" when refreshing is disabled, "skipped"
+        once ``stop()`` has run (the worker is gone and nothing would ever
+        drain the path — saying "queued" there promises work that will
+        never happen), else "queued"."""
         if not self._enabled:
             return "off"
+        if self._stopping.is_set():
+            return "skipped"
         with self._lock:
             self._dirty[rel_path] = self._dirty.get(rel_path, False) or graph_changed
             # Lazy thread start: a server that never writes never spawns
@@ -130,11 +141,19 @@ class IndexRefresher:
             batch = self._drain()
             if batch:
                 self._process_batch(batch)
-        elif self.pending():
-            # Worker still running after the join timeout (e.g. mid cold model
-            # load): we can't safely drain here, and nothing catches up on
-            # restart. Make the loss visible instead of dropping it silently.
-            dropped = self._drain()
+            return
+        # Worker still running after the join timeout (e.g. mid cold model
+        # load): we can't safely drain here, and nothing catches up on
+        # restart. Make the loss visible instead of dropping it silently.
+        # The in-flight batch counts: it has already left the dirty set, so
+        # pending() alone reported 0 for the commonest loss of all (the first
+        # batch of a session cold-loads the embedder for 5-15 s). A batch that
+        # finishes after this deadline is reported anyway — nothing guarantees
+        # it does, and an over-report costs one rebuild.
+        dropped = self._drain()
+        with self._lock:
+            dropped.update(self._inflight)
+        if dropped:
             log.warning(
                 "reindex: %d dirty path(s) dropped on shutdown (worker still "
                 "busy) — run 'ingest.py --rebuild-search-index' to catch up",
@@ -173,6 +192,8 @@ class IndexRefresher:
         the derived notes that changed. All failures are swallowed after
         logging + auditing — the worker thread must never die."""
         paths = paths_for_root(self._vault_root)
+        with self._lock:
+            self._inflight = dict(batch)
         try:
             # (a) Incremental embed. First call cold-loads the embedder
             # (~5-15 s) — that cost is exactly WHY this runs here on the
@@ -192,8 +213,11 @@ class IndexRefresher:
                 outcome="failed",
                 detail=f"{type(exc).__name__}: {exc}"[:300],
             )
+        finally:
+            with self._lock:
+                self._inflight = {}
 
-    def _rebuild_derived(self, paths) -> None:
+    def _rebuild_derived(self, paths: VaultPaths) -> None:
         conn = _connections.rebuild_connections(paths, logger=log)
         cstats = _concepts.rebuild_concepts(paths, logger=log, related=conn.related)
         derived: list[str] = [*cstats.written_paths, *cstats.removed_paths]
@@ -215,6 +239,7 @@ class IndexRefresher:
             self._vault_root,
             paths=[self._vault_root / rel for rel in sorted(set(derived))],
             message="mcp: refresh derived notes",
+            expected_branch=self._branch,
         )
         if outcome.committed and self._request_push is not None:
             self._request_push()

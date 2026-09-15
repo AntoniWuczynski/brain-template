@@ -18,6 +18,7 @@ no rebuild step, nothing to drift out of sync:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, UTC
 from pathlib import Path
@@ -115,7 +116,7 @@ def recency_weight(updated_iso: str, *, halflife_days: float, now: datetime) -> 
     age_days = (now - parsed).total_seconds() / 86400.0
     if age_days <= 0.0:
         return 1.0
-    return 0.5 ** (age_days / halflife_days)
+    return math.pow(0.5, age_days / halflife_days)
 
 
 def _coerce_when(raw: object) -> str:
@@ -223,8 +224,14 @@ def memory_search(
             updated, status = note_cache[rel]
         else:
             if ingested_updated is None:
+                # ``created_at`` — when the source first entered the vault —
+                # not ``updated_at``: a re-summarise or a metadata refresh
+                # bumps ``updated_at`` without the document changing, which
+                # silently reset the "recency" of everything it touched.
+                # Neither is the document's own date (index.jsonl records
+                # none), but first-ingestion is at least stable.
                 ingested_updated = {
-                    p: r.updated_at
+                    p: (r.created_at or r.updated_at)
                     for p, r in latest_records_by_path(paths.metadata_index_jsonl).items()
                 }
             updated, status = ingested_updated.get(rel, ""), ""

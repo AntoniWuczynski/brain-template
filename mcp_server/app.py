@@ -11,19 +11,28 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import ParamSpec, TypeVar
 
 import anyio
 
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel
 
 from . import entity_tools as _entity_tools
 from . import memory_tools as _memory_tools
 from . import tools as _tools
+from . import tools_read as _tools_read
 from .auth import BearerAuthMiddleware
 from .config import ServerConfig, load_config
 from .runtime import Runtime, build_runtime
+
+# Generic parameters for _offload (defined in _register_tools below): the
+# wrapped tool function's own argument shape and its Pydantic result model.
+_ToolParams = ParamSpec("_ToolParams")
+_ToolResultT = TypeVar("_ToolResultT", bound=BaseModel)
 
 
 def build_app() -> FastAPI:
@@ -68,7 +77,7 @@ def build_app() -> FastAPI:
     # refresher FIRST (its derived-notes commit must exist before the
     # final push), then the push worker's last best-effort push.
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async with mcp.session_manager.run():
             try:
                 yield
@@ -112,70 +121,81 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
     concurrency guards behave as intended (real threads to bound).
     """
 
-    async def _offload(fn, *args, **kwargs):
-        result = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
-        return result.model_dump()
+    async def _offload(
+        fn: Callable[_ToolParams, _ToolResultT], *args: _ToolParams.args, **kwargs: _ToolParams.kwargs
+    ) -> _ToolResultT:
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
 
     @mcp.tool()
-    async def vault_search(query: str, top_k: int = 10, mode: str = "hybrid") -> dict:
+    async def vault_search(query: str, top_k: int = 10, mode: str = "hybrid") -> _tools_read.SearchOut:
         """Search the vault. Returns up to ``top_k`` matching chunks with
         their source paths, scores, and snippets. ``mode``: 'hybrid'
         (default — embeddings + BM25, best for both paraphrase and exact
         identifiers like course codes / error strings), 'dense' (embeddings
         only), or 'lexical' (BM25 only). Use this for "what does the vault
-        say about X" questions."""
-        return await _offload(_tools.tool_search, cfg, runtime, query=query, top_k=top_k, mode=mode)
+        say about X" questions. Each hit carries an ``evidence`` hint
+        (exists/probable/unknown, plus a node_id when known) saying whether
+        its subject already has an entity note under
+        knowledge/people|organisations|projects|meetings/ — check it before
+        creating a new entity note so you link the existing one instead of
+        splitting the person/project graph."""
+        return await _offload(_tools_read.tool_search, cfg, runtime, query=query, top_k=top_k, mode=mode)
 
     @mcp.tool()
-    async def vault_read(path: str) -> dict:
+    async def vault_read(path: str) -> _tools_read.ReadOut:
         """Read a text file from the vault by its relative path. Returns
         the full content as UTF-8 text. Refuses binary files, secrets,
         and anything under .git/ or logs/."""
-        return await _offload(_tools.tool_read, cfg, runtime, path)
+        return await _offload(_tools_read.tool_read, cfg, runtime, path)
 
     @mcp.tool()
     async def vault_chunk_context(
         source_relative_path: str, chunk_idx: int, before: int = 1, after: int = 1,
-    ) -> dict:
+    ) -> _tools_read.ChunkContextOut:
         """Expand one ``vault_search`` hit into its neighbouring chunks —
         cheaper and more focused than ``vault_read`` on the whole file. Pass a
         hit's ``source_relative_path`` and ``chunk_idx``; returns that chunk
         plus ``before``/``after`` neighbours and the source's total chunk
         count. Gated by the same read policy as search."""
         return await _offload(
-            _tools.tool_chunk_context, cfg, runtime,
+            _tools_read.tool_chunk_context, cfg, runtime,
             source_relative_path=source_relative_path, chunk_idx=chunk_idx,
             before=before, after=after,
         )
 
     @mcp.tool()
-    async def vault_list(path: str = "") -> dict:
+    async def vault_list(path: str = "") -> _tools_read.ListOut:
         """List entries under a vault directory. Empty path lists the root.
         Hidden files (those starting with .) are omitted."""
-        return await _offload(_tools.tool_list, cfg, runtime, path)
+        return await _offload(_tools_read.tool_list, cfg, runtime, path)
 
     @mcp.tool()
     async def vault_metadata_query(
         by: str = "status",
         value: str | None = None,
         limit: int = 50,
-    ) -> dict:
+        offset: int = 0,
+    ) -> _tools_read.MetadataQueryOut:
         """Query metadata/index.jsonl. ``by`` is one of: status, extension,
         extractor, path_prefix, all. ``value`` is the filter value
         (required unless by=all). Returns up to ``limit`` records with
-        per-source metadata (hash, summary, topics, paths)."""
-        return await _offload(_tools.tool_metadata_query, cfg, runtime, by=by, value=value, limit=limit)
+        per-source metadata (hash, summary, topics, paths), starting at
+        ``offset`` in a stable path-sorted order so paging is meaningful."""
+        return await _offload(
+            _tools_read.tool_metadata_query, cfg, runtime,
+            by=by, value=value, limit=limit, offset=offset,
+        )
 
     @mcp.tool()
-    async def vault_related(concept: str, limit: int = 8) -> dict:
+    async def vault_related(concept: str, limit: int = 8) -> _tools_read.RelatedOut:
         """Given a concept — its slug or display name (e.g. 'packet-switching'
         or 'Packet Switching') — return the concepts most related to it, by
         co-occurrence (tagged on the same documents) and semantic similarity.
         Use this to explore how topics in the vault connect."""
-        return await _offload(_tools.tool_related, cfg, runtime, concept=concept, limit=limit)
+        return await _offload(_tools_read.tool_related, cfg, runtime, concept=concept, limit=limit)
 
     @mcp.tool()
-    async def vault_create_note(path: str, content: str) -> dict:
+    async def vault_create_note(path: str, content: str) -> _tools.WriteResult:
         """Create a new Markdown note. ``path`` must live under one of
         knowledge/{notes,projects,research,people,organisations,university,meetings,assistant}.
         Refuses to overwrite an existing note — vault_append_to_note
@@ -195,7 +215,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         return await _offload(_tools.tool_create_note, cfg, runtime, path=path, content=content)
 
     @mcp.tool()
-    async def vault_replace_note(path: str, content: str) -> dict:
+    async def vault_replace_note(path: str, content: str) -> _tools.WriteResult:
         """Overwrite an existing note under one of the knowledge/ subdirs
         with new content (full replace). Refuses to create a missing file
         — use vault_create_note for that. Use this to regenerate a note in
@@ -203,13 +223,13 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         return await _offload(_tools.tool_replace_note, cfg, runtime, path=path, content=content)
 
     @mcp.tool()
-    async def vault_append_to_note(path: str, content: str) -> dict:
+    async def vault_append_to_note(path: str, content: str) -> _tools.WriteResult:
         """Append ``content`` to an existing note under one of the
         knowledge/ subdirs. Adds a blank-line separator if needed."""
         return await _offload(_tools.tool_append_to_note, cfg, runtime, path=path, content=content)
 
     @mcp.tool()
-    async def vault_update_concept_user_section(slug: str, content: str) -> dict:
+    async def vault_update_concept_user_section(slug: str, content: str) -> _tools.WriteResult:
         """Replace the user-editable section of a concept note (everything
         below the AUTO-GENERATED-END marker). Auto-generated content
         above the marker is preserved. ``slug`` is the filename without
@@ -217,7 +237,22 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         return await _offload(_tools.tool_update_concept_user_section, cfg, runtime, slug=slug, content=content)
 
     @mcp.tool()
-    async def vault_drop_inbox_file(path: str, content_base64: str) -> dict:
+    async def vault_update_compiled_truth(path: str, content: str) -> _tools.WriteResult:
+        """Replace the compiled-truth block of an entity note — the text
+        between the `<!-- COMPILED-TRUTH-START -->` and
+        `<!-- COMPILED-TRUTH-END -->` markers, and nothing else. Every
+        other byte of the note (frontmatter, `relations:`, the
+        hand-written body, the whole `## Log`) stays exactly as it is on
+        disk, so this is the only safe way to write compiled truth —
+        never vault_replace_note. Refuses a note with no fence or an
+        ambiguous one (one marker without the other, out of order,
+        duplicated) and refuses knowledge/assistant/ notes."""
+        return await _offload(
+            _tools.tool_update_compiled_truth, cfg, runtime, path=path, content=content
+        )
+
+    @mcp.tool()
+    async def vault_drop_inbox_file(path: str, content_base64: str) -> _tools.WriteResult:
         """Drop a file at inbox/<path> for later ingestion. ``content_base64``
         is the file content base64-encoded. Up to 100 MB. Refuses if a
         file already exists at that path. Use this to hand the ingest
@@ -232,7 +267,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         valid_from: str = "",
         valid_until: str = "",
         source: str = "",
-    ) -> dict:
+    ) -> _entity_tools.EntityWriteResult:
         """Add or close one typed relation in an EXISTING entity note's
         frontmatter. ``rel`` comes from a closed vocabulary: works_at,
         member_of, attended, stakeholder_in, collaborator_on, met_at,
@@ -252,7 +287,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
     @mcp.tool()
     async def entity_append_fact(
         entity_path: str, text: str, source: str, date: str = ""
-    ) -> dict:
+    ) -> _tools.WriteResult:
         """Append one dated, source-linked fact to the '## Log' section of
         an existing entity note. ``text`` is a single line (max 500 chars
         — distil it); ``source`` is required, the vault-relative
@@ -273,7 +308,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         as_of: str = "",
         include_closed: bool = False,
         limit: int = 50,
-    ) -> dict:
+    ) -> _entity_tools.RelationsQueryOut:
         """Query the typed relation graph (read-only). All filters optional
         and ANDed: ``rel`` (closed vocab: works_at, member_of, attended,
         stakeholder_in, collaborator_on, met_at, related_to), ``entity`` (the
@@ -296,7 +331,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         attendees: list[str],
         project: str = "",
         body: str = "",
-    ) -> dict:
+    ) -> _tools.WriteResult:
         """Create a meeting note at knowledge/meetings/<YYYY>/<date>-<slug>.md
         and record an 'attended' relation on every attendee. ``attendees``
         are people/ node ids (e.g. 'people/anna-kowalska') whose notes must
@@ -317,7 +352,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         top_k: int = 10,
         recency_halflife_days: float = 30.0,
         types: list[str] | None = None,
-    ) -> dict:
+    ) -> _memory_tools.MemorySearchOut:
         """Memory-flavoured semantic search: same index as vault_search but
         re-ranked by recency (half-life decay on each note's 'updated'
         date; default halflife 30 days) and memory status (superseded
@@ -325,7 +360,12 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         use vault_search for timeless archival lookups. ``types``
         optionally filters to knowledge subdirs (people, organisations,
         projects, meetings, notes, research, university, assistant)
-        and/or 'archive' for ingested sources."""
+        and/or 'archive' for ingested sources. Each hit carries an
+        ``evidence`` hint (exists/probable/unknown, plus a node_id when
+        known) saying whether its subject already has an entity note under
+        knowledge/people|organisations|projects|meetings/ — check it before
+        creating a new entity note so you link the existing one instead of
+        splitting the person/project graph."""
         return await _offload(
             _memory_tools.tool_memory_search, cfg, runtime,
             query=query, top_k=top_k,
@@ -333,7 +373,7 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         )
 
     @mcp.tool()
-    async def profile_update(content: str) -> dict:
+    async def profile_update(content: str) -> _tools.WriteResult:
         """Replace the assistant's standing profile of the user
         (knowledge/assistant/PROFILE.md) in full. The profile rides into
         every session, so it has a hard byte budget (default 4096): curate,

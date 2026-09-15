@@ -5,6 +5,7 @@ Examples:
     uv run python scripts/dream_gate.py                 # gate check: exit 0 dream / 1 skip
     uv run python scripts/dream_gate.py --dry-run       # check without recording the pending marker
     uv run python scripts/dream_gate.py --emit-packet   # print the dream worklist JSON
+    uv run python scripts/dream_gate.py --propose f.json  # write the adjudicated contradiction proposals
     uv run python scripts/dream_gate.py --mark-done     # after a successful dream session
 
 The logic lives in ``scripts/ingest_lib/dream.py`` — deterministic git +
@@ -28,13 +29,16 @@ from pathlib import Path
 # (i.e. without ``uv run`` having installed the package yet).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ingest_lib.config import default_paths  # noqa: E402
+from ingest_lib.config import VaultPaths, default_paths  # noqa: E402
 from ingest_lib.dream import (  # noqa: E402
     GitError,
+    ProposalOutcome,
     build_packet,
     evaluate_gate,
     mark_done,
+    parse_adjudicated,
     record_pending,
+    write_proposals,
 )
 
 
@@ -64,7 +68,8 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Exit codes for the default (check) mode: 0 = dream, 1 = skip, "
-            "2 = git error. --emit-packet and --mark-done always exit 0 on success."
+            "2 = git error or bad --propose input. --emit-packet, --propose and "
+            "--mark-done always exit 0 on success."
         ),
     )
     parser.add_argument("--as-of", type=_parse_as_of, default=None, metavar="ISO8601",
@@ -77,11 +82,41 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Candidate connection pairs in the packet (default: 10, env BRAIN_DREAM_PAIRS).")
     parser.add_argument("--emit-packet", action="store_true",
                         help="Print the dream worklist JSON (regardless of the gate verdict).")
+    parser.add_argument("--propose", metavar="JSON", default=None,
+                        help=(
+                            "Write the adjudicated contradiction proposals in this JSON "
+                            "file (or '-' for stdin) into knowledge/assistant/inbox/. "
+                            "The array's entries are the packet's own contradiction "
+                            "findings plus a 'title' and 'body'."
+                        ))
     parser.add_argument("--mark-done", action="store_true",
                         help="Record a completed dream: advance metadata/dream.json to HEAD.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Check without recording the pending marker.")
     return parser
+
+
+def _run_propose(
+    source: str, paths: VaultPaths, *, now: datetime, logger: logging.Logger
+) -> list[ProposalOutcome]:
+    """Write the LLM-adjudicated contradiction survivors as fact notes.
+
+    The dream session adjudicates, this writes: every proposal goes through
+    ``ingest_lib.propose.propose_fact``, so the memory-fact contract and the
+    ``written_via: script`` provenance have exactly one owner, and re-running
+    over the same findings is a no-op (the inbox filename is a hash of the
+    proposal's content).
+    """
+    raw_text = (
+        sys.stdin.read() if source == "-"
+        else Path(source).read_text(encoding="utf-8")
+    )
+    try:
+        payload: object = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--propose input is not valid JSON: {exc}") from None
+    findings = parse_adjudicated(payload)
+    return write_proposals(paths, findings, now=now, logger=logger)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     paths = default_paths()
     as_of = args.as_of if args.as_of is not None else datetime.now(tz=UTC)
     try:
+        if args.propose is not None:
+            outcomes = _run_propose(args.propose, paths, now=as_of, logger=logger)
+            print(json.dumps(outcomes, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
         if args.mark_done:
             state = mark_done(paths, now=as_of, logger=logger)
             print(json.dumps(asdict(state), ensure_ascii=False, sort_keys=True))
@@ -108,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(verdict), ensure_ascii=False, sort_keys=True))
         return 0 if verdict.should_dream else 1
     except GitError as exc:
+        logger.error("%s", exc)
+        return 2
+    except (ValueError, OSError) as exc:
+        # --propose input problems: a malformed file, a finding missing a
+        # field, an edited fact. A clean message, not a traceback.
         logger.error("%s", exc)
         return 2
     except Exception:  # noqa: BLE001 — a crash must exit 2, not read as "skip"

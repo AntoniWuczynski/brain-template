@@ -5,8 +5,86 @@
   "showAttachments": false,
   "hideUnresolved": false,
   "showOrphans": true,
-  "collapse-color-groups": true,
-  "colorGroups": [],
+  "collapse-color-groups": false,
+  "colorGroups": [
+    {
+      "query": "path:knowledge/projects",
+      "color": {
+        "a": 1,
+        "rgb": 15242810
+      }
+    },
+    {
+      "query": "path:knowledge/people",
+      "color": {
+        "a": 1,
+        "rgb": 5017568
+      }
+    },
+    {
+      "query": "path:knowledge/organisations",
+      "color": {
+        "a": 1,
+        "rgb": 3127464
+      }
+    },
+    {
+      "query": "path:knowledge/meetings",
+      "color": {
+        "a": 1,
+        "rgb": 10186720
+      }
+    },
+    {
+      "query": "path:knowledge/research",
+      "color": {
+        "a": 1,
+        "rgb": 13939514
+      }
+    },
+    {
+      "query": "path:knowledge/university",
+      "color": {
+        "a": 1,
+        "rgb": 14704762
+      }
+    },
+    {
+      "query": "path:knowledge/index",
+      "color": {
+        "a": 1,
+        "rgb": 6273125
+      }
+    },
+    {
+      "query": "path:knowledge/concepts",
+      "color": {
+        "a": 1,
+        "rgb": 8160920
+      }
+    },
+    {
+      "query": "path:knowledge/assistant",
+      "color": {
+        "a": 1,
+        "rgb": 12932528
+      }
+    },
+    {
+      "query": "path:knowledge/notes",
+      "color": {
+        "a": 1,
+        "rgb": 4175828
+      }
+    },
+    {
+      "query": "path:archive/processed",
+      "color": {
+        "a": 1,
+        "rgb": 7041664
+      }
+    }
+  ],
   "collapse-display": false,
   "showArrow": false,
   "textFadeMultiplier": 0,
@@ -17,6 +95,6 @@
   "repelStrength": 10,
   "linkStrength": 1,
   "linkDistance": 250,
-  "scale": 0.08888229047752248,
+  "scale": 0.08279407671133353,
   "close": true
 }

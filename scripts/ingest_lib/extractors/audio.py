@@ -145,7 +145,7 @@ def _extract_subtitles(src: Path) -> ExtractionResult:
 
 def _extract_audio(src: Path) -> ExtractionResult:
     try:
-        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+        from faster_whisper import WhisperModel
     except ImportError:
         return ExtractionResult(
             status="manual_review", extractor="audio-asr", markdown="",

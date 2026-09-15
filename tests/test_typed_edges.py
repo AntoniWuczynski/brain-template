@@ -53,7 +53,7 @@ def _write(paths: VaultPaths, rel: str, text: str) -> None:
 # typed_edges (pure)
 # ---------------------------------------------------------------------------
 
-def test_typed_edges_are_directional_not_reordered():
+def test_typed_edges_are_directional_not_reordered() -> None:
     # "people/zed" > "organisations/acme" lexicographically; an undirected
     # kind would swap them — typed edges must keep origin in `a`.
     entities = {
@@ -74,7 +74,7 @@ def test_typed_edges_are_directional_not_reordered():
     assert e.sources == ("knowledge/people/zed.md",)   # declaring note = provenance
 
 
-def test_typed_edges_deterministic_sort_and_history_kept():
+def test_typed_edges_deterministic_sort_and_history_kept() -> None:
     entities = {
         "people/zed": _entity(
             "people/zed",
@@ -141,7 +141,7 @@ def _seed_three_kinds(tmp_path: Path) -> VaultPaths:
     return paths
 
 
-def test_compute_connections_merges_all_three_kinds(tmp_path: Path):
+def test_compute_connections_merges_all_three_kinds(tmp_path: Path) -> None:
     paths = _seed_three_kinds(tmp_path)
     edges, _related, stats = compute_connections(paths)
 
@@ -153,7 +153,7 @@ def test_compute_connections_merges_all_three_kinds(tmp_path: Path):
     assert (typed[0].a, typed[0].b) == ("people/anna-kowalska", "organisations/acme")
 
 
-def test_jsonl_round_trip_preserves_typed_keys_and_old_lines(tmp_path: Path):
+def test_jsonl_round_trip_preserves_typed_keys_and_old_lines(tmp_path: Path) -> None:
     paths = _seed_three_kinds(tmp_path)
     rebuild_connections(paths, logger=_LOG)
 
@@ -181,7 +181,7 @@ def test_jsonl_round_trip_preserves_typed_keys_and_old_lines(tmp_path: Path):
     assert all(e.rel == "" and e.valid_from == "" and e.valid_until == "" for e in old)
 
 
-def test_build_related_map_ignores_typed_kind_without_raising():
+def test_build_related_map_ignores_typed_kind_without_raising() -> None:
     edges = [
         Edge(a="alpha", b="beta", kind="cooccurrence", weight=1.0),
         Edge(a="people/x", b="organisations/y", kind="typed", weight=1.0,
@@ -238,7 +238,7 @@ def _seed_entities(tmp_path: Path) -> VaultPaths:
     return paths
 
 
-def test_related_entities_resolution_by_id_stem_title_and_alias(tmp_path: Path):
+def test_related_entities_resolution_by_id_stem_title_and_alias(tmp_path: Path) -> None:
     paths = _seed_entities(tmp_path)
     for query in ("people/anna-kowalska", "anna-kowalska", "Anna Kowalska", "Ania"):
         node, neighbours = related_entities(paths, query)
@@ -248,7 +248,7 @@ def test_related_entities_resolution_by_id_stem_title_and_alias(tmp_path: Path):
     assert (node, neighbours) == ("", [])
 
 
-def test_related_entities_directions_and_ranking(tmp_path: Path):
+def test_related_entities_directions_and_ranking(tmp_path: Path) -> None:
     paths = _seed_entities(tmp_path)
     node, neighbours = related_entities(paths, "people/anna-kowalska")
     assert node == "people/anna-kowalska"
@@ -274,7 +274,7 @@ def test_related_entities_directions_and_ranking(tmp_path: Path):
     assert neighbours[-1].valid_until == "2024-12-31"
 
 
-def test_related_entities_from_target_side_sees_incoming(tmp_path: Path):
+def test_related_entities_from_target_side_sees_incoming(tmp_path: Path) -> None:
     paths = _seed_entities(tmp_path)
     node, neighbours = related_entities(paths, "ACME")   # resolves via title
     assert node == "organisations/acme"
@@ -286,7 +286,7 @@ def test_related_entities_from_target_side_sees_incoming(tmp_path: Path):
     assert n.valid_until == "2024-12-31"
 
 
-def test_related_entities_caps_at_top_n(tmp_path: Path):
+def test_related_entities_caps_at_top_n(tmp_path: Path) -> None:
     paths = _seed_entities(tmp_path)
     _node, neighbours = related_entities(paths, "people/anna-kowalska", top_n=1)
     assert len(neighbours) == 1

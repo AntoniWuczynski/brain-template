@@ -95,7 +95,14 @@ def _hit(rel: str, score: float = 0.9, origin: str = "knowledge-note") -> Search
 def _patch_search(monkeypatch: pytest.MonkeyPatch, hits: list[SearchHit]) -> list[int]:
     requested: list[int] = []
 
-    def fake_search(paths: VaultPaths, query: str, *, top_k: int = 10, logger=None):
+    def fake_search(
+        paths: VaultPaths,
+        query: str,
+        *,
+        top_k: int = 10,
+        mode: str = "hybrid",
+        logger: logging.Logger | None = None,
+    ) -> list[SearchHit]:
         requested.append(top_k)
         return hits
 
@@ -292,3 +299,29 @@ def test_top_k_truncates_after_reranking(
     assert len(hits) == 1
     assert hits[0].source_relative_path == "knowledge/notes/fresh.md"
     assert isinstance(hits[0], MemoryHit)
+
+
+def test_archive_recency_uses_created_at_not_a_later_reingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AUD-098: a re-summarise or metadata refresh bumps updated_at without
+    # the document changing, which used to reset the source's "recency".
+    paths = _vault(tmp_path)
+    append_record(
+        paths.metadata_index_jsonl,
+        IndexRecord(
+            relative_path="uni/lecture.pdf", source_hash="h", size_bytes=1,
+            extension=".pdf", extractor="pdf-mineru", status="processed",
+            raw_path="archive/raw/uni/lecture.pdf",
+            processed_path="archive/processed/uni/lecture.md",
+            index_note_path=None,
+            created_at=_iso(NOW - timedelta(days=60)),
+            updated_at=_iso(NOW),
+        ),
+    )
+    _patch_search(monkeypatch, [_hit("uni/lecture.pdf", origin="pdf-mineru")])
+
+    hits = memory_search(paths, "q", halflife_days=30.0, now=NOW, logger=_LOG)
+
+    assert hits[0].updated == _iso(NOW - timedelta(days=60))
+    assert hits[0].recency == pytest.approx(0.25)

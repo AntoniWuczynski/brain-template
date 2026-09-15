@@ -188,7 +188,7 @@ def _retrieve(
     if not queries or not vectors_path.exists() or not meta_path.exists():
         return empty
     try:
-        import numpy as np  # type: ignore[import-not-found]
+        import numpy as np
     except ImportError:
         return empty
     from .semantic import _load_embedder, _query_prefix

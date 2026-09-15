@@ -8,9 +8,15 @@ tool call).
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 import sys
 import threading
 from pathlib import Path
+from typing import NoReturn
+
+import pytest
 
 # mcp_server is not an installed package (only ingest_lib is). The full
 # suite imports it via a collection-order side effect; pin the repo root
@@ -99,13 +105,40 @@ def test_concurrent_writers_do_not_interleave(tmp_path: Path) -> None:
         assert row["outcome"] == "ok"
 
 
-def test_oserror_is_swallowed(tmp_path: Path, monkeypatch) -> None:
+def test_oserror_is_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     audit = AuditLog(tmp_path)
+    attempts: list[str] = []
 
-    def boom(*args, **kwargs):
+    def boom(path: object, *args: object, **kwargs: object) -> NoReturn:
+        attempts.append(Path(str(path)).name)
         raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "open", boom)
-    # Must not raise: logging failure never propagates into the tool call.
+    monkeypatch.setattr(os, "open", boom)
+    with caplog.at_level(logging.WARNING, logger="mcp_server.audit"):
+        # Must not raise: logging failure never propagates into the tool call.
+        audit.tool_event(agent="a", tool="t", path=None, outcome="ok")
+        audit.access_event(agent="a", tool="t", paths=[])
+
+    # AUD-072: "did not raise" is not evidence the fail-open branch ran — a
+    # writer that stopped calling the patched name would pass that too. Pin
+    # the branch itself: both appends reached the opener, both failed, and
+    # both were reported as a warning rather than swallowed in silence.
+    assert attempts == ["mcp-audit.jsonl", "mcp-access.jsonl"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert all("disk full" in w for w in warnings)
+    assert [w for w in warnings if "mcp-audit.jsonl" in w]
+    assert [w for w in warnings if "mcp-access.jsonl" in w]
+    # ...and nothing landed on disk, so the rows really were lost.
+    assert not (tmp_path / "logs" / "mcp-audit.jsonl").exists()
+    assert not (tmp_path / "logs" / "mcp-access.jsonl").exists()
+
+
+def test_new_log_file_created_with_0600(tmp_path: Path) -> None:
+    audit = AuditLog(tmp_path)
     audit.tool_event(agent="a", tool="t", path=None, outcome="ok")
-    audit.access_event(agent="a", tool="t", paths=[])
+
+    path = tmp_path / "logs" / "mcp-audit.jsonl"
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600

@@ -15,17 +15,26 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Letters and digits in ANY script, underscore excluded so snake_case
+# identifiers still split into their parts (``memory_status`` -> ``memory``,
+# ``status``). ``\w`` alone would keep the underscore and swallow them whole.
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _K1 = 1.5
 _B = 0.75
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercase alphanumeric runs. Keeps identifiers whole (``COMP0157`` ->
-    ``comp0157``) so exact-token queries can match them."""
-    return _TOKEN_RE.findall(text.lower())
+    """Case-folded alphanumeric runs in any script. Keeps identifiers whole
+    (``COMP0157`` -> ``comp0157``) so exact-token queries can match them, and
+    keeps non-ASCII names whole (``Wuczyński`` -> ``wuczyński``) — an
+    ASCII-only pattern shredded them into fragments (``wuczy``, ``ski``) that
+    collide with every other name, which defeats the exact-identifier job this
+    leg exists for. NFKC first so compatibility forms (fullwidth digits,
+    ligatures) fold onto the same token as their plain spelling."""
+    return _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).casefold())
 
 
 @dataclass(frozen=True)

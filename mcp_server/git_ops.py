@@ -57,11 +57,20 @@ def _git(cwd: Path, *args: str, timeout: float = 30.0) -> str:
     return result.stdout
 
 
+def current_branch(vault_root: Path) -> str:
+    """Short name of the checked-out branch, or ``'(detached HEAD)'``."""
+    try:
+        return _git(vault_root, "symbolic-ref", "--short", "HEAD").strip()
+    except GitError:
+        return "(detached HEAD)"
+
+
 def commit_paths(
     vault_root: Path,
     *,
     paths: list[Path],
     message: str,
+    expected_branch: str | None = None,
 ) -> CommitOutcome:
     """Stage the given paths and commit — no push.
 
@@ -69,12 +78,22 @@ def commit_paths(
     because the index is shared global state across concurrent tool
     threads. Returns ``pushed=False`` always; pushing is the caller's
     business (asynchronously via ``push_queue.PushWorker``). Raises
-    ``GitError`` only if the commit step itself fails.
+    ``GitError`` only if the commit step itself fails, or, when
+    ``expected_branch`` is given, if a different branch (or no branch,
+    i.e. detached HEAD) is checked out.
     """
     if not paths:
         return CommitOutcome(None, False, False, "no paths given")
 
     with _GIT_LOCK:
+        if expected_branch is not None:
+            current = current_branch(vault_root)
+            if current != expected_branch:
+                raise GitError(
+                    f"refusing to commit: checked-out branch {current!r} is not "
+                    f"the configured {expected_branch!r}"
+                )
+
         # Stage only the explicit paths we touched.
         rel_paths = []
         for p in paths:

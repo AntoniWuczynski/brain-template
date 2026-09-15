@@ -16,7 +16,7 @@ handwriting/diagrams remain viewable from the note.
 Routing: the PDF extractor uses this module when ``BRAIN_PDF_EXTRACTOR``
 is ``vlm`` (set it for handwritten modules). Provider/model selection
 reuses the summarizer's config; the vision model defaults to
-``claude-sonnet-4-6`` for anthropic and is overridable with
+``claude-sonnet-5`` for anthropic and is overridable with
 ``BRAIN_VLM_MODEL``.
 """
 from __future__ import annotations
@@ -45,7 +45,9 @@ _MAX_OUTPUT_TOKENS: Final[int] = 4096
 # so BRAIN_LOCAL_MODEL takes effect when set after import — consistent with
 # summarize._select_model. This literal only holds the static fallback.
 _DEFAULT_VLM_MODELS: Final[dict[str, str]] = {
-    "anthropic": "claude-sonnet-4-6",
+    # Sonnet 5 is the current Sonnet: same 1M context as sonnet-4-6 at
+    # $2/$10 per million rather than $3/$15.
+    "anthropic": "claude-sonnet-5",
     "openai": "gpt-5-mini",
     "gemini": "gemini-2.5-flash",
     "local": "llama3.2-vision",
@@ -223,7 +225,7 @@ def extract(src: Path, assets_dir: Path) -> ExtractionResult:
 
 def _render_pages(src: Path) -> list[bytes]:
     """Render each PDF page to PNG bytes via pypdfium2."""
-    import pypdfium2 as pdfium  # type: ignore[import-not-found]
+    import pypdfium2 as pdfium
 
     scale = float(os.environ.get("BRAIN_VLM_SCALE") or _DEFAULT_SCALE)
     out: list[bytes] = []

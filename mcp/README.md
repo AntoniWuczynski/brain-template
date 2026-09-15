@@ -24,7 +24,8 @@ ingestion without per-agent custom integrations.
 ## Tools
 
 Seventeen tools, registered in [`mcp_server/app.py`](../mcp_server/app.py) and
-implemented in [`mcp_server/tools.py`](../mcp_server/tools.py) (read/write),
+implemented in [`mcp_server/tools_read.py`](../mcp_server/tools_read.py) (read),
+[`mcp_server/tools.py`](../mcp_server/tools.py) (write + shared guards),
 [`mcp_server/entity_tools.py`](../mcp_server/entity_tools.py) (entity) and
 [`mcp_server/memory_tools.py`](../mcp_server/memory_tools.py) (memory).
 
@@ -43,7 +44,8 @@ implemented in [`mcp_server/tools.py`](../mcp_server/tools.py) (read/write),
 
 ### Write
 
-Every write commits to the vault's git branch and returns a `WriteResult`:
+Every write commits to the vault's git branch (`BRAIN_MCP_GIT_BRANCH`,
+default `main`) and returns a `WriteResult`:
 
 ```
 {path, bytes_written, commit_sha, committed,
@@ -61,7 +63,7 @@ compatibility only.
 | Name | Description | I/O |
 |---|---|---|
 | `vault_create_note` | Create a **new** note. Refuses to overwrite. | `path, content` → `WriteResult` |
-| `vault_replace_note` | **Overwrite an existing** note in full. Refuses to create a missing file. | `path, content` → `WriteResult` |
+| `vault_replace_note` | **Overwrite an existing** note in full. Refuses to create a missing file. Both `create` and `replace` also refuse frontmatter that doesn't parse as YAML and a `relations:` block with malformed entries (see "Refusals" below). | `path, content` → `WriteResult` |
 | `vault_append_to_note` | Append to an existing note. | `path, content` → `WriteResult` |
 | `vault_update_concept_user_section` | Replace the user-editable section of a concept note (below the `AUTO-GENERATED-END` marker). | `slug, content` → `WriteResult` |
 | `vault_drop_inbox_file` | Drop a (possibly binary) file under `inbox/` for later ingestion. | `path, content_base64` → `WriteResult` |
@@ -87,7 +89,7 @@ that is `vault_create_note`'s job, so "who made this note" stays unambiguous.
 **Write allowlist** (`mcp_server/config.py`): `create`/`replace`/`append`
 notes may only touch
 `knowledge/{notes,projects,research,people,organisations,university,meetings,assistant}`.
-Concept notes use the dedicated `update_concept_user_section` tool.
+Concept notes use the dedicated `vault_update_concept_user_section` tool.
 `knowledge/assistant/PROFILE.md` lives inside the allowlist but the three
 general verbs **refuse** it — that is what makes `profile_update`'s byte
 budget (`BRAIN_PROFILE_MAX_BYTES`) real, since it would otherwise be
@@ -99,6 +101,26 @@ only through `vault_drop_inbox_file`. Everything else — `archive/`,
 regenerate a note in full an agent reads it, rebuilds the body (preserving
 any frontmatter it wants to keep), then calls `vault_replace_note` — an
 explicit verb, never a silent truncation.
+
+### Refusals
+
+A write tool can fail closed for reasons beyond the allowlist above, always
+before anything reaches disk:
+
+- **Unparseable frontmatter.** If the note's frontmatter fence is present but
+  doesn't parse as a YAML mapping, the server can't stamp provenance into it
+  and refuses (`ProvenanceError`, `mcp_server/provenance.py`).
+- **Malformed `relations:`.** `vault_create_note` and `vault_replace_note`
+  reject a `relations:` block containing an unknown `rel`, a target that
+  doesn't look like a node id, or a non-canonical date — the same closed
+  vocabulary and shape `AGENTS.md` defines, enforced at write time rather
+  than left for the sweep to flag after the fact.
+- **Wrong branch checked out.** Every commit passes `expected_branch`
+  (`BRAIN_MCP_GIT_BRANCH`, default `main`) to git; if the vault's checked-out
+  branch doesn't match (including detached HEAD), the commit step refuses.
+  The note is still written to disk — the tool returns `committed: false`
+  with a warning, not an error, so the caller knows the change didn't land
+  in git.
 
 ## After a write: provenance, commits, push, reindex
 
@@ -143,15 +165,19 @@ explicit verb, never a silent truncation.
   hosts are configured for the deployment (localhost by default, plus any
   public host behind a Cloudflare Tunnel).
 - **Rate + concurrency limits**: writes 30/min, search 60/min, reads 120/min,
-  with bounded concurrency so a burst of slow ops can't wedge every tool.
+  **per agent** (one sliding window per bearer token, not a shared process-wide
+  bucket) — with `BRAIN_MCP_TOKENS` configuring N agents, the effective
+  ceiling is N × those numbers. Bounded concurrency on top so a burst of slow
+  ops can't wedge every tool.
 - **Cloudflare Access** is the intended outer auth ring for remote
   deployments; the bearer token is the inner ring. See `DEPLOY.md`.
 
 ## Running it
 
 - **Locally for Claude Code** — `mcp_server/run-local.sh` binds
-  `127.0.0.1:8765`, persists a token at `~/.brain-mcp-token`, and prints the
-  `claude mcp add` command to register it (push is off by default).
+  `127.0.0.1:8765`, persists a token at `~/.brain-mcp-token` (override the
+  path with `BRAIN_MCP_TOKEN_FILE`), and prints the `claude mcp add` command
+  to register it (push is off by default).
 - **As a service** — `mcp_server/systemd/brain-mcp.service`; see `DEPLOY.md`.
 - **Smoke test** — `uv run python -m mcp_server.manual_test` (full stack,
   rewinds its own writes). The write-policy and search-gate invariants it used

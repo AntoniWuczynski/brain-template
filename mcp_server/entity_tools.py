@@ -29,8 +29,9 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from ingest_lib.concepts import slugify as _slugify  # type: ignore[import-not-found]  # noqa: E402
-from ingest_lib.relations import (  # type: ignore[import-not-found]  # noqa: E402
+from ingest_lib import paths_for_root as _paths_for_root  # noqa: E402
+from ingest_lib.concepts import slugify as _slugify  # noqa: E402
+from ingest_lib.relations import (  # noqa: E402
     RELATION_VOCAB,
     Relation,
     append_fact_to_log,
@@ -43,7 +44,9 @@ from ingest_lib.relations import (  # type: ignore[import-not-found]  # noqa: E4
 )
 
 from . import tools as _tools
+from . import tools_read as _tools_read
 from .config import MAX_NOTE_BYTES, ServerConfig
+from .errors import ToolError
 from .git_ops import CommitOutcome
 from .identity import current_agent
 from .provenance import stamp_provenance
@@ -54,7 +57,7 @@ from .runtime import Runtime
 # the traversal/symlink/control-character gauntlet, or a target like
 # ``people/../../secret`` would probe paths outside the vault.
 from .safety import _resolve_inside_vault, resolve_write_under_allowlist
-from .tools import ToolError, WriteResult
+from .tools import WriteResult
 
 # Cap on one fact line. Facts are meant to be distilled single sentences;
 # anything longer belongs in a note body, not the log.
@@ -176,7 +179,7 @@ def tool_relations_query(
     interval contains that date (the supersede history, queryable). Without
     ``as_of``, only currently-open relations unless ``include_closed``.
     """
-    _tools._rate_check_read()
+    _tools_read._rate_check_read()
     if rel and rel not in RELATION_VOCAB:
         raise ToolError(
             f"unknown rel {rel!r}; the closed vocabulary is: "
@@ -187,7 +190,7 @@ def tool_relations_query(
     if not 1 <= limit <= 500:
         raise ToolError("limit must be in [1, 500]")
 
-    paths = _tools._paths_for_root(cfg.vault_root)
+    paths = _paths_for_root(cfg.vault_root)
     hits = query_relations(
         paths,
         rel=rel or None,
@@ -268,7 +271,10 @@ def tool_entity_upsert_relation(
                 text = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 raise ToolError("entity note could not be read") from None
-            new_text, action = upsert_relation_in_text(text, relation)
+            try:
+                new_text, action = upsert_relation_in_text(text, relation)
+            except ValueError as exc:
+                raise ToolError(str(exc)) from None
             if action == "noop":
                 # Nothing to write, nothing to commit: tell the agent the
                 # graph already says this instead of minting empty commits.
@@ -583,7 +589,12 @@ def tool_meeting_create(
                     raise ToolError(
                         f"attendee note could not be read: {note_path_for_node(aid)!r}"
                     ) from None
-                new_text, action = upsert_relation_in_text(text, attended)
+                try:
+                    new_text, action = upsert_relation_in_text(text, attended)
+                except ValueError as exc:
+                    raise ToolError(
+                        f"attendee note {note_path_for_node(aid)!r}: {exc}"
+                    ) from None
                 if action == "noop":
                     continue  # already recorded (e.g. a retried call)
                 pending.append((

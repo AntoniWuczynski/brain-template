@@ -9,10 +9,11 @@ import pytest
 
 from mcp_server.audit import AuditLog
 from mcp_server.config import ServerConfig
+from mcp_server.errors import ToolError
 from mcp_server.push_queue import PushWorker
 from mcp_server.reindex import IndexRefresher
 from mcp_server.runtime import Runtime
-from mcp_server.tools import ToolError, tool_chunk_context
+from mcp_server.tools_read import tool_chunk_context
 
 
 def _make_vault(tmp_path: Path) -> Path:
@@ -40,7 +41,7 @@ def _runtime(root: Path) -> Runtime:
     )
 
 
-def _seed_index(root: Path, rows: list[dict]) -> None:
+def _seed_index(root: Path, rows: list[dict[str, str | int]]) -> None:
     meta = root / "metadata" / "embeddings_meta.jsonl"
     meta.parent.mkdir(parents=True, exist_ok=True)
     with meta.open("w", encoding="utf-8") as fh:
@@ -48,7 +49,7 @@ def _seed_index(root: Path, rows: list[dict]) -> None:
             fh.write(json.dumps(r) + "\n")
 
 
-def _rows(src: str, n: int, origin: str = "knowledge-note") -> list[dict]:
+def _rows(src: str, n: int, origin: str = "knowledge-note") -> list[dict[str, str | int]]:
     return [
         {"source_relative_path": src, "text": f"chunk {i}", "chunk_idx": i,
          "title": src, "origin": origin, "source_hash": "h"}

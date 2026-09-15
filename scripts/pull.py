@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime, UTC
@@ -30,11 +31,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from ingest_lib.config import default_paths  # noqa: E402
 from ingest_lib.connectors import CONNECTORS, run_connector  # noqa: E402
+from ingest_lib.connectors._transcript_common import TranscriptSourceError  # noqa: E402
 
 
 def _load_env() -> None:
     try:
-        from dotenv import load_dotenv  # type: ignore[import-not-found]
+        from dotenv import load_dotenv
     except ImportError:
         return
     load_dotenv(_REPO_ROOT / ".env", override=False)
@@ -51,7 +53,9 @@ def _configure_logger(logs_dir: Path, name: str) -> logging.Logger:
         logger.removeHandler(h)
     fmt = logging.Formatter("%(asctime)sZ %(levelname)-7s %(message)s",
                             datefmt="%Y-%m-%dT%H:%M:%S")
-    fmt.converter = lambda *_a: time.gmtime()
+    # ``time.gmtime`` honours the record's creation timestamp, so a buffered
+    # flush stamps event-time rather than flush-time (as logging_setup does).
+    fmt.converter = time.gmtime
     file_h = logging.FileHandler(logs_dir / f"pull-{name}-{ts}.log", encoding="utf-8")
     file_h.setFormatter(fmt)
     logger.addHandler(file_h)
@@ -69,7 +73,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="report what would be pulled, write nothing")
     ap.add_argument("--then-ingest", action="store_true",
                     help="run the ingest pipeline over inbox/ after pulling")
+    ap.add_argument("--path", help="source file/dir for a local-file connector "
+                                    "(chat_export's conversations.json file, or "
+                                    "claude_code's sessions directory); "
+                                    "sets BRAIN_PULL_PATH for this run")
     args = ap.parse_args(argv)
+
+    if args.path:
+        os.environ["BRAIN_PULL_PATH"] = args.path
 
     if args.list or not args.connector:
         names = sorted(CONNECTORS)
@@ -92,8 +103,16 @@ def main(argv: list[str] | None = None) -> int:
     connector = CONNECTORS[args.connector]()
     pulled_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    stats = run_connector(connector, paths, pulled_at=pulled_at,
-                          dry_run=args.dry_run, logger=logger)
+    try:
+        stats = run_connector(connector, paths, pulled_at=pulled_at,
+                              dry_run=args.dry_run, logger=logger)
+    except TranscriptSourceError as exc:
+        # A --path/env-var-configured source that doesn't resolve is a loud,
+        # non-zero-exit failure — not a silent zero-item pull that looks
+        # like "nothing new" (see review M2).
+        logger.error("pull %s: %s", args.connector, exc)
+        print(f"pull {args.connector}: ERROR: {exc}", file=sys.stderr)
+        return 2
     print(f"pull {args.connector}: written={stats.written} skipped={stats.skipped}"
           f"{' (dry-run)' if args.dry_run else ''}")
 

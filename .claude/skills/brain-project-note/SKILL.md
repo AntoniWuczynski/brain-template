@@ -51,7 +51,26 @@ kebab-case filename (e.g. `mnemosyne-capabilities.md`), distinct from the
 `<slug>.md` overview. A note that spans several projects goes under
 `knowledge/projects/shared/`, linked to each project with a `related_to`
 relation. Give curated notes `topics:` and `relations:` frontmatter so they
-join the concept and relation graph. This is additive — the overview + log
+join the concept and relation graph, e.g.:
+
+```yaml
+relations:
+  - rel: related_to
+    target: projects/<slug>/<slug>
+    valid_from: "2025-03-01"      # optional, YYYY-MM-DD
+    source: knowledge/meetings/2026/2026-06-12-kern-call   # optional, provenance
+```
+
+`rel` must come from the closed vocabulary in AGENTS.md (`works_at`,
+`member_of`, `attended`, `stakeholder_in`, `collaborator_on`, `met_at`,
+`related_to`) — never invent a synonym. Targets are node ids: the
+`knowledge/`-relative path without extension, e.g.
+`projects/fps/stack-and-architecture` — never a `knowledge/...` prefix and
+never a `.md` suffix. A project is a FOLDER, so the project entity's id is
+its **overview note's** path — `projects/server/server`, never the bare
+folder `projects/server`, which is no note and resolves to nothing. Use the
+same canonical form for a `promote.target` in a memory fact. The server now refuses writes whose `relations:` block
+does not parse, so get the shape right first time. This is additive — the overview + log
 remain the session-snapshot baseline; curated notes are for knowledge that
 deserves its own home rather than a log line. The `notes/` subdir stays the
 human's area — never write there.

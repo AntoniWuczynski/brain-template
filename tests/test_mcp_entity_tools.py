@@ -7,8 +7,10 @@ test agent. Fully offline — no model loads, no network, no pushes.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
@@ -21,11 +23,11 @@ from mcp_server.entity_tools import (
     tool_meeting_create,
     tool_relations_query,
 )
+from mcp_server.errors import ToolError
 from mcp_server.identity import AGENT_VAR
 from mcp_server.push_queue import PushWorker
 from mcp_server.reindex import IndexRefresher
 from mcp_server.runtime import Runtime
-from mcp_server.tools import ToolError
 
 
 # --------------------------------------------------------------- harness
@@ -115,7 +117,7 @@ def _roomy_rate_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def env(tmp_path: Path):
+def env(tmp_path: Path) -> Iterator[tuple[Path, ServerConfig, Runtime]]:
     root = _make_vault(tmp_path)
     _seed(root)
     token = AGENT_VAR.set("agent-a")
@@ -130,7 +132,7 @@ SOURCE = "knowledge/meetings/2026/2026-06-01-kickoff"
 
 # ------------------------------------------------- entity_upsert_relation
 
-def test_upsert_adds_relation(env) -> None:
+def test_upsert_adds_relation(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     res = tool_entity_upsert_relation(
         cfg, runtime,
@@ -153,7 +155,7 @@ def test_upsert_adds_relation(env) -> None:
         "mcp(agent-a): relation works_at people/anna -> organisations/acme"
 
 
-def test_upsert_closes_open_relation(env) -> None:
+def test_upsert_closes_open_relation(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     tool_entity_upsert_relation(
         cfg, runtime, entity_path="knowledge/people/anna.md",
@@ -170,7 +172,7 @@ def test_upsert_closes_open_relation(env) -> None:
     assert on_disk.count("rel: works_at") == 1
 
 
-def test_upsert_noop_skips_write_and_commit(env) -> None:
+def test_upsert_noop_skips_write_and_commit(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     tool_entity_upsert_relation(
         cfg, runtime, entity_path="knowledge/people/anna.md",
@@ -191,7 +193,7 @@ def test_upsert_noop_skips_write_and_commit(env) -> None:
     assert _git(root, "rev-parse", "HEAD") == sha  # no new commit
 
 
-def test_upsert_rejects_unknown_rel(env) -> None:
+def test_upsert_rejects_unknown_rel(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="works_at"):  # vocabulary is listed
         tool_entity_upsert_relation(
@@ -200,7 +202,7 @@ def test_upsert_rejects_unknown_rel(env) -> None:
         )
 
 
-def test_upsert_rejects_missing_target(env) -> None:
+def test_upsert_rejects_missing_target(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match=r"knowledge/organisations/ghost\.md"):
         tool_entity_upsert_relation(
@@ -209,7 +211,7 @@ def test_upsert_rejects_missing_target(env) -> None:
         )
 
 
-def test_upsert_rejects_nonexistent_entity(env) -> None:
+def test_upsert_rejects_nonexistent_entity(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="vault_create_note"):
         tool_entity_upsert_relation(
@@ -218,12 +220,49 @@ def test_upsert_rejects_nonexistent_entity(env) -> None:
         )
 
 
+def test_upsert_refuses_unparseable_fenced_frontmatter(
+    env: tuple[Path, ServerConfig, Runtime]
+) -> None:
+    # F2: a note whose '---' fence is present but fails to parse as a YAML
+    # mapping (here: a tab-indented value) must be refused with a
+    # ToolError — an audited refusal, not the old silent double-fence —
+    # and nothing may be written or committed.
+    root, cfg, runtime = env
+    broken_text = "---\ntitle: Broken\n\trelations: []\n---\n\n# Broken\n"
+    broken_path = root / "knowledge/people/broken.md"
+    broken_path.write_text(broken_text, encoding="utf-8")
+
+    # Establish a real HEAD via one unrelated successful write, so "no new
+    # commit" below is checked against an actual prior SHA.
+    tool_entity_upsert_relation(
+        cfg, runtime, entity_path="knowledge/people/anna.md",
+        rel="works_at", target="organisations/acme",
+    )
+    sha = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(ToolError, match="does not parse as a YAML mapping"):
+        tool_entity_upsert_relation(
+            cfg, runtime, entity_path="knowledge/people/broken.md",
+            rel="works_at", target="organisations/acme",
+        )
+
+    assert broken_path.read_text(encoding="utf-8") == broken_text  # untouched
+    assert _git(root, "rev-parse", "HEAD") == sha                  # nothing committed
+
+
+class _RelationDateKwargs(TypedDict, total=False):
+    valid_from: str
+    valid_until: str
+
+
 @pytest.mark.parametrize("field,kwargs", [
     ("valid_from", {"valid_from": "01-01-2026"}),
     ("valid_from", {"valid_from": "2026-1-1"}),     # non-canonical
     ("valid_until", {"valid_until": "2026-13-40"}),  # impossible
 ])
-def test_upsert_rejects_bad_dates(env, field: str, kwargs: dict) -> None:
+def test_upsert_rejects_bad_dates(
+    env: tuple[Path, ServerConfig, Runtime], field: str, kwargs: _RelationDateKwargs
+) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="YYYY-MM-DD"):
         tool_entity_upsert_relation(
@@ -234,7 +273,7 @@ def test_upsert_rejects_bad_dates(env, field: str, kwargs: dict) -> None:
 
 # ---------------------------------------------------- entity_append_fact
 
-def test_append_fact_happy_path(env) -> None:
+def test_append_fact_happy_path(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     res = tool_entity_append_fact(
         cfg, runtime, entity_path="knowledge/people/anna.md",
@@ -250,7 +289,7 @@ def test_append_fact_happy_path(env) -> None:
     assert _git(root, "log", "-1", "--format=%s") == "mcp(agent-a): fact -> people/anna"
 
 
-def test_append_fact_defaults_date_to_today_utc(env) -> None:
+def test_append_fact_defaults_date_to_today_utc(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     # Capture the date window AROUND the call so a run that crosses UTC
     # midnight between the tool stamp and this assertion doesn't flake.
@@ -273,7 +312,7 @@ def test_append_fact_defaults_date_to_today_utc(env) -> None:
     ("   ", "non-empty"),
     ("x" * 501, "500"),
 ])
-def test_append_fact_rejects_bad_text(env, bad_text: str, expected: str) -> None:
+def test_append_fact_rejects_bad_text(env: tuple[Path, ServerConfig, Runtime], bad_text: str, expected: str) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match=expected):
         tool_entity_append_fact(
@@ -282,7 +321,7 @@ def test_append_fact_rejects_bad_text(env, bad_text: str, expected: str) -> None
         )
 
 
-def test_append_fact_requires_source(env) -> None:
+def test_append_fact_requires_source(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="source is required"):
         tool_entity_append_fact(
@@ -291,7 +330,7 @@ def test_append_fact_requires_source(env) -> None:
         )
 
 
-def test_append_fact_rejects_missing_source_note(env) -> None:
+def test_append_fact_rejects_missing_source_note(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="does not exist"):
         tool_entity_append_fact(
@@ -300,7 +339,7 @@ def test_append_fact_rejects_missing_source_note(env) -> None:
         )
 
 
-def test_append_fact_rejects_bad_date(env) -> None:
+def test_append_fact_rejects_bad_date(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="YYYY-MM-DD"):
         tool_entity_append_fact(
@@ -311,7 +350,7 @@ def test_append_fact_rejects_bad_date(env) -> None:
 
 # --------------------------------------------------------- meeting_create
 
-def test_meeting_create_happy_path(env) -> None:
+def test_meeting_create_happy_path(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     res = tool_meeting_create(
         cfg, runtime,
@@ -360,7 +399,7 @@ def test_meeting_create_happy_path(env) -> None:
     assert changed == {rel, "knowledge/people/anna.md", "knowledge/people/bob.md"}
 
 
-def test_meeting_create_lists_all_missing_attendees(env) -> None:
+def test_meeting_create_lists_all_missing_attendees(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError) as exc:
         tool_meeting_create(
@@ -373,7 +412,7 @@ def test_meeting_create_lists_all_missing_attendees(env) -> None:
     assert "knowledge/people/anna.md" not in msg  # exists; not reported
 
 
-def test_meeting_create_refuses_duplicate(env) -> None:
+def test_meeting_create_refuses_duplicate(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     tool_meeting_create(
         cfg, runtime, date="2026-06-12", title="Kern Call",
@@ -386,7 +425,7 @@ def test_meeting_create_refuses_duplicate(env) -> None:
         )
 
 
-def test_meeting_create_without_project_has_no_relation(env) -> None:
+def test_meeting_create_without_project_has_no_relation(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     tool_meeting_create(
         cfg, runtime, date="2026-06-12", title="No Project Standup",
@@ -399,7 +438,7 @@ def test_meeting_create_without_project_has_no_relation(env) -> None:
     assert "_(empty)_" in meeting  # no body -> placeholder under Notes
 
 
-def test_meeting_create_rejects_missing_project(env) -> None:
+def test_meeting_create_rejects_missing_project(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match=r"knowledge/projects/ghost\.md"):
         tool_meeting_create(
@@ -408,7 +447,7 @@ def test_meeting_create_rejects_missing_project(env) -> None:
         )
 
 
-def test_meeting_create_is_all_or_nothing(env) -> None:
+def test_meeting_create_is_all_or_nothing(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     anna_before = (root / "knowledge/people/anna.md").read_text(encoding="utf-8")
     with pytest.raises(ToolError, match="missing attendee"):
@@ -427,6 +466,12 @@ def test_meeting_create_is_all_or_nothing(env) -> None:
     assert proc.returncode != 0
 
 
+class _MeetingCreateKwargs(TypedDict, total=False):
+    date: str
+    title: str
+    attendees: list[str]
+
+
 @pytest.mark.parametrize("kwargs,expected", [
     ({"date": "12/06/2026", "title": "X", "attendees": ["people/anna"]}, "YYYY-MM-DD"),
     ({"date": "2026-06-12", "title": "   ", "attendees": ["people/anna"]}, "non-empty"),
@@ -435,7 +480,9 @@ def test_meeting_create_is_all_or_nothing(env) -> None:
     ({"date": "2026-06-12", "title": "X", "attendees": ["organisations/acme"]},
      "people/ node id"),
 ])
-def test_meeting_create_validates_inputs(env, kwargs: dict, expected: str) -> None:
+def test_meeting_create_validates_inputs(
+    env: tuple[Path, ServerConfig, Runtime], kwargs: _MeetingCreateKwargs, expected: str
+) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match=expected):
         tool_meeting_create(cfg, runtime, **kwargs)
@@ -443,7 +490,7 @@ def test_meeting_create_validates_inputs(env, kwargs: dict, expected: str) -> No
 
 # ------------------------------------------------- relations_query (P3)
 
-def test_relations_query_reverse_and_as_of(env) -> None:
+def test_relations_query_reverse_and_as_of(env: tuple[Path, ServerConfig, Runtime]) -> None:
     root, cfg, runtime = env
     # Anna: at Acme 2025, moved to Initech 2026 (seed has anna + acme; add initech).
     (root / "knowledge/organisations/initech.md").write_text(
@@ -470,7 +517,7 @@ def test_relations_query_reverse_and_as_of(env) -> None:
     assert [h.entity for h in rev.relations] == ["people/anna"]
 
 
-def test_relations_query_rejects_bad_rel_and_date(env) -> None:
+def test_relations_query_rejects_bad_rel_and_date(env: tuple[Path, ServerConfig, Runtime]) -> None:
     _root, cfg, runtime = env
     with pytest.raises(ToolError, match="unknown rel"):
         tool_relations_query(cfg, runtime, rel="employed_by")

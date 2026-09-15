@@ -48,9 +48,10 @@ from .concepts import (  # private helpers, but module-internal
     _AUTO_START,
     _existing_frontmatter,
     _resolve_user_tail,
+    _vault_relative,
 )
 from .config import VaultPaths
-from .notes import _atomic_write, _split_frontmatter, fm_list, fm_scalar
+from .notes import _atomic_write, _split_frontmatter, fm_list, fm_scalar, md_cell
 from .relations import EntityInfo, entity_notes, normalize_target
 
 # knowledge/ subdir -> dashboard title. Order is the render order; the
@@ -112,7 +113,9 @@ def rebuild_dashboards(
             continue
         if wrote:
             written += 1
-            written_paths.append(_vault_relative(target, paths))
+            written_paths.append(
+                _vault_relative(target, paths, fallback_dir="knowledge/index/entities")
+            )
         else:
             unchanged += 1
 
@@ -128,12 +131,6 @@ def rebuild_dashboards(
 # ---------------------------------------------------------------------------
 # row rendering
 # ---------------------------------------------------------------------------
-
-def _cell(text: str) -> str:
-    """Markdown-table-safe cell text: a stray pipe or newline would break
-    the row, so collapse whitespace and escape pipes."""
-    return " ".join(text.split()).replace("|", "\\|")
-
 
 def _fm_str(raw: object) -> str:
     """Frontmatter value -> stripped string. Unquoted YAML dates parse as
@@ -173,9 +170,9 @@ def _rows_for_group(
         rows = []
         for info in infos:
             fm = _note_frontmatter(paths.root / info.rel_path)
-            status = _cell(_fm_str(fm.get("status"))) or "—"
-            topics = _cell(", ".join(_fm_list(fm.get("topics")))) or "—"
-            updated = _cell(info.updated) or "—"
+            status = md_cell(_fm_str(fm.get("status"))) or "—"
+            topics = md_cell(", ".join(_fm_list(fm.get("topics")))) or "—"
+            updated = md_cell(info.updated) or "—"
             rows.append(
                 f"| [[knowledge/{info.node_id}]] | {status} | {topics} | {updated} |"
             )
@@ -194,7 +191,7 @@ def _rows_for_group(
             project = _fm_str(fm.get("project"))
             project_cell = f"[[knowledge/{normalize_target(project)}]]" if project else "—"
             row = (
-                f"| [[knowledge/{info.node_id}]] | {_cell(date_s) or '—'} "
+                f"| [[knowledge/{info.node_id}]] | {md_cell(date_s) or '—'} "
                 f"| {attendees} | {project_cell} |"
             )
             entries.append((date_s, info.node_id, row))
@@ -217,23 +214,13 @@ def _rows_for_group(
         rels = "; ".join(
             f"{r.rel} -> [[knowledge/{r.target}]]" for r in open_rels
         ) or "—"
-        rows.append(f"| [[knowledge/{info.node_id}]] | {rels} | {_cell(info.updated) or '—'} |")
+        rows.append(f"| [[knowledge/{info.node_id}]] | {rels} | {md_cell(info.updated) or '—'} |")
     return header, rows
 
 
 # ---------------------------------------------------------------------------
 # note writing (mirrors concepts._write_concept_note)
 # ---------------------------------------------------------------------------
-
-def _vault_relative(target: Path, paths: VaultPaths) -> str:
-    """Vault-relative posix path for stats/commit lists. Falls back to the
-    canonical location when ``knowledge`` sits outside ``root``
-    (hand-built VaultPaths in tests can do that)."""
-    try:
-        return target.relative_to(paths.root).as_posix()
-    except ValueError:
-        return f"knowledge/index/entities/{target.name}"
-
 
 def _write_dashboard(
     *,

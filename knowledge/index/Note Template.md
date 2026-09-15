@@ -1,6 +1,6 @@
 ---
 title:
-type: source_note            # source_note | concept | project | person | org
+type: source_note            # source_note | concept | project | person | organisation | meeting | memory_fact | digest | dashboard
 source_file:
 source_hash:
 created:

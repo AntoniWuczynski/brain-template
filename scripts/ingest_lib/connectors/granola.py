@@ -19,14 +19,73 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from typing import TYPE_CHECKING, TypedDict
 
 from .base import Snapshot, meeting_filename, normalize_attendees
+
+if TYPE_CHECKING:
+    from .state import ConnectorState
 
 _LOG = logging.getLogger(__name__)
 _API_URL = "https://api.granola.ai/v1/meetings"
 
 
-def _fetch_meetings(api_key: str) -> list[dict]:
+class _Meeting(TypedDict, total=False):
+    """The fields this connector reads from one Granola API meeting object.
+    ``total=False``: the API may omit any of these (see the module docstring
+    — the exact response shape is unconfirmed), and every read below already
+    tolerates absence via ``.get(...)``."""
+    id: str
+    title: str
+    date: str
+    created_at: str
+    attendees: object
+    participants: object
+    summary: str
+    notes: str
+    transcript: str
+
+
+def _meeting_from_json(obj: object) -> _Meeting:
+    """Narrow one decoded Granola meeting object to a ``_Meeting``.
+
+    Every field is optional (``total=False``) — the exact API shape is
+    unconfirmed (see module docstring) — so a wrong-typed field is simply
+    omitted rather than raising; ``_to_snapshot``'s ``.get(...)`` calls
+    already tolerate absence.
+    """
+    if not isinstance(obj, dict):
+        return {}
+    out: _Meeting = {}
+    id_ = obj.get("id")
+    if isinstance(id_, str):
+        out["id"] = id_
+    title = obj.get("title")
+    if isinstance(title, str):
+        out["title"] = title
+    date = obj.get("date")
+    if isinstance(date, str):
+        out["date"] = date
+    created_at = obj.get("created_at")
+    if isinstance(created_at, str):
+        out["created_at"] = created_at
+    summary = obj.get("summary")
+    if isinstance(summary, str):
+        out["summary"] = summary
+    notes = obj.get("notes")
+    if isinstance(notes, str):
+        out["notes"] = notes
+    transcript = obj.get("transcript")
+    if isinstance(transcript, str):
+        out["transcript"] = transcript
+    if "attendees" in obj:
+        out["attendees"] = obj["attendees"]
+    if "participants" in obj:
+        out["participants"] = obj["participants"]
+    return out
+
+
+def _fetch_meetings(api_key: str) -> list[_Meeting]:
     """GET the meetings list. Isolated so tests can stub it (no network)."""
     url = os.environ.get("GRANOLA_API_URL", _API_URL)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
@@ -34,11 +93,15 @@ def _fetch_meetings(api_key: str) -> list[dict]:
         data = json.loads(resp.read().decode("utf-8"))
     if isinstance(data, dict):
         meetings = data.get("meetings")
-        return meetings if isinstance(meetings, list) else []
-    return data if isinstance(data, list) else []
+        if isinstance(meetings, list):
+            return [_meeting_from_json(m) for m in meetings if isinstance(m, dict)]
+        return []
+    if isinstance(data, list):
+        return [_meeting_from_json(m) for m in data if isinstance(m, dict)]
+    return []
 
 
-def _to_snapshot(meeting: dict) -> Snapshot | None:
+def _to_snapshot(meeting: _Meeting) -> Snapshot | None:
     mid = str(meeting.get("id") or "").strip()
     if not mid:
         return None
@@ -65,7 +128,7 @@ def _to_snapshot(meeting: dict) -> Snapshot | None:
 class GranolaConnector:
     name = "granola"
 
-    def pull(self, state) -> Iterator[Snapshot]:  # noqa: ANN001 - ConnectorState
+    def pull(self, state: ConnectorState) -> Iterator[Snapshot]:
         api_key = os.environ.get("GRANOLA_API_KEY")
         if not api_key:
             return
