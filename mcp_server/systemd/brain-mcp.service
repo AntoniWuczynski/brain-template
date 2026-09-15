@@ -6,34 +6,38 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=brain
-Group=brain
-WorkingDirectory=/srv/brain
-EnvironmentFile=/etc/brain-mcp/env
+# User systemd unit: no User=/Group= (the user manager already runs as the
+# invoking user; a system-manager directive here is refused at load time).
+# Install to ~/.config/systemd/user/ and run with `systemctl --user`. %h
+# expands to the invoking user's home directory.
+WorkingDirectory=%h/services/brain
+EnvironmentFile=%h/services/brain/.env
 
-# Run the venv interpreter directly (built by `uv sync` -> /srv/brain/.venv).
-# Avoids depending on uv's location and on /home, which ProtectHome blocks.
-ExecStart=/srv/brain/.venv/bin/python -m mcp_server
+# Run the venv interpreter directly (built by `uv sync` -> %h/services/brain/.venv).
+# Avoids depending on uv's location on PATH at service-start time.
+ExecStart=%h/services/brain/.venv/bin/python -m mcp_server
 
-# Keep model/cache downloads under the writable vault. The brain user's home
-# is /srv/brain (see DEPLOY.md), but pin these explicitly so a stray HOME or
-# ProtectSystem=strict can't push the sentence-transformers weight download
-# somewhere read-only and break vault_search on first use.
-Environment=HF_HOME=/srv/brain/.cache/huggingface
-Environment=XDG_CACHE_HOME=/srv/brain/.cache
+# Keep model/cache downloads under the writable service dir rather than the
+# default ~/.cache the process would otherwise use, so a stray HOME can't
+# send the sentence-transformers weight download (when that stack is
+# installed — see mcp/DEPLOY.md "no ML stack") somewhere unexpected.
+Environment=HF_HOME=%h/services/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=%h/services/brain/.cache
 
 Restart=on-failure
 RestartSec=5
 
-# --- hardening: deny everything we don't need ---
+# --- hardening: deny everything this service doesn't need ---
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-# The vault root and the env file are the only writable / readable paths
-# we need outside the venv. systemd lets us whitelist them explicitly.
-ReadWritePaths=/srv/brain
-ReadOnlyPaths=/etc/brain-mcp
+# read-only, not true: git push reads the deploy key under ~/.ssh (kept
+# OUTSIDE %h/services/brain — see DEPLOY.md — so a compromised agent can't
+# reach it through the read tools), which "true" would hide entirely.
+ProtectHome=read-only
+# The service dir is the only path this unit writes to; everything else
+# under $HOME stays read-only per ProtectHome above.
+ReadWritePaths=%h/services/brain
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -45,21 +49,18 @@ LockPersonality=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-# NOTE: no MemoryDenyWriteExecute — torch / sentence-transformers map
-# executable pages (JIT, BLAS) and the search tool would silently break.
+# NOTE: no MemoryDenyWriteExecute — torch / sentence-transformers (when
+# installed) map executable pages (JIT, BLAS) and vault_search would break.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
-# Network — only outbound to GitHub for push and Cloudflare for tunnel.
-# (No fine-grained outbound restriction here; rely on the user's firewall
-# if they want it.)
+# Network — only outbound to GitHub for push and the tailnet/tunnel for
+# inbound. (No fine-grained outbound restriction here; rely on the host's
+# firewall if you want one.)
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 UMask=0077
 
-# User-namespace isolation: the service's root maps to an unprivileged host UID.
-PrivateUsers=true
-
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

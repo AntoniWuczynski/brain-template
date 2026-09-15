@@ -15,6 +15,7 @@ from . import image as _image_mod
 from . import meeting as _meeting_mod
 from . import notebook as _notebook_mod
 from . import pdf as _pdf_mod
+from . import ppt as _ppt_mod
 from . import pptx as _pptx_mod
 from . import text as _text_mod
 from . import transcript as _transcript_mod
@@ -26,8 +27,11 @@ _REGISTRY: dict[str, Extractor] = {
     ".pdf": _pdf_mod.extract,
     # DOCX (modern Word). Old .doc not supported.
     ".docx": _docx_mod.extract,
-    # PPTX (modern PowerPoint). Old .ppt not supported.
+    # PPTX (modern PowerPoint).
     ".pptx": _pptx_mod.extract,
+    # Legacy PowerPoint 97-2003: converted to .pptx via a headless
+    # LibreOffice subprocess, then handed to the .pptx extractor above.
+    ".ppt": _ppt_mod.extract,
     # Jupyter notebooks.
     ".ipynb": _notebook_mod.extract,
     # Datasets (schema-only extraction, never dump rows).

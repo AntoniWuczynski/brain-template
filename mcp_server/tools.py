@@ -71,10 +71,21 @@ from .config import (
     ServerConfig,
     WRITE_RATE_PER_MINUTE,
 )
-from .git_ops import CommitOutcome, GitError, commit_paths, current_branch
+from .git_ops import (
+    CommitOutcome,
+    GitError,
+    commit_paths,
+)
 from .identity import current_agent
 from .provenance import frontmatter_signature, stamp_provenance
 from .runtime import Runtime
+from .sync import (
+    WRITE_LOCK,
+    pull_before_write,
+    refuse_if_head_moved,
+    require_writable_branch,
+    write_section,
+)
 from .safety import (
     SafetyError,
     resolve_inbox,
@@ -129,15 +140,26 @@ def _rate_check_write() -> None:
         )
 
 
-# Serializes the read-modify-write-commit critical section of every write
-# tool. Writes are rate-limited (30/min) and git is already serialized, so a
-# single global lock adds negligible latency while removing three hazards:
+# The write critical section, defined in ``sync`` because the background
+# index refresher and the push worker hold the same lock — a lock the tool
+# layer owned privately could not cover them, and the three writers must be
+# mutually exclusive. Re-exported under the old name because the tool bodies
+# below, ``entity_tools`` and ``memory_tools`` all take it around their own
+# read-modify-write; it is re-entrant, so those inner blocks are nested
+# inside the one ``_audited_write`` already holds.
+#
+# Writes are rate-limited (30/min) and git is already serialized, so a single
+# global lock adds negligible latency while removing four hazards:
 # (a) the lost-update race when two appends/updates race the same note
 #     (both read the old body, the later write drops the earlier one);
 # (b) the create/drop exists-then-write TOCTOU;
 # (c) unbounded concurrent write threads (e.g. many large inbox uploads at
-#     once) parking the worker pool.
-_write_lock = threading.Lock()
+#     once) parking the worker pool;
+# (d) a pull, a refresher rebuild or the push worker's rebase moving HEAD or
+#     dirtying the tree between a tool's read of a note and its commit —
+#     which silently overwrote an absorbed hand edit, and made writes refuse
+#     each other over a dirty tree neither the agent nor the user could clear.
+_write_lock = WRITE_LOCK
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +476,7 @@ def tool_update_compiled_truth(
         if not _is_knowledge_md(rel):
             raise ToolError(
                 f"{path!r} is not a knowledge/ Markdown note; compiled truth "
-                "lives on entity notes (people/, organisations/, projects/)"
+                "lives on entity notes (people/, organisations/, projects/, chats/)"
             )
         if _is_memory_area(rel):
             raise ToolError(
@@ -742,21 +764,6 @@ def _commit_message(agent: str, action: str) -> str:
     )
 
 
-def _require_configured_branch(runtime: Runtime) -> None:
-    """Refuse BEFORE any disk write when the vault has a branch other than
-    the configured one checked out. ``commit_paths`` guards the commit too,
-    but by then the file is on disk and the tool would report a
-    written-but-uncommitted result; refusing up front keeps the shared
-    working tree clean and makes the cause visible to the client."""
-    expected = runtime.push_worker.branch
-    current = current_branch(runtime.push_worker.vault_root)
-    if current != expected:
-        raise ToolError(
-            f"refusing to write: the vault has {current!r} checked out, not the "
-            f"configured {expected!r}; a write now would be stranded off {expected!r}"
-        )
-
-
 def _audited_write(
     runtime: Runtime, *, tool: str, path: str | None, fn: Callable[[], WriteResult]
 ) -> WriteResult:
@@ -764,11 +771,24 @@ def _audited_write(
 
     Refusals (rate limit, safety, size, exists/missing) are part of the
     protocol and land as ``refused: <reason>``; anything unexpected lands
-    as ``error``. Both re-raise so FastMCP surfaces them unchanged."""
+    as ``error``. Both re-raise so FastMCP surfaces them unchanged.
+
+    ``path`` is the identifier the call was aiming at — a vault-relative
+    note path, a concept slug, an inbox path, an entity node's note. It
+    labels the audit row, and ``sync.pull_before_write`` matches it against
+    a rebase's conflicting paths to decide whether a standing conflict is
+    this write's problem or someone else's."""
     agent = current_agent()
     try:
-        _require_configured_branch(runtime)
-        result = fn()
+        # ONE critical section: the pull, the tool body's read-modify-write
+        # and its commit. Anything less and the pull inspects (or the body
+        # reads) a tree another writer is midway through changing — see the
+        # hazards on ``_write_lock``.
+        with WRITE_LOCK:
+            require_writable_branch(runtime)
+            pull_before_write(runtime, tool=tool, path=path, agent=agent)
+            with write_section(runtime.push_worker.vault_root):
+                result = fn()
     except (ToolError, SafetyError) as exc:
         runtime.audit.tool_event(
             agent=agent, tool=tool, path=path,
@@ -862,6 +882,12 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
       rather than silently following.
     - Same-directory placement → ``os.replace`` is atomic (POSIX rename).
 
+    It also refuses if the vault's HEAD moved since this write section
+    began (``sync.refuse_if_head_moved``). Every write tool funnels its
+    bytes through here, so this is the one place that can guarantee no
+    transformed-from-a-stale-read text lands on top of a note another
+    process has just changed underneath us.
+
     ``os.replace`` itself doesn't follow symlinks at the destination —
     if the target was a symlink, the rename swaps the directory entry,
     leaving whatever the symlink pointed to untouched. So this routine
@@ -875,6 +901,7 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     writer in the vault (``ingest_lib.notes._atomic_write``), so a note's
     permissions don't flip depending on which writer touched it last.
     """
+    refuse_if_head_moved()
     try:
         atomic_write_bytes(
             target, data, prefix=f".{target.name}.", suffix=".tmp"

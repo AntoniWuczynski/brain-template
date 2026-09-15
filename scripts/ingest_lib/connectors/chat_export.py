@@ -117,12 +117,12 @@ def _load_conversations(path: Path) -> list[object]:
     return data if isinstance(data, list) else []
 
 
-def _str_field(obj: dict[object, object], key: str) -> str:
+def _str_field(obj: dict[str, object], key: str) -> str:
     val = obj.get(key)
     return val if isinstance(val, str) else ""
 
 
-def _claude_ai_message_text(m: dict[object, object], stats: TranscriptStats) -> str:
+def _claude_ai_message_text(m: dict[str, object], stats: TranscriptStats) -> str:
     text_field = m.get("text")
     if isinstance(text_field, str) and text_field.strip():
         return text_field
@@ -168,7 +168,7 @@ def _emit_turn(
     turns.append({"role": role, "text": text})
 
 
-def _claude_ai_turns(obj: dict[object, object], home: str, stats: TranscriptStats) -> list[TranscriptTurn]:
+def _claude_ai_turns(obj: dict[str, object], home: str, stats: TranscriptStats) -> list[TranscriptTurn]:
     turns: list[TranscriptTurn] = []
     messages = obj.get("chat_messages")
     if not isinstance(messages, list):
@@ -191,7 +191,7 @@ def _claude_ai_turns(obj: dict[object, object], home: str, stats: TranscriptStat
     return turns
 
 
-def _chatgpt_turns(obj: dict[object, object], home: str, stats: TranscriptStats) -> list[TranscriptTurn]:
+def _chatgpt_turns(obj: dict[str, object], home: str, stats: TranscriptStats) -> list[TranscriptTurn]:
     turns: list[TranscriptTurn] = []
     mapping = obj.get("mapping")
     if not isinstance(mapping, dict):
@@ -243,7 +243,7 @@ def _chatgpt_turns(obj: dict[object, object], home: str, stats: TranscriptStats)
     return turns
 
 
-def _native_id(obj: dict[object, object], turns: list[TranscriptTurn]) -> str:
+def _native_id(obj: dict[str, object], turns: list[TranscriptTurn]) -> str:
     """Both known export formats always carry a stable id, but a malformed
     or future export might not — the fallback hashes the conversation's own
     turn content rather than its position in the export list, so re-running
@@ -259,7 +259,7 @@ def _native_id(obj: dict[object, object], turns: list[TranscriptTurn]) -> str:
     return f"conversation-{digest}"
 
 
-def _date_from(obj: dict[object, object]) -> str:
+def _date_from(obj: dict[str, object]) -> str:
     created = obj.get("created_at")
     if isinstance(created, str) and len(created) >= 10:
         return created[:10]
@@ -279,7 +279,7 @@ class ChatExportConnector:
         home = str(Path.home())
         max_items = _int_env(_MAX_ENV, _DEFAULT_MAX)
 
-        dated: list[tuple[str, dict[object, object]]] = []
+        dated: list[tuple[str, dict[str, object]]] = []
         for item in _load_conversations(path):
             if isinstance(item, dict):
                 dated.append((_date_from(item), item))

@@ -117,7 +117,7 @@ def resolve_attendee(name: str, index: PeopleIndex) -> AttendeeResolution:
     1. the accent-folded slug — ``Antoni Wuczyński`` -> ``people/antoni-wuczynski``;
     2. the exact note title — this is what catches an attendee named by
        their email address, whose node is slugged without separators
-       (``people/alexasymmetricsecuritycom``) but titled with the address
+       (``people/alexexamplecom``) but titled with the address
        verbatim;
     3. an exact ``aliases:`` entry — AGENTS.md's merge keeps the address as
        an alias on the named survivor, so a snapshot still carrying it

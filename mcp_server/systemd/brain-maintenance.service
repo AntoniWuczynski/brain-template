@@ -7,18 +7,22 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-User=brain
-Group=brain
-WorkingDirectory=/srv/brain
-Environment=HF_HOME=/srv/brain/.cache/huggingface
-Environment=XDG_CACHE_HOME=/srv/brain/.cache
-# maintain.sh runs the venv interpreter directly; no uv needed at runtime.
-ExecStart=/srv/brain/scripts/maintain.sh
+# User systemd unit: no User=/Group= (the user manager already runs as the
+# invoking user). Install to ~/.config/systemd/user/. %h expands to the
+# invoking user's home directory.
+WorkingDirectory=%h/services/brain
+EnvironmentFile=%h/services/brain/.env
+Environment=HF_HOME=%h/services/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=%h/services/brain/.cache
+# maintain.sh repairs its own PATH (uv, and the .venv fallback) and resolves
+# the repo root from its own location, so no further ExecStart plumbing is
+# needed here.
+ExecStart=/bin/bash %h/services/brain/scripts/maintain.sh
 
-# --- hardening (mirrors brain-mcp.service) ---
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/srv/brain
-UMask=0077
+# Deliberately NOT filesystem-sandboxed like brain-mcp.service: maintain.sh
+# shells out to `uv` (which may live anywhere under $HOME — ~/.local/bin,
+# ~/.cargo/bin, a pyenv/asdf shim) and this job's actual footprint has never
+# been characterised the way the always-on server's has. Add ProtectSystem=
+# strict / ProtectHome= here only after confirming the run's full file
+# access under a real systemd instance — getting it wrong fails the
+# scheduled job silently until someone reads journalctl.

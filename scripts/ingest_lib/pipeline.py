@@ -6,6 +6,30 @@ Public entry points:
 - :func:`run_ingest` — execute a plan, writing outputs and metadata.
 
 Both functions are deterministic given the same filesystem state.
+
+AUD-121: split into sibling modules (``pipeline_plan.py``, ``pipeline_post.py``)
+to stay under the 1000-line house limit. Every name this module used to
+define is still bound here — public and private alike — either because the
+function stayed (see below) or via a re-export of the moved definition, so
+``from ingest_lib.pipeline import _whatever`` and
+``monkeypatch.setattr(pipeline, "_whatever", ...)`` both keep working exactly
+as before.
+
+Several functions (``plan_ingest``, ``run_ingest``, ``_process_one``,
+``_maybe_summarize``, ``backfill_summaries``, ``_write_failure_index_note``,
+and the ``_record_failure``/``_record_crash`` pair that calls into the last
+one) call ``dispatch_extractor``, ``_build_search_index``, ``_summary_enabled``,
+``_summarize`` or ``write_index_note`` as bare module globals, and the test
+suite monkeypatches exactly those five names on *this* module
+(``monkeypatch.setattr(pipeline, "dispatch_extractor", fake)`` and friends).
+A function's global lookups are bound to whichever module physically defines
+it, not to wherever it's re-exported — moving any of those functions to a
+sibling would silently stop honouring that patching (the sibling would keep
+calling the real dependency) without any test failing loudly at import time.
+Fixing that would mean a sibling importing this module to reach the patched
+name, which is the circular import the split rules rule out. So those
+functions — and only those — stay put; everything else that doesn't touch
+one of the five moved out.
 """
 from __future__ import annotations
 
@@ -13,10 +37,9 @@ import logging
 import os
 import shutil
 import unicodedata
-from dataclasses import dataclass, field, replace
-from datetime import datetime, UTC
+from dataclasses import replace
 from pathlib import Path
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 
 from .concepts import rebuild_concepts
 from .config import VaultPaths
@@ -32,45 +55,32 @@ from .notes import (
     write_index_note,
     write_processed_note,
 )
+from .pipeline_plan import (
+    _FIGURE_EXTS as _FIGURE_EXTS,
+    _MEETING_EXTRACTOR as _MEETING_EXTRACTOR,
+    _iter_files as _iter_files,
+    _relative_to_logical_root as _relative_to_logical_root,
+    IngestPlan as IngestPlan,
+    IngestStats as IngestStats,
+    PlannedItem as PlannedItem,
+)
+from .pipeline_post import (
+    _atomic_copy as _atomic_copy,
+    _collect_existing_topics as _collect_existing_topics,
+    _duplicate_source_notes as _duplicate_source_notes,
+    _migrate_legacy_note_paths as _migrate_legacy_note_paths,
+    _move_to_failed as _move_to_failed,
+    _strip_frontmatter_header as _strip_frontmatter_header,
+    _title_from_relpath as _title_from_relpath,
+    _utc_now_iso as _utc_now_iso,
+)
 from .semantic import build_index as _build_search_index
 from .summarize import is_enabled as _summary_enabled, summarize as _summarize
-
-
-# Asset extensions counted as "figures" for the index note's figures: list.
-_FIGURE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".svg"})
-
-
-@dataclass(frozen=True)
-class PlannedItem:
-    """One file scheduled for ingestion."""
-
-    src: Path                 # path to read content from (inbox or archive/raw)
-    relative_path: str        # repo-root-relative under inbox/ or archive/raw/
-    is_in_archive: bool       # True when scanning archive/raw directly
-
-
-@dataclass
-class IngestPlan:
-    items: list[PlannedItem] = field(default_factory=list)
-    skipped_already_processed: list[PlannedItem] = field(default_factory=list)
-    skipped_unsupported: list[PlannedItem] = field(default_factory=list)
-
-
-@dataclass
-class IngestStats:
-    processed: int = 0
-    partial: int = 0
-    manual_review: int = 0
-    skipped: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Planning
 # ---------------------------------------------------------------------------
-
-# The extractor name a connector snapshot records; the meeting-promotion
-# pass below is gated on one of these having been processed this run.
-_MEETING_EXTRACTOR = "meeting"
 
 
 def plan_ingest(
@@ -140,44 +150,6 @@ def plan_ingest(
     plan.skipped_already_processed.sort(key=lambda i: i.relative_path)
     plan.skipped_unsupported.sort(key=lambda i: i.relative_path)
     return plan
-
-
-def _iter_files(root: Path) -> Iterator[Path]:
-    if root.is_file():
-        yield root
-        return
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        # ".tmp-*": a raw copy torn apart by a kill mid-`_atomic_copy`. It is
-        # not a source, and ingesting it would archive the truncated bytes.
-        if (
-            path.name == ".DS_Store"
-            or path.name.startswith("._")
-            or path.name.startswith(".tmp-")
-        ):
-            continue
-        yield path
-
-
-def _relative_to_logical_root(
-    f: Path, paths: VaultPaths, *, from_archive: bool
-) -> str | None:
-    """Compute the path under ``inbox/`` or ``archive/raw/`` for a file.
-
-    If the file is under neither (i.e. ``--path`` pointing outside the
-    vault), return None and let the caller fall back to ``f.name``.
-    """
-    bases: list[Path] = (
-        [paths.archive_raw] if from_archive else [paths.inbox, paths.archive_raw]
-    )
-    for base in bases:
-        try:
-            rel = f.relative_to(base)
-        except ValueError:
-            continue
-        return rel.as_posix()
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -595,90 +567,6 @@ def _process_one(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _atomic_copy(src: Path, dest: Path) -> None:
-    """Copy a source file into the immutable tree atomically.
-
-    A plain ``copy2`` that dies mid-write leaves a truncated file at
-    ``dest`` — and since ``archive/raw`` is never overwritten, that torn
-    file reads as a permanent ``archive-clash`` on every later run. Write
-    to a temp name in the same directory, fsync, then rename.
-    """
-    tmp = dest.parent / (".tmp-" + dest.name)
-    try:
-        shutil.copy2(src, tmp)
-        with open(tmp, "rb") as fh:
-            os.fsync(fh.fileno())
-        os.replace(tmp, dest)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def _migrate_legacy_note_paths(
-    paths: VaultPaths,
-    prev: IndexRecord,
-    *,
-    processed_target: Path,
-    index_note_target: Path,
-    assets_dir: Path,
-    logger: logging.Logger,
-) -> None:
-    """Move a record's notes onto today's derived names before re-ingesting.
-
-    The derived name gained the source's own extension in 6e015a63
-    (``report.pdf`` -> ``report.pdf.md``), but the targets are computed from
-    the source path alone, so a re-ingest of a note written under the old
-    scheme wrote a ``report.pdf.md`` twin beside ``report.md``: the old note
-    kept its user frontmatter (rule 9's merge reads the NEW path), its
-    assets dir was left behind, and both notes embedded into the search
-    index. Renaming the recorded paths onto the current ones first makes the
-    re-ingest refresh the note the user has been editing. Only ever renames
-    onto a free name, and never touches ``archive/raw``.
-    """
-    moves: list[tuple[Path, Path]] = []
-    if prev.processed_path:
-        old_processed = paths.root / prev.processed_path
-        moves.append((old_processed, processed_target))
-        # The assets dir sits next to the processed note and carries its name
-        # (minus ".md") — true under both the old and the current scheme.
-        moves.append((
-            old_processed.parent / (old_processed.name.removesuffix(".md") + "_assets"),
-            assets_dir,
-        ))
-    if prev.index_note_path:
-        moves.append((paths.root / prev.index_note_path, index_note_target))
-    for old_path, new_path in moves:
-        if old_path == new_path or new_path.exists() or not old_path.exists():
-            continue
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(old_path, new_path)
-        logger.info(
-            "  migrated legacy note path: %s -> %s",
-            old_path.relative_to(paths.root),
-            new_path.relative_to(paths.root),
-        )
-
-
-def _duplicate_source_notes(
-    *, rel: str, src_hash: str, known: dict[str, IndexRecord]
-) -> list[str]:
-    """Cross-reference an identical file already ingested under another path.
-
-    Same bytes under two paths are archived, extracted and indexed twice
-    (only the summary is deduplicated), with nothing in either note saying
-    so. Name the first one, alphabetically, so the note is deterministic.
-    """
-    others = sorted(
-        r.relative_path
-        for r in known.values()
-        if r.source_hash == src_hash
-        and r.relative_path != rel
-        and r.status in ("processed", "partial")
-    )
-    if not others:
-        return []
-    return [f"duplicate of `{others[0]}` (identical content, same source_hash)"]
-
-
 def _write_failure_index_note(
     paths: VaultPaths,
     *,
@@ -741,15 +629,6 @@ def _record_crash(paths: VaultPaths, item: PlannedItem, *, error: str) -> None:
         ),
         extractor_name="crashed",
     )
-
-
-def _title_from_relpath(rel: str) -> str:
-    stem = Path(rel).stem
-    return stem.replace("_", " ").replace("-", " ").strip() or rel
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def backfill_summaries(
@@ -877,52 +756,6 @@ def backfill_summaries(
     return stats
 
 
-def _strip_frontmatter_header(text: str) -> str:
-    """Recover just the extracted body from a processed note.
-
-    ``write_processed_note`` wraps the body as::
-
-        # Title
-        > Source/Hash/Extractor/Status
-        ---
-        <body>
-        ---
-        ## Processing notes
-        <notes>
-
-    We must strip BOTH the leading title/meta block (up to the first
-    ``---``) AND the trailing ``---`` + ``## Processing notes`` footer.
-    Missing the footer meant ``backfill_summaries`` fed the old notes back
-    to the summarizer and re-wrapped them, growing a duplicate
-    ``## Processing notes`` section on every backfill (and embedding the
-    stale metadata into the search index). The trailing strip loops so a
-    note already carrying several duplicated footers heals to a single body.
-    """
-    lines = text.splitlines(keepends=True)
-    start = 0
-    for i, ln in enumerate(lines):
-        if ln.strip() == "---" and i > 0:
-            start = i + 1
-            break
-    body = "".join(lines[start:]).lstrip()
-    # Strip every trailing '---\n\n## Processing notes\n...' footer.
-    while True:
-        blines = body.splitlines(keepends=True)
-        cut = None
-        for j in range(len(blines) - 1, -1, -1):
-            if blines[j].strip() == "## Processing notes":
-                k = j - 1
-                while k >= 0 and blines[k].strip() == "":
-                    k -= 1
-                if k >= 0 and blines[k].strip() == "---":
-                    cut = k
-                break
-        if cut is None:
-            break
-        body = "".join(blines[:cut]).rstrip() + "\n"
-    return body
-
-
 def _maybe_summarize(
     *,
     rel: str,
@@ -980,57 +813,6 @@ def _maybe_summarize(
     if out is None:
         return "", [], [], ["summary: skipped (see warnings in log)"]
     return out.summary, list(out.key_points), list(out.topics), list(out.notes)
-
-
-def _collect_existing_topics(latest: dict[str, IndexRecord]) -> list[str]:
-    """Return distinct canonical topics across all records."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for r in latest.values():
-        for t in r.topics or []:
-            if t and t not in seen:
-                seen.add(t)
-                out.append(t)
-    return out
-
-
-def _move_to_failed(raw_target: Path, paths: VaultPaths) -> Path | None:
-    """Move a failed raw file into ``archive/failed/``. Returns the FINAL
-    destination path (which may carry a ``.N`` suffix if a prior failure
-    already occupies the plain name), or None if there was nothing to move,
-    so the caller can record the true location in metadata."""
-    if not raw_target.exists():
-        return None
-    try:
-        rel = raw_target.relative_to(paths.archive_raw)
-    except ValueError:
-        return None
-    failed_target = paths.archive_failed / rel
-    failed_target.parent.mkdir(parents=True, exist_ok=True)
-    if failed_target.exists():
-        # A prior failure already sits here. If it's byte-identical (the same
-        # file failing again on a re-run — inbox sources are never deleted, so
-        # this is the common case), the bytes are already preserved: drop the
-        # duplicate rather than stacking x.docx.1, x.docx.2, ... on every run.
-        raw_hash = sha256_of(raw_target)
-        if sha256_of(failed_target) == raw_hash:
-            raw_target.unlink()
-            return failed_target
-        # Different bytes: don't overwrite — find the next free suffix whose
-        # existing occupant also differs (an identical .N copy is likewise a
-        # no-op we reuse).
-        i = 1
-        while True:
-            cand = failed_target.with_name(failed_target.name + f".{i}")
-            if not cand.exists():
-                failed_target = cand
-                break
-            if sha256_of(cand) == raw_hash:
-                raw_target.unlink()
-                return cand
-            i += 1
-    shutil.move(str(raw_target), str(failed_target))
-    return failed_target
 
 
 def _record_failure(

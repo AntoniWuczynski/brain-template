@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Rebuild the entity dashboards under knowledge/index/entities/ "
-            "(people, organisations, projects, meetings) from the entity "
+            "(people, organisations, projects, chats, meetings) from the entity "
             "notes' frontmatter. Deterministic; free; no LLM calls. Also "
             "runs automatically after --rebuild-concepts and each ingest."
         ),

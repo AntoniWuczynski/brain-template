@@ -5,7 +5,8 @@ description: >-
   project or work session they're currently in into their "brain" knowledge
   vault — e.g. "summarise this project to the brain", "log my work to the
   brain", "save a project note", "write up what we did to the brain". Works
-  from any directory. Requires the brain MCP server (mcp__brain__* tools).
+  from any directory, repo or not — a chat-based project with no repo logs
+  under knowledge/chats/. Requires the brain MCP server (mcp__brain__* tools).
 ---
 
 # brain-project-note
@@ -17,7 +18,7 @@ notes in the user's "brain" vault, written **only** through the brain MCP
 server. You are usually invoked from *another* repo, not the brain itself.
 
 **Core principle:** the brain's location is the MCP server's concern. You call
-tools with vault-relative paths (`knowledge/projects/...`); you never read,
+tools with vault-relative paths (`knowledge/<area>/...`); you never read,
 guess, or hardcode where the brain lives on disk.
 
 ## Hard requirement: MCP-only
@@ -30,10 +31,25 @@ files anywhere as a fallback. Tell the user:
 > user brain http://127.0.0.1:8765/mcp --header "Authorization: Bearer
 > $(cat ~/.brain-mcp-token)"`), then reconnect (`/mcp`) and re-run me.
 
+## Where it goes — choose the area first
+
+`knowledge/` is organised by subject (AGENTS.md, "Where a note lives").
+These are recommendations, so pick by what the work IS, never by which tool
+you are or where the files happen to sit:
+
+- `knowledge/projects/<slug>/` — a bounded piece of work with a repo or a
+  codebase. The usual case.
+- `knowledge/chats/<slug>/` — a chat-based project with no repository (a
+  claude.ai / ChatGPT / Codex "project" of conversations, e.g. a job
+  search). Same folder shape and rules as a project: substitute `chats`
+  for `projects` in every path below.
+- `knowledge/personal/<area>/` — life admin (leases, contracts, health,
+  finance). Free-form notes: no overview/log ceremony, no graph nodes.
+
 ## Layout (exact — do not flatten)
 
 ```
-knowledge/projects/<slug>/
+knowledge/<area>/<slug>/        # <area> = projects (default) or chats
 ├── <slug>.md          # overview — you own this, full-rewrite each run
 ├── <topic>.md         # focused curated notes — create these when warranted
 ├── notes/             # the human's own notes — NEVER write here
@@ -56,7 +72,7 @@ join the concept and relation graph, e.g.:
 ```yaml
 relations:
   - rel: related_to
-    target: projects/<slug>/<slug>
+    target: <area>/<slug>/<slug>
     valid_from: "2025-03-01"      # optional, YYYY-MM-DD
     source: knowledge/meetings/2026/2026-06-12-kern-call   # optional, provenance
 ```
@@ -80,16 +96,18 @@ human's area — never write there.
   non-alphanumerics → `-` (e.g. `git@github.com:acme/RandEval.git` → `randeval`).
   The directory name is NOT the identity — the same repo checked out under
   `fyp-old/`, `comp0138-vpjx1/`, and `randeval/` is ONE project and must map
-  to ONE folder. Only when there is no git remote, fall back to the repo-root
-  basename (`git rev-parse --show-toplevel`), then the cwd basename.
+  to ONE folder. When there is no git remote, derive a readable kebab-case
+  slug from the project's title (`WorkSearch` → `worksearch`). Never slug a
+  directory basename or an opaque chat-project id (`g-p-69fb…`): the slug is
+  for humans, `source_repo` carries the on-disk identity.
 - Do **not** create a `knowledge/index/...` MOC. Do **not** touch `notes/`.
 
 ## Identity check (before any write)
 
-If `knowledge/projects/<slug>/` already exists → proceed (same project).
+If `knowledge/<area>/<slug>/` already exists → proceed (same project).
 If it does NOT exist, check you're not about to fragment an existing project:
-`vault_list knowledge/projects`, and for each existing folder
-`vault_read knowledge/projects/<f>/<f>.md` and compare its `source_repo`
+`vault_list knowledge/projects` and `vault_list knowledge/chats`, and for each
+existing folder `vault_read knowledge/<area>/<f>/<f>.md` and compare its `source_repo`
 against this project's identity:
 
 - **With a remote**: compare remote URLs normalized — scheme/`git@` form,
@@ -118,11 +136,11 @@ the absolute local path when there is no remote. No annotations or prose —
 3. **Gather — this session**: what you actually did in this conversation
    (changes, decisions, problems solved) plus `git diff`/new commits since the
    session began.
-4. **Write the overview** `knowledge/projects/<slug>/<slug>.md`:
+4. **Write the overview** `knowledge/<area>/<slug>/<slug>.md`:
    - `vault_read` it. **Not found** → `vault_create_note` with a fresh
      `created:`. **Found** → parse its `created:`, keep it verbatim, regenerate
      the full body, bump `updated:`, then `vault_replace_note`.
-5. **Write the session log** `knowledge/projects/<slug>/log/<YYYY-MM-DD>.md`:
+5. **Write the session log** `knowledge/<area>/<slug>/log/<YYYY-MM-DD>.md`:
    - `vault_read` it. **Not found** → `vault_create_note`. **Found**
      (same-day rerun) → `vault_append_to_note` a new `## <HH:MM>Z` subsection.
 6. **Report** the `commit_sha` from each `WriteResult`. If `committed` is
@@ -201,7 +219,7 @@ title: "<Project name> — session <YYYY-MM-DD>"
 type: project
 created: "<ISO8601 UTC>"
 updated: "<ISO8601 UTC>"
-project: "[[knowledge/projects/<slug>/<slug>]]"
+project: "[[knowledge/<area>/<slug>/<slug>]]"
 topics: []
 ---
 
@@ -217,7 +235,7 @@ topics: []
 <open items / next steps.>
 
 ## Links
-- Project: [[knowledge/projects/<slug>/<slug>]]
+- Project: [[knowledge/<area>/<slug>/<slug>]]
 - Commits: <relevant SHAs / branch>
 ```
 
@@ -226,6 +244,8 @@ topics: []
 | Mistake | Do instead |
 |---|---|
 | Slugging the directory name | Slug the git remote; dirs `fyp-old/` and `randeval/` with one remote are ONE project |
+| Slugging an opaque chat-project id (`g-p-…`) or a dotdir | Readable kebab slug from the title; `source_repo` holds the identity |
+| Forcing a chat-based project or life admin into `projects/` | `chats/<slug>/` for a chat project, `personal/<area>/` for life admin — pick by subject |
 | Creating a new folder without the identity check | Compare the remote against existing notes' `source_repo` first; ask on a match |
 | Flattening the whole project to `projects/<slug>.md` | The *overview* is `projects/<slug>/<slug>.md` inside the folder (curated `<topic>.md` notes beside it are fine) |
 | Cramming every artefact into the log | Give a durable decision / design / artefact its own curated `<topic>.md` under `projects/<slug>/` (or `projects/shared/`) |

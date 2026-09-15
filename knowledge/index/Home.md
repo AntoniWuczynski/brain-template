@@ -16,6 +16,8 @@ For the full system overview see [`../../README.md`](../../README.md). For agent
 - `index/` — generated index notes (one per processed source file) plus this file and `Note Template.md`.
 - `concepts/` — auto-generated cross-source topic notes. Edit anything below the `AUTO-GENERATED-END` marker; survives regeneration.
 - `projects/` — ongoing or finished work.
+- `chats/` — chat-based projects with no repo (same folder shape as `projects/`).
+- `personal/` — life admin: leases, contracts, health, finance.
 - `university/` — course-organised material.
 - `research/` — papers, lit-review notes, derivations.
 - `people/`, `organisations/` — entity notes.

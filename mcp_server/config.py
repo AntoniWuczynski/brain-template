@@ -19,9 +19,14 @@ from .identity import parse_token_spec
 # let replace_note destroy a pending (typically uncommitted) source file.
 # knowledge/meetings and knowledge/assistant are the entity-memory areas:
 # meeting notes plus the assistant's own inbox/archive/digests.
+# knowledge/chats (chat-based projects, same folder shape as projects/) and
+# knowledge/personal (life admin, free-form) are the two areas AGENTS.md
+# recommends beside projects/ — see "Where a note lives".
 WRITE_ALLOW_PREFIXES: Final[tuple[str, ...]] = (
     "knowledge/notes",
     "knowledge/projects",
+    "knowledge/chats",
+    "knowledge/personal",
     "knowledge/research",
     "knowledge/people",
     "knowledge/organisations",

@@ -187,6 +187,7 @@ for dir in \
     "inbox" \
     "archive/raw" "archive/processed" "archive/failed" \
     "knowledge/index" "knowledge/concepts" "knowledge/projects" \
+    "knowledge/chats" "knowledge/personal" \
     "knowledge/university" "knowledge/research" "knowledge/people" \
     "knowledge/organisations" "knowledge/notes" "knowledge/meetings" \
     "knowledge/assistant/inbox" "knowledge/assistant/archive" \
@@ -224,6 +225,38 @@ done
 # inventory lives in data, whereas source/docs/tests legitimately use
 # path-shaped course markers (university/COMP0123/...) as illustrative
 # examples, which must not trip the guard.
+# People scan: the vault's own people and organisations must never appear in
+# synced code, docs or tests, even as "realistic" fixtures — three real
+# contacts and one address leaked that way on 2026-09-06 and were caught only
+# by a hand grep. Every node slug under knowledge/people|organisations (the
+# owner's own excepted), plus every alias and email in their frontmatter, is a
+# forbidden string anywhere in the worktree. Runs only in the private repo,
+# where those notes exist; on the template it is a no-op.
+OWNER_SLUG_RE='^antoni'
+people_terms=$(
+  for f in "$ROOT"/knowledge/people/*.md "$ROOT"/knowledge/organisations/*.md; do
+    [ -e "$f" ] || continue
+    slug=$(basename "$f" .md)
+    printf '%s\n' "$slug" | grep -Eqv "$OWNER_SLUG_RE" && printf '%s\n' "$slug"
+    # aliases: [a, b] and inline emails in the frontmatter block
+    sed -n '1,/^---$/p' "$f" | sed -n '2,$p' \
+      | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' || true
+  done | sort -u | awk 'length($0) >= 6'
+)
+if [ -n "$people_terms" ]; then
+  leaked=$(printf '%s\n' "$people_terms" | while IFS= read -r term; do
+    # `|| true`: a term that matches nothing makes grep exit 1, and under
+    # pipefail that becomes the loop's status, then the assignment's — which
+    # errexit turns into a silent exit before the template commit.
+    grep -rIl -F -- "$term" "$WORKTREE" --exclude-dir=.git 2>/dev/null | sed "s|^|$term -> |" || true
+  done)
+  if [ -n "$leaked" ]; then
+    echo "ABORT: a person or organisation from the private vault appears in synced content:"
+    echo "$leaked"
+    exit 1
+  fi
+fi
+
 INVENTORY_RE='university/COMP[0-9]+/'
 if grep -rElE "$INVENTORY_RE" "$WORKTREE" --include='*.jsonl' \
         --exclude-dir=.git >/dev/null 2>&1; then

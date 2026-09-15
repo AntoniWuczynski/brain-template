@@ -160,24 +160,24 @@ def test_propose_duplicate_merges_no_pairs_is_empty(tmp_path: Path) -> None:
 
 
 def test_propose_duplicate_merges_skips_ambiguous_pairs(tmp_path: Path) -> None:
-    """Two named nodes ('Andrew' and 'Andrew Basley') both name the local
+    """Two named nodes ('Quentin' and 'Quentin Baker') both name the local
     part of one email-slugged node: there is no single survivor to name as
     promote.target, so this pass proposes nothing and leaves it for a human
     (the sweep report still flags the pair)."""
     paths = _vault(tmp_path)
     _write(
-        paths, "knowledge/people/andrewexamplecom.md",
-        "---\ntitle: andrew@example.com\ntype: person\naliases: []\n---\n\n"
-        "# andrew@example.com\n",
+        paths, "knowledge/people/quentinexamplecom.md",
+        "---\ntitle: quentin@example.com\ntype: person\naliases: []\n---\n\n"
+        "# quentin@example.com\n",
     )
     _write(
-        paths, "knowledge/people/andrew.md",
-        "---\ntitle: Andrew\ntype: person\naliases: []\n---\n\n# Andrew\n",
+        paths, "knowledge/people/quentin.md",
+        "---\ntitle: Quentin\ntype: person\naliases: []\n---\n\n# Quentin\n",
     )
     _write(
-        paths, "knowledge/people/andrew-basley.md",
-        "---\ntitle: Andrew Basley\ntype: person\naliases: []\n---\n\n"
-        "# Andrew Basley\n",
+        paths, "knowledge/people/quentin-baker.md",
+        "---\ntitle: Quentin Baker\ntype: person\naliases: []\n---\n\n"
+        "# Quentin Baker\n",
     )
 
     assert propose_duplicate_merges(paths) == []

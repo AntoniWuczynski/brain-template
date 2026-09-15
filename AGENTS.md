@@ -32,12 +32,21 @@ agents, or any human-driven script. If you cannot satisfy these rules,
    object per line; never rewrite the whole file.
 5. **Log every operation.** Append to `logs/ingest-YYYYMMDDTHHMMSS.log`
    for ingestion runs, or to a similarly named log for other tools. Logs
-   are append-only. One carve-out: the maintenance rotation
-   (`scripts/rotate_logs.py`) may rename and gzip an oversized telemetry
-   stream into an immutable timestamped segment, and gzip a dated per-run
-   log in place once it is older than `--compress-after-days` — content is
-   compressed and kept forever, never dropped or pruned (decision record:
-   `FOUNDER_DECISIONS.md` IMP-007).
+   are append-only. Three carve-outs, all in the maintenance rotation
+   (`scripts/rotate_logs.py`), all decided under `FOUNDER_DECISIONS.md`
+   IMP-007: it may (a) rename and gzip an oversized telemetry stream into
+   an immutable timestamped segment, (b) gzip a dated per-run log in place
+   once it is older than `--compress-after-days`, and (c), extending
+   IMP-007 — for an undated log a supervisor (launchd/systemd) holds open
+   across process restarts, where a rename would strand the writer's fd on
+   a now-unlinked inode, gzip the current bytes to a timestamped segment
+   (kept forever, same as (a)/(b)) and only then truncate the live file in
+   place at the same inode, so the writer's open fd keeps working. The
+   gzip runs before the truncate, so everything it captured is preserved;
+   only a line the writer emits in the narrow window between that gzip
+   read and the truncate can be lost — the same trade-off `logrotate`'s own
+   `copytruncate` option makes. In all three cases content is compressed
+   and kept, never dropped or pruned to save space.
 6. **Mark uncertainty explicitly.** If extraction is incomplete use
    `status: partial`; if it failed use `status: manual_review` and move
    the file to `archive/failed/` — the move applies only to a file the
@@ -110,10 +119,40 @@ later agents know it was deliberate.
 
 ---
 
+## Where a note lives
+
+`knowledge/` is organised by **subject**, not by which client wrote the
+note. The areas below are recommendations — pick the one that fits, and
+never force a note into `projects/` because a tool defaulted there:
+
+- `projects/<slug>/` — a bounded piece of work, repo or not: an overview
+  `<slug>.md`, curated `<topic>.md` notes beside it, and dated `log/`
+  entries. A folder-backed graph node (next section).
+- `chats/<slug>/` — a chat-based project with no repository behind it (a
+  claude.ai, ChatGPT or Codex "project" of conversations, e.g. a job search
+  run from a chat). Same folder shape and node rules as `projects/`; there
+  is no `chats/shared/`.
+- `personal/<area>/` — life admin: leases, contracts, health, finance,
+  travel. Free-form like `notes/`; nothing under it is a graph node.
+- `people/`, `organisations/`, `meetings/` — entity notes (next section).
+- `notes/`, `research/`, `university/` — free-form curated notes.
+  `assistant/` is the assistant's memory lifecycle ("Provenance and the
+  memory lifecycle" below).
+
+**Slugs are readable.** Use the git remote name when there is one
+(`git@github.com:acme/RandEval.git` → `randeval`); otherwise derive a
+kebab-case name from the title (`WorkSearch` → `worksearch`). Never use a
+directory basename or an opaque chat-project id as a slug —
+`chats/worksearch/`, not `projects/g-p-69fb…/`. The overview's
+`source_repo` field, not the slug, is what identifies "the same project"
+across sessions.
+
+---
+
 ## Entity notes and typed relations
 
-People, organisations, projects and meetings are **graph nodes**, not just
-prose. Blank starting points for people, organisations and meetings live in
+People, organisations, projects, chats and meetings are **graph nodes**, not
+just prose. Blank starting points for people, organisations and meetings live in
 `knowledge/index/templates/`; projects have no blank template yet.
 
 - **Node ids.** An entity's id is its `knowledge/`-relative path without
@@ -121,9 +160,10 @@ prose. Blank starting points for people, organisations and meetings live in
   Node ids always contain a `/`, so they can never collide with concept
   slugs. Relation targets, `promote.target` values and attendee lists all
   use this form.
-- **Folder-backed entities (projects).** A project is a FOLDER,
+- **Folder-backed entities (projects, chats).** A project is a FOLDER,
   `knowledge/projects/<slug>/`, holding an overview note plus curated
-  notes and a `log/`. The id is the overview note's own path —
+  notes and a `log/`; `knowledge/chats/<slug>/` follows exactly the same
+  rules. The id is the overview note's own path —
   `projects/server/server` for `knowledge/projects/server/server.md` —
   **not** the folder `projects/server`, which is no note at all and can
   never resolve. Curated notes beside it keep their own path
@@ -138,7 +178,7 @@ prose. Blank starting points for people, organisations and meetings live in
 - **Closed relation vocabulary.** The list below is the documented source
   of truth. Code mirrors it once, as `RELATION_VOCAB` in
   `scripts/ingest_lib/relations.py`, and
-  `tests/test_relations.py::test_agents_md_is_the_relation_vocabulary_source`
+  `tests/test_relations_regressions.py::test_agents_md_is_the_relation_vocabulary_source`
   fails if the two ever drift. Everything else that names these rels —
   the MCP tool descriptions in `mcp_server/app.py`, the note templates in
   `knowledge/index/templates/`, `README.md`, `mcp/README.md` — is a copy,

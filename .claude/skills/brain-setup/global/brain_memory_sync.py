@@ -12,7 +12,7 @@ Three hook entry points, selected by argv[1]:
            reachable, nudge the model to drop a *distilled* fact-note into
            knowledge/assistant/inbox/. If the PROJECT flag is set AND the server
            is reachable, nudge the model to append a distilled entry to this
-           project's brain log (knowledge/projects/<slug>/log/<date>.md). Both
+           project's brain log (knowledge/<area>/<slug>/log/<date>.md). Both
            nudges can fire in the same turn. If the server is DOWN the flags are
            left in place, so the nudge fires on the first Stop after recovery
            instead of being lost. Flags are consumed at emit time (one-shot).
@@ -89,13 +89,19 @@ _PROJECT_NUDGE = (
     "If anything DURABLE resulted — a decision, a research finding, a milestone, or "
     "new project state worth recalling in a future session — append a short, "
     "distilled entry to this project's brain log via the brain MCP tools: "
-    "mcp__brain__vault_append_to_note on knowledge/projects/{slug}/log/{date}.md "
+    "mcp__brain__vault_append_to_note on knowledge/<area>/{slug}/log/{date}.md "
     "(or mcp__brain__vault_create_note if it does not exist yet), and ensure a "
-    "knowledge/projects/{slug}/{slug}.md overview note exists. When a specific "
-    "decision, design, artefact or sub-topic deserves its own home rather than a log "
-    "line, ALSO create a focused curated note beside the overview at "
-    "knowledge/projects/{slug}/<descriptive-kebab-name>.md — or under "
-    "knowledge/projects/shared/ if it spans several projects, each linked with a "
+    "knowledge/<area>/{slug}/{slug}.md overview note exists. <area> is 'projects' "
+    "for a bounded piece of work with a repo or codebase (the usual case), "
+    "'chats' for a chat-based project with no repo, or 'personal' for life "
+    "admin — recommendations, chosen by subject, never forced. '{slug}' is only "
+    "a suggestion derived from the git remote or directory name: if it is an "
+    "opaque id or does not name the work, use a readable kebab-case slug "
+    "instead, and reuse any folder already in the vault whose overview has the "
+    "same source_repo. When a specific decision, design, artefact or sub-topic "
+    "deserves its own home rather than a log line, ALSO create a focused curated "
+    "note beside the overview at knowledge/<area>/{slug}/<descriptive-kebab-name>.md "
+    "— or under knowledge/projects/shared/ if it spans several projects, each linked with a "
     "related_to relation — carrying topics:/relations: frontmatter so it joins the "
     "concept and relation graph. Use pointers to repo files, not copies; skip purely "
     "operational or trivial edits. If nothing durable happened, just stop without "
@@ -111,7 +117,9 @@ _SESSION_NUDGE = (
     "on this project (try query \"{slug}\", and recent decisions / people / "
     "meetings as relevant).{todo_clause} If the user's opening message asks for "
     "a status recap (\"where did we leave off\", \"what's the status\"), also "
-    "read the latest note under knowledge/projects/{slug}/log/ via "
+    "read the latest note under the project's log/ folder (usually "
+    "knowledge/projects/{slug}/log/, or knowledge/chats/{slug}/log/ for a "
+    "chat-based project with no repo) via "
     "mcp__brain__vault_read and answer with a three-line last-session / "
     "current-status / next-actions recap. At the end of a session in which "
     "decisions were made, features shipped, or plans changed, save a session "

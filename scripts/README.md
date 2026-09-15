@@ -478,7 +478,7 @@ pairs `sweep`/`duplicates` now report. A name is resolved only against the
 followed through `superseded_by` to the live survivor: the accent-folded
 slug (`Antoni Wuczyński` -> `people/antoni-wuczynski`), the exact note title
 (which is what catches an attendee named by their address, whose node is
-slugged `people/alexasymmetricsecuritycom`), and an exact `aliases:` entry
+slugged `people/alexexamplecom`), and an exact `aliases:` entry
 (what AGENTS.md's merge leaves behind). The union must come out at exactly
 one node: two people sharing a name is reported `ambiguous` and resolves to
 nothing. Anything unresolved is listed by display name in the note's
@@ -793,28 +793,37 @@ marked `status: partial`. For full extraction — including figures,
 tables and formulas exported as separate image files — install MinerU:
 
 ```bash
-# Pin 2.7.6. Do NOT install unpinned: the current latest (mineru 3.4.0) is
-# broken — it requires transformers>=4.57.3, but its bundled UniMerNet
-# imports `find_pruneable_heads_and_indices`, which was removed from
-# transformers in 4.57, so every PDF fails to a pypdf fallback. 2.7.6 allows
-# transformers>=4.49 (which still has the symbol). transformers==4.53.3 is
-# pinned in pyproject.toml (so `uv sync` keeps it — no need to re-pin it
-# here). `six` is a missing transitive dep of mineru's pytorchocr.
-uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six
+uv sync --locked --extra mineru
 ```
 
-That's it. The `mineru` package (built on PaddleOCR's PP-Structure for
-layout, PaddleOCR for OCR, and UniMerNet for formulas) auto-downloads
-its model weights from Hugging Face on first run — about 14 GB into
+`mineru[pipeline]==2.7.6` and its `six` dependency (a missing transitive of
+mineru's pytorch-OCR module) are pinned and locked in `pyproject.toml` /
+`uv.lock` under the `mineru` extra — a bare `uv sync` does not install them.
+
+The repo pins Python to 3.12 (`pyproject.toml`'s `requires-python`) for this
+extra's sake: `uv.lock` resolves under `requires-python = "==3.12.*"`, and
+the only wheels it locks for torch 2.12.0 and onnxruntime 1.29.0 (both
+transitives of `mineru[pipeline]`) carry `cp312` tags. That proves the
+locked wheel set was resolved for 3.12 — the lock never queried the index
+for `cp313`/`cp314` tags, so it is not proof those don't exist. Unverified
+on 3.13; re-check before moving the pin.
+Do not install mineru unpinned: the current latest (mineru 3.4.0) is
+broken — it requires transformers>=4.57.3, but its bundled UniMerNet imports
+`find_pruneable_heads_and_indices`, which was removed from transformers in
+4.57, so every PDF fails to a pypdf fallback. 2.7.6 allows transformers>=4.49
+(which still has the symbol); transformers==4.53.3 is pinned in
+`pyproject.toml` for this.
+
+That's it. The `mineru` package (layout via DocLayout-YOLO, OCR via a
+PyTorch port of PaddleOCR's recognition models, formulas via UniMerNet —
+no PaddlePaddle framework dependency) auto-downloads its model weights
+from Hugging Face on first run — about 14 GB into
 `~/.cache/huggingface/`. No config file required.
 
 > **Apple Silicon:** set `MINERU_DEVICE_MODE=mps` for an ~8× speedup over
 > CPU (≈1 min/file vs ≈8 min/file in practice).
 >
-> **Office formats** (`.ppt`, `.pptx`, `.doc`) have no native MinerU path.
-> Convert to PDF first and ingest the PDF for full figure/table extraction:
-> `soffice --headless --convert-to pdf <file>` (LibreOffice). `.docx` is
-> handled natively (text-only) by the docx extractor.
+> **Office formats.** `.pptx` and `.docx` are handled natively (text-only). `.ppt` (legacy PowerPoint 97-2003) is handled by `extractors/ppt.py`: a headless LibreOffice conversion to `.pptx` in a temporary directory, then the pptx extractor, so the note shape is identical; without `soffice` on PATH the file records `manual_review` with the reason. `.doc` has no path. For full figure and table extraction of any office file, convert to PDF first and ingest the PDF: `soffice --headless --convert-to pdf <file>`.
 
 Knobs (env vars, all optional):
 
@@ -870,18 +879,19 @@ with a local Whisper model when installed — activate with
 (default `base`). Without the ASR backend the audio is marked `manual_review`
 with the install command — never a fabricated transcript.
 
-MinerU is deliberately *not* in `pyproject.toml`'s lockfile because
-some of its transitive deps are pre-releases. The ingestion script
-checks whether the `mineru` CLI is on PATH; if it isn't, or if it
-errors on a specific PDF, the script transparently falls back to
-`pypdf` and records the MinerU error verbatim in the note's
-`Processing notes` section.
+MinerU is a locked, opt-in extra (`mineru`) rather than a default
+dependency — the model weights are ~14 GB and it pulls in the ~2 GB torch
+stack, which most CI environments don't want. The ingestion script checks
+whether the `mineru` CLI is on PATH; if it isn't, or if it errors on a
+specific PDF, the script transparently falls back to `pypdf` and records
+the MinerU error verbatim in the note's `Processing notes` section.
 
-**Every `uv sync` prunes MinerU.** Because it isn't in the lockfile, `uv sync`
-removes it (and its torch transitives) from the venv on every run, not just
-the first. Re-run `uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six`
-after each `uv sync` to restore full PDF extraction, or ingestion silently
-falls back to `pypdf` and every PDF lands `partial`.
+**Every bare `uv sync --locked` still prunes MinerU** — extras are installed
+only when named, so a sync without `--extra mineru` removes it (and its
+torch/ultralytics/onnxruntime transitives) from the venv again, exactly as
+before. Re-run `uv sync --locked --extra mineru` after each bare sync to
+restore full PDF extraction, or ingestion silently falls back to `pypdf` and
+every PDF lands `partial`.
 
 ## Internals
 

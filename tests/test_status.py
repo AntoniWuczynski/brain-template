@@ -2,22 +2,23 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from ingest_lib.config import VaultPaths, paths_for_root
-from ingest_lib.metadata import IndexRecord, append_record
+from ingest_lib.metadata import IndexRecord, Status, append_record
 from ingest_lib.status import rebuild_status
 
 _LOG = logging.getLogger("test")
 
 
-def _rec(rel: str, status: str, *, extractor: str, ext: str, src_hash: str,
+def _rec(rel: str, status: Status, *, extractor: str, ext: str, src_hash: str,
          error: str | None = None, raw: str | None = None) -> IndexRecord:
     return IndexRecord(
         relative_path=rel, source_hash=src_hash, size_bytes=1, extension=ext,
-        extractor=extractor, status=status,  # type: ignore[arg-type]
+        extractor=extractor, status=status,
         raw_path=raw or f"archive/raw/{rel}", processed_path=None,
         index_note_path=None, error=error,
     )
@@ -103,9 +104,9 @@ def test_user_tail_preserved(tmp_path: Path) -> None:
     assert "MY IMPORTANT NOTE" in target.read_text(encoding="utf-8")
 
 
-def _rec_dated(rel: str, status: str, *, src_hash: str, created: str) -> IndexRecord:
+def _rec_dated(rel: str, status: Status, *, src_hash: str, created: str) -> IndexRecord:
     r = _rec(rel, status, extractor="text", ext=".md", src_hash=src_hash)
-    return IndexRecord(**{**r.__dict__, "created_at": created})
+    return replace(r, created_at=created)
 
 
 def test_now_dashboard_recent_and_attention(tmp_path: Path) -> None:

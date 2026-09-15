@@ -58,20 +58,26 @@ treat a red run as a real failure, not noise.
 
 ## Tooling defaults
 
-- **Python**: 3.12, pinned in `pyproject.toml`. PaddlePaddle has no 3.13/3.14
-  wheels yet, and MinerU depends on it.
+- **Python**: 3.12, pinned in `pyproject.toml`. `uv.lock` resolves under
+  `requires-python = "==3.12.*"`, and the only wheels it locks for torch
+  2.12.0 and onnxruntime 1.29.0 (pulled in by MinerU's `pipeline` extra)
+  carry `cp312` tags — proof the mineru extra's locked wheel set was
+  resolved for 3.12, not proof of a 3.13/3.14 gap (the lock never asked
+  the index about those tags). Unverified on 3.13; re-check before moving
+  the pin.
 - **Package manager**: `uv`. Never `pip install` outside the venv.
   Use `uv add <pkg>` for new deps, `uv sync` to reproduce the env.
-  **Caveat**: `uv sync` prunes any package not in the lockfile, including
-  `mineru` and its torch transitives. After every `uv sync`, re-run
-  `uv pip install --prerelease=allow "mineru[pipeline]==2.7.6" six`
-  to restore PDF full-extraction. (`transformers==4.53.3` is now pinned in
-  `pyproject.toml`, so `uv sync` keeps it — you no longer have to re-pin
-  transformers after every sync, only reinstall mineru + six.) Pin 2.7.6 —
-  the unpinned install now resolves to mineru 3.4.0, which is broken (needs
+  MinerU is a locked, opt-in extra (`[project.optional-dependencies]
+  mineru`) rather than a default dependency — the model weights are ~14 GB
+  and it pulls in the ~2 GB torch stack, which most CI environments don't
+  want. **Every bare `uv sync --locked` prunes it again** (extras install
+  only when named), so re-run `uv sync --locked --extra mineru` after each
+  bare sync to restore full PDF extraction. Pin 2.7.6 —
+  the unpinned install resolves to mineru 3.4.0, which is broken (needs
   `transformers>=4.57.3` but imports `find_pruneable_heads_and_indices`,
   removed in 4.57), so every PDF silently falls back to pypdf and lands as
-  `partial`. See `scripts/README.md` for the full explanation.
+  `partial`. `transformers==4.53.3` is pinned in `pyproject.toml` for this.
+  See `scripts/README.md` for the full explanation.
 - **LLM provider for summarizer**: four backends behind one router in
   `scripts/ingest_lib/summarize.py` — `anthropic` (default,
   `claude-haiku-4-5`), `openai` (`gpt-5-mini`), `gemini`

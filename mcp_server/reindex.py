@@ -22,6 +22,10 @@ Semantics:
 - Every failure is caught, logged, and audited; the thread never dies
   and a write NEVER depends on reindex success — search freshness
   degrades, vault content does not.
+- The derived-note rebuild + commit holds ``sync.WRITE_LOCK``, the same
+  lock a write tool holds across its pull, its body and its commit. This
+  thread is the only other writer of tracked files in the process, and
+  the two must never see each other's half-written tree.
 """
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ from ingest_lib.config import VaultPaths, paths_for_root  # noqa: E402
 
 from .audit import AuditLog
 from .git_ops import commit_paths
+from .sync import WRITE_LOCK
 
 log = logging.getLogger(__name__)
 
@@ -218,28 +223,38 @@ class IndexRefresher:
                 self._inflight = {}
 
     def _rebuild_derived(self, paths: VaultPaths) -> None:
-        conn = _connections.rebuild_connections(paths, logger=log)
-        cstats = _concepts.rebuild_concepts(paths, logger=log, related=conn.related)
-        derived: list[str] = [*cstats.written_paths, *cstats.removed_paths]
+        """Regenerate the derived notes and commit the ones that changed.
 
-        # Dashboards are a hard dependency (they've existed since that stage
-        # landed). Import at module top and call directly: the old
-        # importlib + `except ImportError` fallback silently swallowed a
-        # genuine ImportError from INSIDE dashboards.py, disabling dashboard
-        # refreshes with zero log output. A real breakage now surfaces via
-        # _process_batch's broad handler instead of being masked.
-        dstats = _dashboards.rebuild_dashboards(paths, logger=log)
-        derived.extend(getattr(dstats, "written_paths", ()))
+        Holds ``sync.WRITE_LOCK`` from the first byte written to the commit
+        that clears it. The rebuild writes concept notes and dashboards
+        into the shared working tree and a real vault's takes seconds:
+        without the lock, every write tool whose pull-before-write landed
+        in that window saw a dirty tree and refused itself, naming a
+        derived note no agent could commit or discard.
+        """
+        with WRITE_LOCK:
+            conn = _connections.rebuild_connections(paths, logger=log)
+            cstats = _concepts.rebuild_concepts(paths, logger=log, related=conn.related)
+            derived: list[str] = [*cstats.written_paths, *cstats.removed_paths]
 
-        if not derived:
-            return
-        # connections.jsonl is gitignored telemetry-adjacent state; only
-        # the derived NOTES are vault content worth a commit.
-        outcome = commit_paths(
-            self._vault_root,
-            paths=[self._vault_root / rel for rel in sorted(set(derived))],
-            message="mcp: refresh derived notes",
-            expected_branch=self._branch,
-        )
+            # Dashboards are a hard dependency (they've existed since that stage
+            # landed). Import at module top and call directly: the old
+            # importlib + `except ImportError` fallback silently swallowed a
+            # genuine ImportError from INSIDE dashboards.py, disabling dashboard
+            # refreshes with zero log output. A real breakage now surfaces via
+            # _process_batch's broad handler instead of being masked.
+            dstats = _dashboards.rebuild_dashboards(paths, logger=log)
+            derived.extend(getattr(dstats, "written_paths", ()))
+
+            if not derived:
+                return
+            # connections.jsonl is gitignored telemetry-adjacent state; only
+            # the derived NOTES are vault content worth a commit.
+            outcome = commit_paths(
+                self._vault_root,
+                paths=[self._vault_root / rel for rel in sorted(set(derived))],
+                message="mcp: refresh derived notes",
+                expected_branch=self._branch,
+            )
         if outcome.committed and self._request_push is not None:
             self._request_push()

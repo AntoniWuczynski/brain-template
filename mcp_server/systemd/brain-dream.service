@@ -1,0 +1,26 @@
+[Unit]
+Description=Brain dream pass
+Documentation=https://github.com/AntoniWuczynski/brain-template/blob/main/.claude/skills/dream-pass/SKILL.md
+# dream.sh drives the `claude` CLI against this box's own MCP server over
+# mcp__brain__* tools, so it needs the server actually reachable, not just
+# started — After= only orders unit starts, so this is best-effort at the
+# boot-race edge; the daily 05:00 schedule (an hour after maintenance) means
+# in practice the server has been up for hours by the time this fires.
+After=brain-mcp.service
+
+[Service]
+Type=oneshot
+# User systemd unit: no User=/Group=. Install to ~/.config/systemd/user/.
+WorkingDirectory=%h/services/brain
+EnvironmentFile=%h/services/brain/.env
+Environment=HF_HOME=%h/services/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=%h/services/brain/.cache
+# dream.sh repairs its own PATH and resolves the repo root itself.
+ExecStart=/bin/bash %h/services/brain/scripts/dream.sh
+
+# Deliberately NOT filesystem-sandboxed: this runs the `claude` CLI itself
+# (subscription auth, no API credits — see scripts/dream.sh), which reads
+# its own config/credentials from under $HOME (~/.claude, ~/.claude.json)
+# and writes session state there too. ProtectHome=/ProtectSystem=strict
+# would very likely break that in ways this repo has no way to verify
+# without a live systemd box (see mcp/DEPLOY.md).

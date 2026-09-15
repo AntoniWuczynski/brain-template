@@ -167,6 +167,20 @@ def test_create_note_refuses_bad_relations(
     assert outcomes[0].startswith("refused:")
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["knowledge/chats/worksearch/worksearch.md", "knowledge/personal/leases/flat-2026.md"],
+)
+def test_create_note_accepts_chats_and_personal_areas(
+    mcp_vault: Path, make_cfg: CfgFactory, make_runtime: RuntimeFactory, path: str
+) -> None:
+    root = mcp_vault
+    cfg, runtime = make_cfg(root), make_runtime(root)
+    result = tool_create_note(cfg, runtime, path=path, content="---\ntitle: x\n---\nbody\n")
+    assert result.committed
+    assert (root / path).is_file()
+
+
 def test_create_note_accepts_valid_relations(
     mcp_vault: Path, make_cfg: CfgFactory, make_runtime: RuntimeFactory
 ) -> None:
