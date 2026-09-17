@@ -141,7 +141,12 @@ never force a note into `projects/` because a tool defaulted there:
 
 **Slugs are readable.** Use the git remote name when there is one
 (`git@github.com:acme/RandEval.git` → `randeval`); otherwise derive a
-kebab-case name from the title (`WorkSearch` → `worksearch`). Never use a
+kebab-case name from the title (`WorkSearch` → `worksearch`). Slugs are
+plain ASCII: a letter with a diacritic folds to its base letter (`Łódź` →
+`lodz`, `Wuczyński` → `wuczynski`, `Peña` → `pena`), never punched out as a
+separator — one rule (`concepts.slugify`) for concepts, meetings, people and
+connector filenames, while `title:` and `aliases:` keep the original
+spelling. Never use a
 directory basename or an opaque chat-project id as a slug —
 `chats/worksearch/`, not `projects/g-p-69fb…/`. The overview's
 `source_repo` field, not the slug, is what identifies "the same project"

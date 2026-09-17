@@ -434,7 +434,7 @@ Everything is via environment variables in `.env`:
 | `BRAIN_EMBED_DEVICE` | Same options for the semantic-search embedder. |
 | `MINERU_MODEL_SOURCE` | `huggingface` (default) or `modelscope`. |
 | `BRAIN_MINERU_FORMULA` | `true` (default) / `false`. Disable MinerU's formula model (it hallucinates LaTeX on handwriting). |
-| `BRAIN_MINERU_LANG` | OCR language passed to MinerU (default `en`). |
+| `BRAIN_MINERU_LANG` | OCR language passed to MinerU (default `en`). Polish, Spanish and other Latin-script languages use `latin`; MinerU has no `pl`/`es` code, and an unknown value drops every PDF in the run to `partial`. |
 | `BRAIN_PDF_EXTRACTOR` | Set to `vlm` to route PDFs through the vision-LLM page transcriber (handwritten/scanned notes). |
 | `BRAIN_VLM_MODEL` | Vision model for the `vlm` extractor (default `claude-sonnet-4-6`). |
 | `BRAIN_VLM_SCALE` | Page render resolution for the `vlm` extractor (default 2.0). |

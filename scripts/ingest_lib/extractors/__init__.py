@@ -14,6 +14,7 @@ from . import docx as _docx_mod
 from . import image as _image_mod
 from . import meeting as _meeting_mod
 from . import notebook as _notebook_mod
+from . import notion_page as _notion_page_mod
 from . import pdf as _pdf_mod
 from . import ppt as _ppt_mod
 from . import pptx as _pptx_mod
@@ -88,8 +89,10 @@ _SOURCE_CLASS_SUFFIX = ".json"
 _SOURCE_CLASS_REGISTRY: dict[str, Extractor] = {
     "meetings/granola/": _meeting_mod.extract,
     "meetings/justrec/": _meeting_mod.extract,
+    "meetings/notion/": _meeting_mod.extract,
     "transcripts/claude_code/": _transcript_mod.extract,
     "transcripts/chat_export/": _transcript_mod.extract,
+    "notes/notion/": _notion_page_mod.extract,
 }
 
 

@@ -216,6 +216,7 @@ def test_packet_compiled_truth_ranks_by_new_evidence_and_honours_its_budget(
         "compiled_truth": 1,
         "reserved_for_other_jobs": 9,
         "contradiction_proposals": 5,
+        "meeting_filings": 10,
     }
 
 

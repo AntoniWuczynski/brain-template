@@ -523,3 +523,21 @@ def test_relations_query_rejects_bad_rel_and_date(env: tuple[Path, ServerConfig,
         tool_relations_query(cfg, runtime, rel="employed_by")
     with pytest.raises(ToolError, match="as_of"):
         tool_relations_query(cfg, runtime, as_of="2026/01/01")
+
+
+def test_meeting_create_folds_diacritics_in_the_slug_only(env: tuple[Path, ServerConfig, Runtime]) -> None:
+    """A Polish title: the node id and filename fold diacritics
+    (``spotkanie-zarzadu-lodz``), the stored title keeps them."""
+    root, cfg, runtime = env
+    res = tool_meeting_create(
+        cfg, runtime,
+        date="2026-06-12", title="Spotkanie zarządu (Łódź)",
+        attendees=["people/anna"], body="Ustalono budżet.",
+    )
+    rel = "knowledge/meetings/2026/2026-06-12-spotkanie-zarzadu-lodz.md"
+    assert res.path == rel
+    meeting = (root / rel).read_text(encoding="utf-8")
+    assert "# Spotkanie zarządu (Łódź)" in meeting
+    assert "Ustalono budżet." in meeting
+    anna = (root / "knowledge/people/anna.md").read_text(encoding="utf-8")
+    assert "target: meetings/2026/2026-06-12-spotkanie-zarzadu-lodz" in anna

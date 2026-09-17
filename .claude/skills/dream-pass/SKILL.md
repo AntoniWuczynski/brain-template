@@ -218,6 +218,31 @@ it cannot settle alone, and surface open questions. The design contract is
 
    Skip freely, and record every skip with its reason in the report.
 
+7b. **Meeting filing.** The packet's `unfiled_meetings` lists meeting
+   notes with no project and no filing proposal yet (newest first, already
+   capped at `edit_budget.meeting_filings`), each with an `excerpt`, its
+   `attendees` and the deterministic `rule_scores` that were too weak or
+   too close to file it at promotion time. `project_catalogue` is the full
+   list of live projects you may choose from.
+
+   For each meeting, pick a `project_id` from the catalogue only when the
+   excerpt, title and attendees make the project clear. Otherwise skip it
+   and note the skip in the report. Never invent a project and never pick
+   one outside the catalogue. Write the picks as a JSON array of
+   `{"node_id", "project_id", "reason"}` to
+   `~/.cache/brain-dream/meeting-filings.json`, with `reason` quoting the
+   evidence, then run:
+
+   ```bash
+   uv run --no-sync python scripts/dream_gate.py --file-meetings ~/.cache/brain-dream/meeting-filings.json
+   ```
+
+   It writes one `approved: false` proposal per meeting (a `related_to`
+   from the meeting to the project), refuses the whole file if any pick
+   names a filed meeting or an unknown project, and never writes a second
+   proposal for a meeting that already has one. A human approves it and
+   `scripts/consolidate.py` applies it.
+
 8. **Consolidation.** For entities in the changeset, read their notes plus
    `mcp__brain__vault_related` context. Where two facts duplicate or
    contradict each other, merge the prose via

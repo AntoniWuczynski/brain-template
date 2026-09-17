@@ -30,32 +30,24 @@ it was on the way in.
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from ..concepts import slugify
 from ..connectors.base import normalize_attendees, safe_display_name
 from .base import ExtractionResult
-
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
 
 def attendee_slug(name: str) -> str:
     """``people/`` slug for an attendee display name.
 
-    Accents are folded to their base letter first (``Lluís Cardona`` ->
-    ``lluis-cardona``, ``Antoni Wuczyński`` -> ``antoni-wuczynski``) rather
-    than being punched out as separators: the live vault's person notes are
-    slugged the folded way, so the unfolded spelling (``llu-s-masanes``)
-    links to — and resolves to — nothing. A name that folds to nothing at
-    all (fully non-Latin) yields ``""``; callers must handle that rather
-    than emit an empty node id.
+    The vault's one slug rule (``concepts.slugify``): accents fold to their
+    base letter (``Lluís Cardona`` -> ``lluis-cardona``, ``Łukasz Żółć`` ->
+    ``lukasz-zolc``), so the id matches a person note named the same way.
+    A name that folds to nothing at all (fully non-Latin) yields ``""``;
+    callers must handle that rather than emit an empty node id.
     """
-    decomposed = unicodedata.normalize("NFKD", name)
-    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return _SLUG_RE.sub("-", folded.strip().lower()).strip("-")
+    return slugify(name)
 
 
 @dataclass(frozen=True)
