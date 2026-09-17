@@ -74,7 +74,7 @@ def test_granola_connector_pulls_snapshots(tmp_path: Path, monkeypatch: pytest.M
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "test-key")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
-        {"id": "g1", "title": "Kern sync", "date": "2026-07-12",
+        {"id": "g1", "title": "Kern sync", "created_at": "2026-07-12T09:00:00Z",
          "attendees": [{"name": "Alice"}], "summary": "s", "transcript": "t"},
         {"id": "", "title": "no id — dropped"},
     ])
@@ -91,8 +91,8 @@ def test_granola_same_day_same_title_do_not_collide(tmp_path: Path, monkeypatch:
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "k")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
-        {"id": "a", "title": "Standup", "date": "2026-07-12", "summary": "one"},
-        {"id": "b", "title": "Standup", "date": "2026-07-12", "summary": "two"},
+        {"id": "a", "title": "Standup", "created_at": "2026-07-12T09:00:00Z", "summary": "one"},
+        {"id": "b", "title": "Standup", "created_at": "2026-07-12T09:00:00Z", "summary": "two"},
     ])
     paths = _vault(tmp_path)
     stats = run_connector(CONNECTORS["granola"](), paths, pulled_at=_AT, logger=_LOG)
@@ -115,7 +115,7 @@ def test_granola_attendee_without_name_dropped(tmp_path: Path, monkeypatch: pyte
     from ingest_lib.connectors import granola
     monkeypatch.setenv("GRANOLA_API_KEY", "k")
     monkeypatch.setattr(granola, "_fetch_meetings", lambda _k: [
-        {"id": "a", "title": "M", "date": "2026-07-12",
+        {"id": "a", "title": "M", "created_at": "2026-07-12T09:00:00Z",
          "attendees": [{"email": "x@y.z"}, {"name": "Real"}, None, "Str"]},
     ])
     paths = _vault(tmp_path)

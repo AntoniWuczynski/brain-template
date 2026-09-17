@@ -13,7 +13,7 @@ concrete connector ships.
 """
 from __future__ import annotations
 
-from .base import Connector, Snapshot
+from .base import Connector, ConnectorError, Snapshot
 from .runner import PullStats, run_connector
 from .state import ConnectorState, load_state, save_state
 
@@ -25,16 +25,19 @@ from .chat_export import ChatExportConnector
 from .claude_code import ClaudeCodeConnector
 from .granola import GranolaConnector
 from .justrec import JustrecConnector
+from .notion import NotionConnector
 
 CONNECTORS: dict[str, Callable[[], Connector]] = {
     "granola": GranolaConnector,
     "justrec": JustrecConnector,
     "claude_code": ClaudeCodeConnector,
     "chat_export": ChatExportConnector,
+    "notion": NotionConnector,
 }
 
 __all__ = [
     "Connector",
+    "ConnectorError",
     "Snapshot",
     "ConnectorState",
     "PullStats",

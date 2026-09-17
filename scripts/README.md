@@ -452,7 +452,8 @@ live in `ingest_lib/sweep.py`.
 duplicate pass, and called by `run_ingest` whenever a run processed a
 snapshot) turns a processed Granola/justREC snapshot into the first-class
 meeting note AGENTS.md describes — `knowledge/meetings/<YYYY>/<YYYY-MM-DD>-<slug>.md`,
-the same shape and slug (`concepts.slugify`) the MCP `meeting_create` tool
+the same shape and slug (`concepts.slugify`, diacritics folded:
+`Spotkanie zarządu` -> `spotkanie-zarzadu`) the MCP `meeting_create` tool
 writes — plus one proposed `attended` relation per attendee. Deterministic,
 zero-LLM, driven by `metadata/index.jsonl` (the records whose `extractor` is
 `meeting`), never by walking `archive/raw/`.
@@ -495,6 +496,27 @@ skipped rather than guessed at. Two DIFFERENT snapshots landing on one
 nothing proposed; a note carrying no `source_file` at all (every meeting
 note `meeting_create` wrote) is treated as this same meeting and left
 untouched, with the attendee proposals still run.
+
+**Filing under a project** (`ingest_lib/meeting_projects.py`). A note this
+pass wrote and that has no project yet is filed only on strong evidence:
+3 points for a project name in the meeting title, 1 for one in the summary,
+2 per attendee whose person note has an open `member_of`/`collaborator_on`
+to the project. Names are a project's aliases, its multi-word title parts
+and a hyphenated folder slug (a bare single title word like `Check` counts
+only if it is also an alias), accent-folded and matched on whole words. The
+best project needs at least 3 points and a lead of 2 over the runner-up.
+Filing writes `project:` plus a `related_to` relation, the shape
+`meeting_create` writes. A note already filed (by hand, by
+`meeting_create`, or by an approved proposal) or one this pass did not
+write is never changed. The run output lists every filed and ambiguous
+meeting with its scores.
+
+Everything else goes to the dream pass: its packet carries
+`unfiled_meetings` (capped at 10 per run) and a `project_catalogue`, and the
+session's picks go through `dream_gate.py --file-meetings <json>`
+(`ingest_lib/dream_meetings.py`), which writes one `approved: false`
+`related_to` proposal per meeting and never a second one for the same
+meeting, even with a different project.
 
 ## Memory consolidation
 
@@ -674,7 +696,7 @@ routed to `extractors/meeting.py` — title, date, attendees as `people/`
 wikilinks, summary, transcript — and from there to the meeting-promotion
 pass above, which makes the meeting a graph node):
 
-- **`granola`** — pulls meetings from the Granola API (`GRANOLA_API_KEY`).
+- **`granola`** — pulls notes (summary, attendees, transcript) from Granola's public API, `https://public-api.granola.ai/v1/notes` (`GRANOLA_API_KEY`, a `grn_` key from Settings → Connectors → API keys; needs a Business/Enterprise plan).
 - **`justrec`** — reads justREC's local export folder (`BRAIN_JUSTREC_DIR`),
   no API/auth.
 
@@ -742,10 +764,98 @@ A transcript pull that lands enough new snapshots (see
 by design, new sources are new evidence the dream gate has always counted,
 same as any other connector's output; it is deliberately not excluded.
 
+**`notion`** pulls every page a Notion internal integration can see via the
+public API (`api.notion.com`, hand-rolled `urllib` client — no new
+dependency). A page carrying Notion's AI meeting-notes block routes into the
+SAME `meetings/notion/` schema as Granola/justREC and rides the existing
+meeting extractor and promotion pass unchanged; every other page becomes a
+`notes/notion/` snapshot (`extractors/notion_page.py`) — title, URL,
+timestamps, and the page rendered to Markdown via Notion's own
+`/pages/{id}/markdown` endpoint. Only TOP-LEVEL blocks are scanned for the
+meeting-notes block, so one nested inside a toggle or column is not
+detected as a meeting: the page's content and transcript are still
+captured in the `notes/notion/` snapshot (the Markdown export inlines the
+transcript too), it just never reaches `knowledge/meetings/`.
+
+Setup: create an internal integration in Notion's developer portal
+(notion.so/my-integrations), then grant it access to the pages you want
+pulled — either from a page's `•••` menu → Connections, or from the
+integration's own Content access tab. Access is inherited by child pages,
+so sharing a top-level page pulls in everything under it. To resolve
+meeting attendees' names (rather than omitting them), also enable the
+integration's "user information" capability on its Configuration tab
+**before the first pull** — without it, `GET /v1/users/{id}` returns HTTP
+403 and an attendee that needed a lookup is omitted from `attendees` in
+that run's snapshot, counted (never silently) in the payload's
+`attendees_unresolved` field rather than just shrinking the list (handled
+gracefully, not a connector failure). Granting the capability LATER
+doesn't retroactively fix a meeting already snapshotted: a page is only
+re-fetched once it is actually edited again (see "Per-version filenames"
+below), so attendee names for an existing meeting arrive only with that
+page's next edit — a re-pull before then just re-records the same
+unresolved count. Put the integration's secret in `.env`:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `NOTION_API_KEY` | — | Required. The integration's secret; missing/invalid raises a loud `ConnectorError` (exit 2), never a silent zero-item pull. |
+| `BRAIN_NOTION_REFRESH_DAYS` | 7 | A page already snapshotted less than this many days ago is skipped even if edited since — see below. |
+
+Behaviour: Notion's search has no server-side `last_edited_time` filter, so
+every run lists ALL pages the integration can see (cheap) and decides per
+page whether to fetch content, using a `last_edited_time` cursor plus the
+connector's own state — this is also what catches a page newly SHARED with
+the integration whose `last_edited_time` is old. A page edited more often
+than `BRAIN_NOTION_REFRESH_DAYS` is throttled (skipped, not re-snapshotted)
+so a fast-changing doc doesn't land a new immutable archive version every
+night; it stays eligible and the cursor holds back until it's actually
+pulled. This throttle block is never dropped for being old — it
+self-expires at a known time, so with a long `BRAIN_NOTION_REFRESH_DAYS`
+(e.g. 30) it can legitimately hold the cursor back for the whole window;
+that lag is the throttle working as designed, not lost data, since the
+page's own state is untouched throughout. A meeting page whose AI
+transcription hasn't reached `notes_ready` yet, or one that fails to
+fetch, is likewise skipped and retried on every later run until it
+settles or succeeds — but this kind of block (an "error" block) DOES stop
+holding the cursor back after 14 days, and past that point the connector
+also forgets the page (drops its own bookkeeping entry) so it looks
+exactly like one newly shared with the integration and keeps being
+fetched on every later run regardless of the cursor — a zombie page (an
+abandoned transcription, a page that fails every run) can only degrade
+incremental sync for so long, without that edit being lost for good once
+it ages past the horizon. Every `notes/notion/`
+snapshot's filename embeds a stamp derived from the page's own listing
+metadata (its `last_edited_time`, not from the payload — the payload itself
+omits that field, so a timestamp-only edit with no real content change
+doesn't land a new immutable version), and every `meetings/notion/`
+snapshot's filename embeds the same stamp, so each content version of a
+page gets its own archive path instead of colliding with the pipeline's
+raw-archive-clash refusal — `ingest_lib.meetings` reconciles same-id
+meeting snapshots across those paths into one meeting note regardless. The
+API version is pinned (`Notion-Version: 2026-03-11` — the meeting-notes
+block is only named `meeting_notes` under this version, and its
+`calendar_event` field lives at this shape) and requests are paced to stay
+under the 180 req/min standard-plan limit, retrying 429/529 with
+`Retry-After` (capped 60s) or 1s/2s/4s backoff. Notion's Markdown export
+truncates around 20,000 blocks; a truncated page lands as `status: partial`
+with a note. Database-row property values beyond the title (status,
+dates, relations, ...) are not captured — only the title and the rendered
+page body.
+
 Adding another connector is a `pull()` + an extractor + an `.env` stanza.
 Follow-up for meetings: promote each into a first-class `knowledge/meetings/`
 note with typed `attended` relations (needs the attendee people notes to
 exist first). See `IDEAS.md` §4.
+
+### Scheduling
+
+Like every connector, `notion` stays out of `maintain.sh` — pulls are a
+separate, explicitly-triggered step, not part of the deterministic
+maintenance pass. `pull.py` exits 0 on a clean run, so it is safe to put
+straight on a cron/launchd schedule:
+
+```bash
+uv run python scripts/pull.py notion --then-ingest
+```
 
 ## Source-grounded concept descriptions
 
@@ -832,7 +942,10 @@ Knobs (env vars, all optional):
   else `cpu`.
 - `MINERU_MODEL_SOURCE` — `huggingface` (default) or `modelscope` (use
   Alibaba's mirror if HF is blocked).
-- `BRAIN_MINERU_LANG` — OCR language passed to MinerU (default `en`).
+- `BRAIN_MINERU_LANG` — OCR language passed to MinerU (default `en`). For
+  Polish, Spanish and other Latin-script languages use `latin` — MinerU's
+  `-l` accepts no `pl`/`es`, and an unknown value makes every PDF in the
+  run fall back to pypdf as `partial`. Applies to the whole run.
 - `BRAIN_MINERU_FORMULA` — `true` (default) / `false`. Set `false` to
   disable MinerU's UniMerNet formula model, which **hallucinates dense
   fake LaTeX on handwriting** it misreads as math. Off = text + figures
@@ -945,6 +1058,7 @@ scripts/
     │   ├── justrec.py               # justREC meeting connector (local-first)
     │   ├── claude_code.py           # Claude Code session-transcript connector (local-first)
     │   ├── chat_export.py           # claude.ai/ChatGPT conversation-export connector (local-first)
+    │   ├── notion.py                # Notion connector (pages + AI meeting notes)
     │   ├── _transcript_common.py    # shared normalisation for the two transcript connectors
     │   ├── runner.py                # drive a connector: pull, skip-unchanged, snapshot
     │   └── state.py                 # per-connector pull state (metadata/connectors/<name>.json)
@@ -960,8 +1074,9 @@ scripts/
         ├── vlm.py                  # vision-LLM page transcription (BRAIN_PDF_EXTRACTOR=vlm)
         ├── image.py                # standalone-image extractor (vision LLM)
         ├── audio.py                # audio + subtitle/transcript extractor (faster-whisper)
-        ├── meeting.py              # Granola/justREC meeting-snapshot extractor
-        └── transcript.py           # claude_code/chat_export snapshot extractor
+        ├── meeting.py              # Granola/justREC/notion meeting-snapshot extractor
+        ├── transcript.py           # claude_code/chat_export snapshot extractor
+        └── notion_page.py          # notes/notion snapshot extractor
 ```
 
 ## Adding a new file type

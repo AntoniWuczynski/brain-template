@@ -42,6 +42,7 @@ models/
 logs/*.log
 logs/*.tmp
 logs/*.gz
+logs/*.out
 # MCP server telemetry (per-machine, append-only; see mcp_server/audit.py),
 # including rotated-but-not-yet-compressed segments a crashed rotation can
 # leave behind (scripts/rotate_logs.py finishes them on its next run)

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, UTC
@@ -65,6 +66,23 @@ _AUTO_END = "<!-- AUTO-GENERATED-END -->"
 
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 
+# Letters with no canonical decomposition, which NFKD alone cannot fold.
+# Polish ł/Ł is the one this vault needs; the rest are the common Latin-script
+# cases, so a Danish or Icelandic name does not lose a letter either.
+_NON_DECOMPOSABLE = str.maketrans({
+    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D",
+    "ð": "d", "Ð": "D", "þ": "th", "Þ": "Th", "ß": "ss",
+    "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ı": "i",
+})
+
+
+def fold_ascii(text: str) -> str:
+    """Fold letters with diacritics to their base letter: ``Łódź`` -> ``Lodz``,
+    ``Wuczyński`` -> ``Wuczynski``, ``Peña`` -> ``Pena``. Letters with no Latin
+    base (CJK, Cyrillic, ...) pass through unchanged."""
+    decomposed = unicodedata.normalize("NFKD", text.translate(_NON_DECOMPOSABLE))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
 
 @dataclass(frozen=True)
 class ConceptStats:
@@ -86,9 +104,13 @@ def slugify(topic: str) -> str:
     Two topic strings that slugify to the same value (e.g.
     ``Behaviour-Driven Development`` and ``behaviour-driven-development``)
     collapse to one concept note, so case and punctuation drift doesn't
-    fragment the index.
+    fragment the index. Diacritics fold to their base letter
+    (``Spotkanie zarządu`` -> ``spotkanie-zarzadu``, ``Łódź`` -> ``lodz``)
+    rather than being punched out as separators. This is the ONE slug rule
+    for concepts, meeting notes, people and connector filenames, so the same
+    name lands on the same id everywhere.
     """
-    return _NON_SLUG.sub("-", topic.strip().lower()).strip("-")
+    return _NON_SLUG.sub("-", fold_ascii(topic).strip().lower()).strip("-")
 
 
 def rebuild_concepts(

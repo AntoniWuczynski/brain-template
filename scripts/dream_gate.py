@@ -40,6 +40,7 @@ from ingest_lib.dream import (  # noqa: E402
     record_pending,
     write_proposals,
 )
+from ingest_lib.dream_meetings import parse_meeting_filings, write_meeting_filings  # noqa: E402
 
 
 def _env_int(name: str, default: int) -> int:
@@ -89,11 +90,29 @@ def _build_parser() -> argparse.ArgumentParser:
                             "The array's entries are the packet's own contradiction "
                             "findings plus a 'title' and 'body'."
                         ))
+    parser.add_argument("--file-meetings", metavar="JSON", default=None,
+                        help=(
+                            "Propose the dream session's meeting -> project picks in "
+                            "this JSON file (or '-' for stdin): an array of "
+                            "{node_id, project_id, reason}."
+                        ))
     parser.add_argument("--mark-done", action="store_true",
                         help="Record a completed dream: advance metadata/dream.json to HEAD.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Check without recording the pending marker.")
     return parser
+
+
+def _load_json(source: str, flag: str) -> object:
+    raw_text = (
+        sys.stdin.read() if source == "-"
+        else Path(source).read_text(encoding="utf-8")
+    )
+    try:
+        payload: object = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{flag} input is not valid JSON: {exc}") from None
+    return payload
 
 
 def _run_propose(
@@ -107,15 +126,7 @@ def _run_propose(
     over the same findings is a no-op (the inbox filename is a hash of the
     proposal's content).
     """
-    raw_text = (
-        sys.stdin.read() if source == "-"
-        else Path(source).read_text(encoding="utf-8")
-    )
-    try:
-        payload: object = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"--propose input is not valid JSON: {exc}") from None
-    findings = parse_adjudicated(payload)
+    findings = parse_adjudicated(_load_json(source, "--propose"))
     return write_proposals(paths, findings, now=now, logger=logger)
 
 
@@ -129,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.propose is not None:
             outcomes = _run_propose(args.propose, paths, now=as_of, logger=logger)
             print(json.dumps(outcomes, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.file_meetings is not None:
+            filings = parse_meeting_filings(_load_json(args.file_meetings, "--file-meetings"))
+            filed = write_meeting_filings(paths, filings, now=as_of, logger=logger)
+            print(json.dumps(filed, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         if args.mark_done:
             state = mark_done(paths, now=as_of, logger=logger)
