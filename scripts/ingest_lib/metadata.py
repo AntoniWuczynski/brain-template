@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 from collections.abc import Iterator
 
 from .atomic import append_jsonl_line
+from .secrets import redact_secrets
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,4 +116,27 @@ def append_record(jsonl_path: Path, record: IndexRecord) -> None:
     a previous write can have been cut short.
     """
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    append_jsonl_line(jsonl_path, record.to_json_line() + "\n", prefix=".index-")
+    append_jsonl_line(jsonl_path, _redacted(record).to_json_line() + "\n", prefix=".index-")
+
+
+def _redacted(record: IndexRecord) -> IndexRecord:
+    """``record`` with its free-text fields passed through redaction.
+
+    The record is built from the summariser's output directly rather than from
+    the note, so redacting the note does not cover this file. It is
+    git-tracked and `metadata` is in the MCP read allowlist, so a credential
+    quoted into a summary would be committed, pushed, and readable back
+    through a tool call.
+
+    The ``note`` profile keeps ``source_hash`` (64 hex) and any git SHA in an
+    error message intact — the hash is what makes re-ingestion idempotent and
+    what the integrity sweep joins on, so rewriting it would be silent
+    corruption.
+    """
+    return replace(
+        record,
+        summary=redact_secrets(record.summary, profile="note")[0],
+        key_points=[redact_secrets(k, profile="note")[0] for k in record.key_points],
+        notes=[redact_secrets(n, profile="note")[0] for n in record.notes],
+        error=None if record.error is None else redact_secrets(record.error, profile="note")[0],
+    )

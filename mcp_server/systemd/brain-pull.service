@@ -1,0 +1,31 @@
+# Nightly connector pull on the server: fetch, ingest, commit, push.
+#
+# Only connectors that need nothing from another machine belong here — an
+# HTTPS API with a key, such as granola. Anything that reads local files
+# (claude_code transcripts) runs where those files are; see
+# mcp_server/launchd/com.brain.pull.plist.
+#
+# Keys live in .env.ingest, NOT in the MCP server's .env: the server never
+# needs a connector or LLM key, and the dream unit hands its whole
+# EnvironmentFile to a CLI session. .env.ingest holds, one per line:
+#   BRAIN_PULL_CONNECTORS=granola
+#   GRANOLA_API_KEY=...
+#   ANTHROPIC_API_KEY=...          (or whichever summariser provider you use)
+# It is gitignored (.env.*) and covered by the dream pass's Read deny list.
+#
+# Not sandboxed, for the same reason brain-maintenance.service is not: it
+# runs git with the deploy key under ~/.ssh and writes across the vault.
+[Unit]
+Description=brain nightly connector pull
+Documentation=https://github.com/AntoniWuczynski/brain-template/blob/main/scripts/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/services/brain
+EnvironmentFile=-%h/services/brain/.env
+EnvironmentFile=%h/services/brain/.env.ingest
+Environment=HF_HOME=%h/services/brain/.cache/huggingface
+Environment=XDG_CACHE_HOME=%h/services/brain/.cache
+ExecStart=/bin/bash -c 'exec %h/services/brain/scripts/nightly_pull.sh $BRAIN_PULL_CONNECTORS'

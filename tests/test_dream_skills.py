@@ -166,3 +166,36 @@ def test_skill_writes_compiled_truth_only_through_the_marker_scoped_tool() -> No
         assert "mcp__brain__vault_update_compiled_truth" in text, path
         assert "**never**\n   `mcp__brain__vault_replace_note`" in text, path
         assert "Never write compiled truth\n  with `mcp__brain__vault_replace_note`." in text, path
+
+
+def test_dream_sh_denies_credential_reads() -> None:
+    """Security review 2026-09-18 (F1): `Read`/`Grep`/`Glob` are granted
+    unrestricted, so a planted note could steer the nightly pass into reading
+    `~/.ssh/brain-mcp-deploy` or the service `.env` and republishing them via
+    the allowed `vault_create_note`, which commits and pushes.
+
+    The fix is a DENY list. Scoping `--allowedTools` does NOT work and must
+    not be substituted back in: Read is already permitted and `--allowedTools`
+    only adds permissions, so an enumerated allow list read `.env` and
+    `~/.ssh/known_hosts` with zero denials when this was tested for real on
+    2026-09-18. Only `--disallowedTools` refused them.
+
+    `.env` matters most: on the server it sits at the repo root, inside the
+    tree the pass legitimately reads.
+    """
+    raw = (_REPO_ROOT / "scripts/dream.sh").read_text(encoding="utf-8")
+    # Comment lines name these paths, so match against code only.
+    script = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    assert "--disallowedTools" in script, "the deny list is gone"
+    assert "DREAM_DENY_RULES" in script
+
+    for denied in (
+        '"Read(.env)"',
+        '"Read(.env.*)"',
+        '"Read(~/.ssh/**)"',
+        '"Read(~/.claude/**)"',
+    ):
+        assert denied in script, f"{denied} no longer denied"

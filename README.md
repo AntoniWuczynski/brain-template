@@ -271,6 +271,9 @@ free too.
   scheduling.
 - **Granola** pulls meetings from the Granola API.
 - **justREC** reads a local justREC export folder, no network needed.
+- **Two-machine sync** (`vault_sync.sh`) keeps a laptop's Obsidian clone and
+  the MCP server's clone level through the git remote every 15 minutes; see
+  `scripts/README.md` → "Two-machine sync".
 
 Adding another source is a `pull()` function, a matching extractor and an
 environment stanza.

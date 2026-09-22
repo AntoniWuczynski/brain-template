@@ -54,6 +54,13 @@ RestrictSUIDSGID=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete
+# Refuse a filtered syscall with EPERM instead of killing the process. torch
+# calls into @resources (thread affinity, memory policy) when the embedding
+# model loads, and under the default kill action the first vault_search took
+# the whole server down with SIGSYS (status=31/SYS, seen at the 2026-09-20
+# cutover — dense search had never run under this unit on Linux before).
+# torch treats the refusal as advisory and carries on, so the filter stays.
+SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
 # Network — only outbound to GitHub for push and the tailnet/tunnel for

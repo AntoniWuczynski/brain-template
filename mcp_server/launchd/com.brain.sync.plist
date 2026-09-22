@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: keep this clone level with the remote every 15 minutes.
+  Commits local edits (Obsidian, a hand-run ingest), rebases, pushes; see
+  scripts/vault_sync.sh.
+  Install:  cp this to ~/Library/LaunchAgents/ (edit the paths first),
+            then: launchctl load ~/Library/LaunchAgents/com.brain.sync.plist
+  Edit REPO_ROOT to your vault path. RunAtLoad on, so it also syncs at login.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brain.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_ROOT/scripts/vault_sync.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/vault-sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/vault-sync.err.log</string>
+</dict>
+</plist>

@@ -284,6 +284,11 @@ def test_compare_warns_when_an_override_matches_the_ambient_environment(
     """An exported BRAIN_* makes the A/B a no-op that still prints
     "improves 0, regresses 0" — indistinguishable from a real null result."""
     _stub_search_on(monkeypatch, {("hybrid", "on"): ["want.pdf"]})
+    # Start from no ambient BRAIN_* at all: the assertion below pins the exact
+    # ambient line, so any BRAIN_* the developer's shell happens to export
+    # (a deployed machine has several) would otherwise fail it.
+    for name in [k for k in os.environ if k.startswith("BRAIN_")]:
+        monkeypatch.delenv(name)
     monkeypatch.setenv("BRAIN_TEST_RANKER", "on")
     monkeypatch.setenv("BRAIN_TEST_AMBIENT", "7")
     golden: list[GoldenQuery] = [{"query": "q", "expected": ["want.pdf"]}]

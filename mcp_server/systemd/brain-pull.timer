@@ -1,0 +1,15 @@
+# 03:00, so the 04:00 maintenance pass promotes and indexes what this brought
+# in, and the 05:00 dream pass dreams over both. A full hour, not half: an
+# ingest ends with a full re-encode of the search index, which is about a
+# millisecond a chunk on a Mac's GPU and about seventeen minutes for 16,000
+# chunks on a CPU-only server (measured 2026-09-20).
+[Unit]
+Description=Run the brain connector pull nightly
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

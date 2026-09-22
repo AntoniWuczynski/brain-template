@@ -857,6 +857,37 @@ straight on a cron/launchd schedule:
 uv run python scripts/pull.py notion --then-ingest
 ```
 
+For an unattended nightly run use `scripts/nightly_pull.sh <connector>...`
+instead of the bare command. It syncs with the remote first, runs
+`pull.py --then-ingest` per connector, commits only the paths the run wrote
+(never a pending hand edit, never over someone else's staged work) and pushes,
+retrying once if another machine pushed in the meantime.
+
+Run each connector on the machine that can reach its source. One that is only
+an HTTPS API with a key (`granola`, `notion`) can run on the server:
+`mcp_server/systemd/brain-pull.{service,timer}`, 03:00, with its keys in
+`.env.ingest` beside the repo (the unit file lists them). One that reads local
+files (`claude_code`) runs where the files are:
+`mcp_server/launchd/com.brain.pull.plist`. Two machines ingesting means two
+writers of `metadata/index.jsonl`, which `.gitattributes` merges by union. The
+file is append-only and keyed by source hash, so that is safe as long as the
+machines pull different connectors.
+
+## Two-machine sync
+
+When the MCP server runs on one machine and you read the vault in Obsidian on
+another, `scripts/vault_sync.sh` keeps both clones level with the remote every
+15 minutes. The server already pushes each MCP write, so there it runs
+`--pull-only` and only fast-forwards
+(`mcp_server/systemd/brain-sync.{service,timer}`). On the laptop it commits
+local edits (Obsidian, a hand-run ingest) on the ingest surface, except
+`knowledge/assistant/`, which agents write through the MCP server. Then it
+rebases onto the remote and pushes (`mcp_server/launchd/com.brain.sync.plist`,
+which also runs at login). Being offline is not an error: the commit goes out
+on the next run. A conflict, a stuck rebase or a rejected push stops the run
+and shows a macOS notification. Logs: `logs/vault-sync.*.log` on the laptop,
+`journalctl --user -u brain-sync` on the server.
+
 ## Source-grounded concept descriptions
 
 `--describe-concepts` writes a synthesized description into each concept note's
