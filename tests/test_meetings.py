@@ -123,6 +123,9 @@ def test_attendee_slug_folds_accents_to_the_live_slug_shape() -> None:
     as a separator produces a slug that resolves to nothing."""
     assert meeting_ex.attendee_slug("Antoni Wuczyński") == "antoni-wuczynski"
     assert meeting_ex.attendee_slug("Lluís Cardona") == "lluis-cardona"
+    # ł/Ł has no NFKD decomposition and used to be punched out ("ukasz-zo-c").
+    assert meeting_ex.attendee_slug("Łukasz Żółć") == "lukasz-zolc"
+    assert meeting_ex.attendee_slug("Małgorzata Peña") == "malgorzata-pena"
     assert meeting_ex.attendee_slug("日本語") == ""
 
 
@@ -511,20 +514,43 @@ def test_titleless_snapshot_is_promoted_as_untitled_not_invented(
 
 
 def test_meeting_slug_matches_the_one_meeting_create_uses(tmp_path: Path) -> None:
-    """The live vault's meeting notes are named by ``concepts.slugify``
-    (``2026-06-11-antoni-wuczy-ski-nous.md``), the function
-    ``mcp_server.entity_tools.tool_meeting_create`` uses. Promoting the same
-    meeting must land on that path — the accent-FOLDED slug used for people
-    lookup would name a second, near-identical note beside it."""
+    """Meeting notes are named by ``concepts.slugify``, the function
+    ``mcp_server.entity_tools.tool_meeting_create`` uses, and since the
+    2026-09-17 convention that rule FOLDS diacritics (``Wuczyński`` ->
+    ``wuczynski``) instead of punching them out (``wuczy-ski``). People and
+    meetings now share one rule, so promotion and ``meeting_create`` land on
+    the same path for the same title."""
     paths = _vault(tmp_path)
     _snapshot(paths, title="Antoni Wuczyński < > Nous", attendees=[])
     report = promote_meetings(paths, now=_NOW)
     assert report.promotions[0].candidate.node_id == (
-        "meetings/2026/2026-07-12-antoni-wuczy-ski-nous"
+        "meetings/2026/2026-07-12-antoni-wuczynski-nous"
     )
     assert meeting_ex.attendee_slug("Antoni Wuczyński < > Nous") == (
         "antoni-wuczynski-nous"
     )
+
+
+def test_polish_meeting_promotes_with_folded_slug_and_resolves_attendee(tmp_path: Path) -> None:
+    """A Polish-language Granola/justREC snapshot: the title keeps its
+    diacritics in the note, the node id folds them, and an attendee with
+    ł in their name resolves to the person note slugged the same way."""
+    paths = _vault(tmp_path)
+    _person(paths, "lukasz-kowalski", "Łukasz Kowalski")
+    _snapshot(
+        paths, title="Spotkanie zarządu (Łódź)", attendees=["Łukasz Kowalski"],
+        summary="Ustalono budżet na czwarty kwartał.",
+    )
+    report = promote_meetings(paths, now=_NOW)
+    assert report.skipped == ()
+    promotion = report.promotions[0]
+    assert promotion.candidate.node_id == "meetings/2026/2026-07-12-spotkanie-zarzadu-lodz"
+    assert promotion.candidate.resolved_ids == ("people/lukasz-kowalski",)
+    assert promotion.candidate.unresolved_names == ()
+    note = (paths.root / promotion.candidate.rel_path).read_text(encoding="utf-8")
+    assert "Spotkanie zarządu (Łódź)" in note
+    assert "Ustalono budżet na czwarty kwartał." in note
+    assert "[[knowledge/people/lukasz-kowalski]]" in note
 
 
 # ------------------------------------------------- untrusted display text

@@ -31,7 +31,15 @@ from .dream_contradictions import (
 )
 from .dream_gate_core import GateVerdict
 from .dream_git import _git
+from .dream_meetings import (
+    MEETING_FILING_BUDGET,
+    ProjectCatalogueEntry,
+    UnfiledMeeting,
+    project_catalogue,
+    unfiled_meetings,
+)
 from .propose import ProposeResult, propose_fact
+from .relations import entity_notes
 
 
 class PairCandidate(TypedDict):
@@ -56,6 +64,7 @@ class EditBudget(TypedDict):
     compiled_truth: int
     reserved_for_other_jobs: int
     contradiction_proposals: int
+    meeting_filings: int
 
 
 class DreamPacket(TypedDict):
@@ -72,6 +81,8 @@ class DreamPacket(TypedDict):
     compiled_truth: list[CompiledTruthCandidate]
     compiled_truth_blocked: list[str]
     contradictions: list[ContradictionCandidate]
+    unfiled_meetings: list[UnfiledMeeting]
+    project_catalogue: list[ProjectCatalogueEntry]
     edit_budget: EditBudget
 
 
@@ -141,6 +152,7 @@ def build_packet(
 ) -> DreamPacket:
     head = _git(paths.root, "rev-parse", "HEAD").strip()
     active = _active_entities(verdict.changed_notes)
+    entities = entity_notes(paths)
     compiled, blocked = _compiled_truth_candidates(
         paths,
         active_entities=active,
@@ -162,19 +174,23 @@ def build_packet(
         contradictions=_contradictions(
             paths, active_entities=active, budget=contradiction_budget
         ),
+        unfiled_meetings=unfiled_meetings(paths, entities),
+        project_catalogue=project_catalogue(paths, entities),
         edit_budget=EditBudget(
             total_note_edits=EDIT_CAP,
             compiled_truth=compiled_truth_budget,
             reserved_for_other_jobs=EDIT_CAP - compiled_truth_budget,
             contradiction_proposals=contradiction_budget,
+            meeting_filings=MEETING_FILING_BUDGET,
         ),
     )
     logger.info(
         "dream packet: %d changed note(s), %d new source(s), %d candidate pair(s), "
-        "%d compiled-truth candidate(s), %d contradiction hint(s)",
+        "%d compiled-truth candidate(s), %d contradiction hint(s), "
+        "%d unfiled meeting(s)",
         len(packet["changed_notes"]), len(packet["new_sources"]),
         len(packet["candidate_pairs"]), len(packet["compiled_truth"]),
-        len(packet["contradictions"]),
+        len(packet["contradictions"]), len(packet["unfiled_meetings"]),
     )
     return packet
 

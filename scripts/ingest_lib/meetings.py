@@ -90,6 +90,7 @@ from .concepts import slugify
 from .config import VaultPaths, default_paths
 from .connectors.base import safe_display_name
 from .extractors.meeting import MeetingSnapshot, load_snapshot
+from .meeting_projects import ProjectProfile, filed_project, match_project, project_profiles
 from .metadata import latest_records_by_path
 # private, but module-internal (wikilinks.py/consolidate.py do the same)
 from .notes import (
@@ -99,7 +100,14 @@ from .notes import (
     fm_scalar,
 )
 from .propose import ProposeResult, propose_fact
-from .relations import EntityInfo, Relation, is_valid_node_id, normalize_target
+from .relations import (
+    EntityInfo,
+    Relation,
+    is_valid_node_id,
+    normalize_target,
+    parse_relations,
+    upsert_relation_in_text,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -134,6 +142,11 @@ _CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {"\x7f"}
 # added an attendee, or a person note now exists for one it could not
 # resolve); its hand-written regions are untouched.
 NoteAction = Literal["written", "updated", "exists", "conflict"]
+
+# What this run did about the meeting's project (see ingest_lib.meeting_projects).
+# "not_owned": a note this pass did not write — left to the dream pass, which
+# only proposes. "skipped": no note to file (an id conflict).
+ProjectFiling = Literal["filed", "already", "ambiguous", "unmatched", "not_owned", "skipped"]
 
 
 @dataclass(frozen=True)
@@ -201,6 +214,11 @@ class MeetingPromotion:
     # Attendees whose note ALREADY declares the attended edge, so nothing
     # was proposed for them.
     already_related: tuple[str, ...]
+    project_filing: ProjectFiling = "skipped"
+    # The project the note is (now) filed under; "" when unfiled.
+    project_id: str = ""
+    # Non-zero rule scores, best first — the evidence for "ambiguous".
+    project_scores: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -670,6 +688,63 @@ def _write_note(
 
 
 # ---------------------------------------------------------------------------
+# filing the meeting under a project
+# ---------------------------------------------------------------------------
+
+def _file_project(
+    paths: VaultPaths,
+    candidate: MeetingCandidate,
+    profiles: tuple[ProjectProfile, ...],
+    *,
+    dry_run: bool,
+    now: datetime,
+) -> tuple[ProjectFiling, str, tuple[tuple[str, int], ...]]:
+    """File a note this pass owns under the one project the rules single out:
+    ``project:`` plus a ``related_to`` relation, the shape ``meeting_create``
+    writes. A note already filed (by a human, by ``meeting_create`` or by an
+    approved dream proposal) is never refiled."""
+    dest = paths.root / candidate.rel_path
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if dest.exists():
+        try:
+            text = dest.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            _LOG.warning("meetings: cannot read %s (%s)", candidate.rel_path, exc)
+            return "skipped", "", ()
+    elif dry_run:
+        text = render_meeting_note(candidate, now_iso=now_iso)
+    else:
+        return "skipped", "", ()
+    frontmatter, _body = _split_frontmatter(text)
+    relations, _problems = parse_relations(frontmatter)
+    existing = filed_project(frontmatter, [
+        normalize_target(r.target) for r in relations
+        if r.rel == "related_to" and not r.valid_until
+    ])
+    if existing:
+        return "already", existing, ()
+    if _fm_str(frontmatter, "author") != _AUTHOR:
+        return "not_owned", "", ()
+    match = match_project(
+        profiles, title=candidate.title, summary=candidate.summary,
+        attendee_ids=candidate.resolved_ids,
+    )
+    if match.status != "filed":
+        return match.status, "", match.scores
+    if not dry_run:
+        filed, _action = upsert_relation_in_text(text, Relation(
+            rel="related_to", target=match.project_id,
+            source=_source_link_path(candidate.source_file),
+        ))
+        filed = _splice_fm_key(filed, f"project: {_yaml_squote(match.project_id)}")
+        filed = _splice_fm_key(filed, f"updated: {fm_scalar(now_iso)}")
+        atomic_write_text(
+            dest, filed, prefix=".meeting-", suffix=".md", mode=umask_mode(),
+        )
+    return "filed", match.project_id, match.scores
+
+
+# ---------------------------------------------------------------------------
 # the attended proposals
 # ---------------------------------------------------------------------------
 
@@ -758,6 +833,7 @@ def promote_meetings(
     vault writes nothing and proposes nothing new.
     """
     index = people_index(paths)
+    profiles = project_profiles(index.entities)
     when = now or datetime.now(UTC)
     candidates, skipped = _find_candidates(paths, index)
     promotions: list[MeetingPromotion] = []
@@ -783,15 +859,20 @@ def promote_meetings(
         proposals, already = _propose_attendance(
             paths, candidate, index=index, dry_run=dry_run, now=now
         )
+        filing, project_id, scores = _file_project(
+            paths, candidate, profiles, dry_run=dry_run, now=when
+        )
         _LOG.info(
             "meetings: %s %s (%d attendee(s) resolved, %d unresolved, "
-            "%d proposal(s), %d already related)",
+            "%d proposal(s), %d already related, project %s %s)",
             action, candidate.node_id, len(candidate.resolved_ids),
             len(candidate.unresolved_names), len(proposals), len(already),
+            filing, project_id or "-",
         )
         promotions.append(MeetingPromotion(
             candidate=candidate, note_action=action, conflict_source="",
             conflict_source_id="", proposals=proposals, already_related=already,
+            project_filing=filing, project_id=project_id, project_scores=scores,
         ))
     return PromotionReport(promotions=tuple(promotions), skipped=tuple(skipped))
 
@@ -866,6 +947,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  attendees unresolved   : {len(unresolved)}")
     for name in sorted(unresolved):
         print(f"    - {name} ({', '.join(unresolved[name])})")
+    for status in ("filed", "already", "ambiguous", "unmatched", "not_owned"):
+        hits = [p for p in promotions if p.project_filing == status]
+        print(f"  project {status:<16}: {len(hits)}")
+        if status in ("filed", "ambiguous"):
+            for p in hits:
+                evidence = ", ".join(f"{pid}={score}" for pid, score in p.project_scores)
+                target = f" -> {p.project_id}" if p.project_id else ""
+                print(f"    - {p.candidate.node_id}{target} ({evidence})")
     for promotion in conflicts:
         print(
             f"  conflict: {promotion.candidate.rel_path} already exists for a "

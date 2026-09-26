@@ -301,3 +301,76 @@ def test_normalize_attendees_returns_empty_for_a_non_list() -> None:
     assert normalize_attendees(None) == []
     assert normalize_attendees({"name": "Ada"}) == []
     assert normalize_attendees("Ada") == []
+
+
+# --------------------------------------------------------- granola connector
+
+def test_granola_pull_paginates_and_maps_the_public_api_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ingest_lib.connectors import granola
+
+    responses: dict[str, dict[str, object]] = {
+        "https://api.test/v1/notes": {
+            "notes": [{"id": "not_a"}], "hasMore": True, "cursor": "c1",
+        },
+        "https://api.test/v1/notes?cursor=c1": {
+            "notes": [{"id": "not_b"}], "hasMore": False, "cursor": None,
+        },
+        "https://api.test/v1/notes/not_a?include=transcript": {
+            "id": "not_a", "title": "Kern weekly",
+            "created_at": "2026-09-16T10:00:00Z",
+            "attendees": [{"name": "Alice Smith", "email": "a@x.test"}],
+            "summary_text": "plain", "summary_markdown": "## Summary",
+            "transcript": [
+                {"speaker": {"source": "microphone"}, "text": "Hello"},
+                {"speaker": {"source": "speaker", "diarization_label": "Speaker B"},
+                 "text": " Hi "},
+            ],
+        },
+        "https://api.test/v1/notes/not_b?include=transcript": {
+            "id": "not_b", "title": "Solo", "created_at": "2026-09-17T09:00:00Z",
+            "attendees": [], "summary_markdown": None,
+            "private_notes_text": "my notes", "transcript": None,
+        },
+    }
+    seen: list[str] = []
+
+    def fake_get(url: str, api_key: str) -> dict[str, object]:
+        assert api_key == "grn_test"
+        seen.append(url)
+        return responses[url]
+
+    monkeypatch.setenv("GRANOLA_API_KEY", "grn_test")
+    monkeypatch.setenv("GRANOLA_API_URL", "https://api.test/v1/")
+    monkeypatch.setattr(granola, "_get_json", fake_get)
+    monkeypatch.setattr(granola, "_REQUEST_GAP_S", 0)
+
+    snaps = list(granola.GranolaConnector().pull(ConnectorState(name="granola")))
+
+    assert seen == list(responses)
+    a, b = (json.loads(s.payload) for s in snaps)
+    assert a == {
+        "connector": "granola", "id": "not_a", "title": "Kern weekly",
+        "date": "2026-09-16", "attendees": ["Alice Smith"],
+        "summary": "## Summary", "transcript": "microphone: Hello\nSpeaker B: Hi",
+    }
+    assert (b["date"], b["summary"], b["transcript"]) == ("2026-09-17", "my notes", "")
+    assert snaps[0].source_class == "meetings/granola"
+
+
+def test_granola_pull_degrades_to_nothing_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.error
+    from email.message import Message
+
+    from ingest_lib.connectors import granola
+
+    def failing_get(url: str, api_key: str) -> NoReturn:
+        raise urllib.error.HTTPError(url, 401, "Unauthorized", Message(), None)
+
+    monkeypatch.setenv("GRANOLA_API_KEY", "grn_bad")
+    monkeypatch.setattr(granola, "_get_json", failing_get)
+
+    assert list(granola.GranolaConnector().pull(ConnectorState(name="granola"))) == []

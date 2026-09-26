@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from ingest_lib.config import default_paths  # noqa: E402
-from ingest_lib.connectors import CONNECTORS, run_connector  # noqa: E402
+from ingest_lib.connectors import CONNECTORS, ConnectorError, run_connector  # noqa: E402
 from ingest_lib.connectors._transcript_common import TranscriptSourceError  # noqa: E402
 
 
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         stats = run_connector(connector, paths, pulled_at=pulled_at,
                               dry_run=args.dry_run, logger=logger)
-    except TranscriptSourceError as exc:
+    except (TranscriptSourceError, ConnectorError) as exc:
         # A --path/env-var-configured source that doesn't resolve is a loud,
         # non-zero-exit failure — not a silent zero-item pull that looks
         # like "nothing new" (see review M2).
