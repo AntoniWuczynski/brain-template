@@ -75,6 +75,7 @@ from .config import VaultPaths
 from .knowledge import scan_knowledge
 from .metadata import latest_records_by_path
 from .sweep_checks_archive import _check_archive
+from .sweep_checks_secrets import _check_secret_leak
 from .sweep_checks_graph import (
     _check_alias_collisions,
     _check_entity_duplicates,
@@ -200,6 +201,7 @@ def run_sweep(
     findings += _check_index_drift(paths, latest, knowledge_recs)
     findings += _check_stale_memory(paths, as_of=as_of, stale_days=stale_days)
     findings += _check_inbox_unprocessable(paths)
+    findings += _check_secret_leak(paths.root)
     findings += _check_dream_stalled(paths, as_of=as_of)
 
     findings.sort(key=lambda f: (f.category, f.path, f.detail))

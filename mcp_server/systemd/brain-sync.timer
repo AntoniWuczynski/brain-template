@@ -1,0 +1,9 @@
+[Unit]
+Description=Fast-forward the brain vault from the remote every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

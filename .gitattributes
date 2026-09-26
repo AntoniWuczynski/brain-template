@@ -14,3 +14,8 @@ uv.lock text eol=lf
 # Treat raw archive content as binary so git doesn't try to diff
 archive/raw/** binary
 inbox/** binary
+
+# Append-only and keyed by source hash, written by two machines that pull
+# disjoint sources (scripts/nightly_pull.sh): concurrent appends merge by union
+# instead of conflicting on the shared tail.
+metadata/index.jsonl merge=union

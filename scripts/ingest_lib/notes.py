@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, UTC
 from pathlib import Path
 from typing import Literal
@@ -12,6 +12,7 @@ from typing import Literal
 import yaml
 
 from .atomic import atomic_write_text
+from .secrets import redact_secrets
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 _PIPELINE_OWNED_KEYS = frozenset(
     {"title", "type", "source_file", "source_hash", "created", "updated", "status", "figures", "topics"}
 )
+
 
 
 @dataclass(frozen=True)
@@ -283,6 +285,36 @@ def _frontmatter_to_yaml(fm: dict[str, object], *, raw_blocks: dict[str, str] | 
     return "".join(parts)
 
 
+def _redacted(content: NoteContent) -> NoteContent:
+    """``content`` with every free-text field passed through redaction.
+
+    Applied by both note writers, so a path into the vault is covered by
+    default instead of having to opt in — until 2026-09-18 only the two
+    transcript connectors redacted, which left PDFs, meeting exports, dropped
+    files and vision output in clear text.
+
+    The ``note`` profile is used, not ``transcript``: an extracted document is
+    full of references worth keeping, and the generic 40-character fallbacks
+    would rewrite git SHAs and URLs inside it.
+
+    Deliberately untouched: ``source_hash``, which is 64 hex and is how a note
+    is joined back to its index record, and ``title``, which names the file
+    and the wikilinks pointing at it.
+    """
+    return replace(
+        content,
+        extracted_markdown=redact_secrets(content.extracted_markdown, profile="note")[0],
+        summary=redact_secrets(content.summary, profile="note")[0],
+        processing_notes=[
+            redact_secrets(n, profile="note")[0] for n in content.processing_notes
+        ],
+        key_points=tuple(
+            redact_secrets(k, profile="note")[0] for k in content.key_points
+        ),
+        topics=tuple(redact_secrets(x, profile="note")[0] for x in content.topics),
+    )
+
+
 def write_processed_note(
     *,
     target: Path,
@@ -292,6 +324,7 @@ def write_processed_note(
 
     This file is regenerable; we don't try to merge user edits here.
     """
+    content = _redacted(content)
     body = content.extracted_markdown or "_(no content extracted)_\n"
     notes_block = "\n".join(f"- {n}" for n in content.processing_notes) or "- _(no notes)_"
     rendered = (
@@ -324,6 +357,7 @@ def write_index_note(
     rule 6 forbids — so an unreadable block is a manual-review condition on
     the note, not a license to regenerate it from scratch.
     """
+    content = _redacted(content)
     existing_fm: dict[str, object] = {}
     existing_raw_blocks: dict[str, str] = {}
     if target.exists():

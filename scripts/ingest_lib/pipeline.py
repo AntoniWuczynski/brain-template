@@ -239,8 +239,9 @@ def run_ingest(
                 logger.warning("meetings: promotion failed (%r) — skipping", exc)
         # Build the semantic index first: concept centroids (and thus the
         # connection graph's semantic edges) read fresh vectors from it.
-        # Cheap (~1 chunk/ms on MPS); failure is non-fatal — search just
-        # stays stale until the next rebuild.
+        # Cheap: only text the index has not embedded before reaches the
+        # model (see semantic._stored_vectors). Failure is non-fatal — search
+        # just stays stale until the next rebuild.
         try:
             n = _build_search_index(paths, logger=logger)
             logger.info("semantic: indexed %d chunks", n)

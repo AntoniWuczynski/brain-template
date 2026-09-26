@@ -102,6 +102,7 @@ from .semantic_meta import (
     SearchHit as SearchHit,
     _VISUALS_ONLY_PARTIAL_EXTRACTORS as _VISUALS_ONLY_PARTIAL_EXTRACTORS,
     _by_extension as _by_extension,
+    _compose_embed_text as _compose_embed_text,
     _embed_model_tag as _embed_model_tag,
     _embed_text as _embed_text,
     _hit_from_row as _hit_from_row,
@@ -420,6 +421,34 @@ def _write_index_files(
     _fsync_dir(meta_path.parent)
 
 
+def _stored_vectors(vectors_path: Path, meta_path: Path) -> dict[str, np.ndarray]:
+    """Embedded text -> its stored vector, for every row of the current index
+    that belongs to the vector space being built.
+
+    Keyed by the exact string that was sent to the model, rebuilt from the
+    row by the same function that builds it for a new chunk — not by
+    ``(source, chunk_idx)``, which says nothing about whether the text under
+    that position changed. Rows tagged for another space (a different model,
+    or ``BRAIN_EMBED_HEADING_CONTEXT`` flipped) are skipped, so changing either
+    re-encodes everything, as it must. An index that is missing, torn or
+    unreadable yields nothing, which makes the build a full one. To force a
+    full re-encode by hand, delete ``metadata/embeddings.npy``.
+    """
+    try:
+        loaded = _load_index(vectors_path, meta_path)
+    except (OSError, ValueError):
+        return {}
+    if loaded is None:
+        return {}
+    _key, vectors, meta = loaded
+    tag = _embed_model_tag()
+    return {
+        _compose_embed_text(row["title"], row["heading_path"], row["text"]): vectors[i]
+        for i, row in enumerate(meta)
+        if row["model"] == tag
+    }
+
+
 def build_index(
     paths: VaultPaths,
     *,
@@ -466,7 +495,7 @@ def build_index(
             return 0
 
         logger.info(
-            "semantic: encoding %d chunk(s) from %d source(s)",
+            "semantic: indexing %d chunk(s) from %d source(s)",
             len(chunks), len(records),
         )
         _warn_if_index_large(len(chunks), logger)
@@ -477,32 +506,50 @@ def build_index(
             logger.warning("semantic: numpy not installed (%s) — skipping", exc)
             return 0
 
-        try:
-            model, device = _load_embedder()
-        except ImportError as exc:
-            logger.warning(
-                "semantic: sentence-transformers not installed (%s) — skipping. "
-                "Install with: uv pip install sentence-transformers",
-                exc,
-            )
-            return 0
-        except Exception as exc:  # noqa: BLE001 — model load can fail many ways
-            logger.warning("semantic: model load failed (%r) — skipping", exc)
-            return 0
-
-        logger.info("semantic: model %s on %s", _MODEL_NAME, device)
-
-        texts = [_embed_text(c) for c in chunks]
-        vectors = model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=32,
-        )
-        vectors = np.asarray(vectors, dtype=np.float32)
-
         vectors_path = paths.metadata / "embeddings.npy"
         meta_path = paths.metadata / "embeddings_meta.jsonl"
+
+        # Same model, same input string, same vector — so only text the
+        # index has not already embedded needs the model. Every ingest ends
+        # here and so does the nightly maintenance pass; re-encoding it all
+        # each time is ~1 ms a chunk on MPS and was seventeen minutes for
+        # 16,000 chunks on the CPU-only server after ONE new meeting.
+        texts = [_embed_text(c) for c in chunks]
+        known = _stored_vectors(vectors_path, meta_path)
+        fresh_texts = list(dict.fromkeys(t for t in texts if t not in known))
+        fresh = set(fresh_texts)
+
+        if fresh_texts:
+            try:
+                model, device = _load_embedder()
+            except ImportError as exc:
+                logger.warning(
+                    "semantic: sentence-transformers not installed (%s) — skipping. "
+                    "Install with: uv pip install sentence-transformers",
+                    exc,
+                )
+                return 0
+            except Exception as exc:  # noqa: BLE001 — model load can fail many ways
+                logger.warning("semantic: model load failed (%r) — skipping", exc)
+                return 0
+
+            logger.info("semantic: model %s on %s", _MODEL_NAME, device)
+            encoded = np.asarray(
+                model.encode(
+                    fresh_texts,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=32,
+                ),
+                dtype=np.float32,
+            )
+            known.update(zip(fresh_texts, encoded, strict=True))
+        logger.info(
+            "semantic: reused %d stored vector(s), encoded %d new",
+            len(texts) - sum(t in fresh for t in texts), len(fresh_texts),
+        )
+        vectors = np.stack([known[t] for t in texts]).astype(np.float32)
+
         _write_index_files(
             vectors,
             [_meta_row(c) for c in chunks],

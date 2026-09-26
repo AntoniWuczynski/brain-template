@@ -105,6 +105,31 @@ if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
             # absolute ("//" + the expanded $HOME) — because a Write rule
             # that fails to match is a step 7 that silently cannot run, and
             # a silent step 7 is exactly the defect this list is fixing.
+            # Credential paths the pass must never read (security review
+            # 2026-09-18, finding F1). Unrestricted Read/Grep/Glob let a
+            # planted note steer the session into reading a key or a token
+            # and republishing it through the allowed vault_create_note,
+            # which commits and pushes.
+            #
+            # This is a DENY list, not a scoped allow list, because scoping
+            # --allowedTools does not restrict Read at all: Read is already
+            # permitted, and --allowedTools only ADDS permissions. Verified
+            # empirically on 2026-09-18 — an enumerated allow list still
+            # read .env and ~/.ssh/known_hosts with zero denials, while
+            # these deny rules refuse both ("File is in a directory that is
+            # denied by your permission settings").
+            #
+            # .env is named FIRST because on the server it lives at the repo
+            # root (~/services/brain/.env), i.e. inside the vault the pass
+            # legitimately reads. ~/.claude holds the CLI's own OAuth
+            # credentials, so it is denied to the CLI itself.
+            DREAM_DENY_RULES=(
+                "Read(.env)" "Read(.env.*)"
+                "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
+                "Read(~/.claude/**)" "Read(~/.config/**)"
+                "Read(//etc/shadow)" "Read(//etc/ssh/**)"
+            )
+
             run_capped claude -p "/dream-pass" \
                 --allowedTools \
                     "mcp__brain__vault_read" \
@@ -118,6 +143,7 @@ if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
                     "Write(/$SCRATCH/**)" \
                     "Bash(uv run --no-sync python scripts/dream_gate.py*)" \
                     "Bash(.venv/bin/python scripts/dream_gate.py*)" \
+                --disallowedTools "${DREAM_DENY_RULES[@]}" \
                 --max-turns "$MAX_TURNS" >>"$LOG" 2>&1
             report_runner_exit claude $?
             ;;

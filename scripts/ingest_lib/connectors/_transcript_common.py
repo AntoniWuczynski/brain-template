@@ -52,6 +52,18 @@ import re
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
+# Redaction moved to ``ingest_lib.secrets`` on 2026-09-18 so every path into
+# the vault can use it, not just the two transcript connectors. Re-exported
+# here under the old names so existing callers and tests are unaffected.
+from ..secrets import _ENV_ASSIGN_RE as _ENV_ASSIGN_RE  # noqa: E402
+from ..secrets import _HEADER_LINE_RE as _HEADER_LINE_RE  # noqa: E402
+from ..secrets import _REDACTIONS as _REDACTIONS  # noqa: E402
+from ..secrets import _URL_CREDENTIALS_RE as _URL_CREDENTIALS_RE  # noqa: E402
+from ..secrets import _redact_env_assignments as _redact_env_assignments  # noqa: E402
+from ..secrets import _redact_header_lines as _redact_header_lines  # noqa: E402
+from ..secrets import _redact_url_credentials as _redact_url_credentials  # noqa: E402
+from ..secrets import redact_secrets as redact_secrets  # noqa: E402
+
 _MAX_TURN_CHARS = 6000
 
 _SESSION_MAX_CHARS_ENV = "BRAIN_TRANSCRIPT_MAX_CHARS"
@@ -111,110 +123,6 @@ _HARNESS_TAG_OPEN_RE = re.compile(
     r"\A<(?:local-command|task|bash|command|skill|system)-[a-z0-9-]*>"
 )
 
-# Vendor-prefixed / structurally-distinctive tokens, checked BEFORE the
-# generic env-assignment/header nets below so a recognised shape keeps its
-# specific label instead of being swallowed by the generic ``env-secret``/
-# ``http-header`` catch-alls (and so the generic nets' bracket-exclusion
-# guard, see below, never has to fire in practice for these).
-_REDACTIONS: list[tuple[str, re.Pattern[str]]] = [
-    ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("private-key-block", re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"
-    )),
-    ("anthropic-key", re.compile(r"sk-ant-[A-Za-z0-9\-_]{20,}")),
-    ("openai-key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
-    ("github-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")),
-    ("github-pat-token", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
-    ("npm-token", re.compile(r"npm_[A-Za-z0-9]{20,}")),
-    ("gitlab-token", re.compile(r"glpat-[A-Za-z0-9_-]{20,}")),
-    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
-    ("slack-token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
-    ("bearer-token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-_.=]{20,}")),
-    ("basic-auth", re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{16,}")),
-    # A bare 40-hex GitHub "classic" token — checked before the more
-    # general base64-ish secret pattern below so a pure-hex 40-char run
-    # gets the more precise label (review N1).
-    ("github-classic-token", re.compile(r"\b[0-9a-fA-F]{40}\b")),
-    # A generic 40-char high-entropy base64-ish run (e.g. an AWS secret
-    # access key) that isn't pure hex — the fallback for a vendor shape
-    # this module doesn't name individually (review N1).
-    ("aws-secret-key", re.compile(r"\b[A-Za-z0-9/+]{40}\b")),
-]
-
-# ``.env``/JSON/YAML-style ``SOME_API_KEY=value`` / ``"some_token": "value"``
-# / ``some-secret: value`` assignments, in any casing, with or without a
-# leading ``export``/``set``, quoted or not. The key name is kept (it is
-# often useful context, e.g. "which var was unset") and only the value is
-# redacted.
-#
-# ``lead`` matches either the start of a line (``^``, for a bare ``.env``
-# line) OR a single separator character that commonly precedes a key in
-# prose/JSON/YAML/shell — whitespace, an opening quote/bracket/brace/paren,
-# a comma, a hyphen (a YAML list item's ``- key: value``), or a URL
-# query-string ``?``/``&`` — since a strict line-start anchor alone misses
-# every one of those (``export API_KEY=...``, ``{"api_key": "..."}``,
-# ``x-api-key: ...``, ``?api_key=...``; review N1). The prefix run before
-# the keyword is OPTIONAL (``*``, not ``[A-Za-z_]`` + ``*``) — a mandatory
-# leading character means a bare ``API_KEY=``/``TOKEN=``/``SECRET=``/
-# ``PASSWORD=`` (the commonest shapes in a pasted ``.env``) never matches at
-# all, since there is nothing before the keyword for that first character
-# to consume (see review C2). An optional quote/whitespace is allowed
-# between the keyword and the ``:``/``=`` so a JSON key's closing quote
-# (``"api_key": ...``) doesn't break the match.
-#
-# The value's character class excludes ``[``/``]`` (in addition to
-# whitespace/quotes/comma/brace/ampersand) so this can never re-match an
-# already-emitted ``[REDACTED:...]`` placeholder from an earlier pass in
-# ``redact_secrets`` (e.g. "here is a secret: [REDACTED:bearer-token]" must
-# not be re-redacted as ``env-secret``, clobbering the more specific label)
-# — this is why the vendor-prefixed patterns above run FIRST.
-#
-# LEFT AS-IS, deliberately (review AUD-118/m6): ``NOT_A_SECRET=plainvalue``
-# and the loose ``xox[baprs]-`` slack-token pattern both over-redact —
-# `NOT_A_SECRET` contains the literal substring `SECRET`, and a real Slack
-# token's ``-``-separated numeric segments aren't required by the pattern.
-# The obvious tightener (require the value to contain a digit) was tried
-# against both pinned tables and rejected: it breaks the exact rows that
-# pin the two hard cases this module exists to catch —
-# ``test_redact_env_style_bare_keyword_assignment``'s bare keyword forms
-# (e.g. ``SECRET=supersecretvalue`` — no digit in the value) and
-# ``test_redact_secrets_known_patterns``'s pinned Slack row
-# (``"xoxb-" + "a" * 15`` — no digit either). Any digit-based or
-# length/shape-based discriminator narrow enough to reject
-# ``NOT_A_SECRET=``/the documentation-shaped Slack string is exactly narrow
-# enough to also reject a real bare secret with no digits in it, which is
-# the one outcome this module treats as unacceptable (see the module
-# docstring: "over-redacting ... is an accepted false positive, silently
-# keeping a real secret is not"). No discriminator was found that keeps
-# every row of both tables passing, so this stays over-redacting rather
-# than risk leaking.
-_ENV_ASSIGN_RE = re.compile(
-    r"(?im)(?P<lead>^|[\s\"'\[{(,?&-])"
-    r"(?P<prefix>[A-Za-z0-9_.-]*"
-    r"(?:SECRET|TOKEN|API[_-]?KEY|APIKEY|PASSWORD|PASSWD|PRIVATE[_-]?KEY)"
-    r"[A-Za-z0-9_.-]*['\"]?[ \t]*[:=][ \t]*)"
-    r"(?P<quote>['\"]?)(?P<value>[^\s'\"\[\]{}&]{6,})(?P=quote)"
-)
-
-# A full ``Authorization``/``Cookie``/``X-Api-Key`` header line — these
-# don't always carry a SECRET/TOKEN/KEY-shaped value (e.g. a raw opaque
-# Cookie string), so they're matched by header NAME rather than by
-# ``_ENV_ASSIGN_RE``'s keyword list. The negative lookahead skips a value
-# already redacted by an earlier pass (e.g. ``Authorization: Basic ...``
-# already turned into ``Authorization: [REDACTED:basic-auth]`` by the
-# vendor patterns above) so it isn't re-redacted under the generic label.
-_HEADER_LINE_RE = re.compile(
-    r"(?im)^(?P<prefix>[ \t]*(?:Authorization|Cookie|X-Api-Key)[ \t]*:[ \t]*)"
-    r"(?P<value>(?!\[REDACTED:)\S.*)$"
-)
-
-# ``scheme://user:password@host`` URL-embedded credentials (e.g. a Postgres
-# or Redis connection string pasted into a turn). The username is OPTIONAL
-# (``*``, not ``+``) — ``redis://:password@host`` (no username) is a common
-# real shape and previously required a non-empty username to match at all
-# (see review N1).
-_URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>://)[^/\s:@]*:[^/\s@]{4,}@")
 
 
 class TranscriptTurn(TypedDict):
@@ -291,47 +199,6 @@ def home_relative(path: str, home: str) -> str:
         return "~" + rest if rest else "~"
     return path
 
-
-def _redact_env_assignments(text: str) -> tuple[str, int]:
-    def repl(m: re.Match[str]) -> str:
-        return (f"{m.group('lead')}{m.group('prefix')}{m.group('quote')}"
-                f"[REDACTED:env-secret]{m.group('quote')}")
-    return _ENV_ASSIGN_RE.subn(repl, text)
-
-
-def _redact_header_lines(text: str) -> tuple[str, int]:
-    def repl(m: re.Match[str]) -> str:
-        return f"{m.group('prefix')}[REDACTED:http-header]"
-    return _HEADER_LINE_RE.subn(repl, text)
-
-
-def _redact_url_credentials(text: str) -> tuple[str, int]:
-    def repl(m: re.Match[str]) -> str:
-        return f"{m.group('scheme')}[REDACTED:url-credentials]@"
-    return _URL_CREDENTIALS_RE.subn(repl, text)
-
-
-def redact_secrets(text: str) -> tuple[str, int]:
-    """Replace obvious credential patterns with ``[REDACTED:<kind>]``.
-    Returns the cleaned text and how many replacements were made.
-
-    Order matters: the vendor-prefixed/structural patterns in
-    ``_REDACTIONS`` run FIRST so a recognised shape (an AWS key, a bearer
-    token, a JWT, ...) keeps its specific label; the header-line and
-    generic env-assignment nets run after and are guarded (see their
-    docstrings) against re-redacting a placeholder an earlier pass already
-    emitted (review N1)."""
-    total = 0
-    for label, pattern in _REDACTIONS:
-        text, n = pattern.subn(f"[REDACTED:{label}]", text)
-        total += n
-    text, n = _redact_header_lines(text)
-    total += n
-    text, n = _redact_env_assignments(text)
-    total += n
-    text, n = _redact_url_credentials(text)
-    total += n
-    return text, total
 
 
 def _collapse_bare_command(stripped: str) -> str | None:

@@ -130,11 +130,19 @@ def _embed_text(c: Chunk) -> str:
     passage vectors, so enabling it requires a full ``--rebuild-search-index``;
     measure the effect with ``scripts/eval_retrieval.py --compare-modes`` /
     ``--write-report`` before keeping it (see TODO.md / IDEAS.md)."""
+    return _compose_embed_text(c.title, c.heading_path, c.text)
+
+
+def _compose_embed_text(title: str, heading_path: str, text: str) -> str:
+    """``_embed_text`` over bare fields, so the string a STORED row was
+    embedded from can be rebuilt from that row and compared with a new
+    chunk's. One definition for both, or the two drift and a reused vector
+    quietly stops matching its text."""
     if os.environ.get("BRAIN_EMBED_HEADING_CONTEXT", "0") != "1":
-        return c.text
-    parts = [p for p in (c.title, c.heading_path) if p]
+        return text
+    parts = [p for p in (title, heading_path) if p]
     ctx = " > ".join(parts)
-    return f"{ctx}\n{c.text}" if ctx else c.text
+    return f"{ctx}\n{text}" if ctx else text
 
 
 @dataclass(frozen=True)

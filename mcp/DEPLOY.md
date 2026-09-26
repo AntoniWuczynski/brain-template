@@ -12,7 +12,7 @@ Three decisions this doc assumes:
 
 - A Linux box you control, with a normal user account and `systemd --user` support (any modern distro; the commands below use Debian/Ubuntu `apt` syntax where one is needed — adjust for yours).
 - `git` and [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
-- [Tailscale](https://tailscale.com/) installed and logged into the same account as your other devices, so the server has a stable tailnet hostname. (A public hostname for the claude.ai connector is a separate, optional step — see the very end of this doc.)
+- [Tailscale](https://tailscale.com/) installed and logged into the same account as your other devices, so the server has a stable tailnet hostname. There is deliberately no public-hostname option: a headless MCP client has no practical second auth ring in front of a public endpoint, so the tailnet is the only way in.
 - Write access to the private `brain` GitHub repo, to add a deploy key.
 
 ## 1. Clone the repo and install Python 3.12 (no ML stack)
@@ -112,7 +112,7 @@ Fill in every key under the `MCP server` divider:
 | `BRAIN_MCP_ALLOWED_HOSTS` | your tailnet MagicDNS hostname, e.g. `myhost.tailXXXX.ts.net` (no port — see step 5 on why) — **required**: `TrustedHostMiddleware` rejects any request whose `Host` header isn't loopback or in this list, so a request that reaches the box over the tailnet is rejected at the guard, not your code, until this is set |
 | `BRAIN_MCP_GIT_PUSH_ON_WRITE` | `1` |
 | `BRAIN_MCP_GIT_REMOTE` / `_BRANCH` | `origin` / `main` — `_BRANCH` must equal the branch actually checked out here, or every write's commit step refuses (`committed: false`, note still written to disk) |
-| `GIT_SSH_COMMAND` | points at the step-2 key (the commented-out line in `.env.example` is ready to uncomment) |
+| `GIT_SSH_COMMAND` | points at the step-2 key (the commented-out line in `.env.example` is ready to uncomment). Keep its `-F /dev/null`: the unit's sandbox runs in a user namespace where root-owned `/etc/ssh/ssh_config.d/*` files appear owned by `nobody`, and ssh then refuses to start with `Bad owner or permissions` — every push fails while commits keep succeeding |
 | `BRAIN_MCP_LOG_LEVEL` | `info` |
 | `HF_HOME` | set by the unit file unconditionally (step 4) — leave commented out here unless running without systemd |
 
@@ -174,6 +174,30 @@ Confirm `BRAIN_MCP_ALLOWED_HOSTS` in `.env` already has that hostname (with no p
 ```bash
 systemctl --user restart brain-mcp
 ```
+
+### If Serve is not enabled on your tailnet
+
+`tailscale serve` has to be switched on once in the admin console, and until it is the command above blocks on a prompt rather than failing. The alternative needs no console access: bind the server on the box's own tailnet address and skip the proxy.
+
+```bash
+tailscale ip -4          # this box's tailnet address
+```
+
+Set `BRAIN_MCP_BIND_HOST` to that address, list `<magicdns-name>:*` and `<tailnet-address>:*` in `BRAIN_MCP_ALLOWED_HOSTS` (the `:*` matters — the guard matches `Host` exactly, port included), and point clients at `http://<magicdns-name>:8765/mcp`. Plain HTTP is acceptable here and only here: traffic between tailnet devices is already WireGuard-encrypted and device-authenticated end to end. It also keeps the hostname out of public certificate-transparency logs, which `serve`'s certificate does not. The unit may start before Tailscale has its address at boot, and `Restart=on-failure` retries until it binds.
+
+### Build the search index once
+
+`metadata/embeddings*` is gitignored and per-machine, so a fresh clone serves lexical-only search until the index exists. Build it once after install (the nightly maintenance timer keeps it fresh afterwards):
+
+```bash
+cd ~/services/brain
+HF_HOME=$PWD/.cache/huggingface XDG_CACHE_HOME=$PWD/.cache \
+  .venv/bin/python scripts/ingest.py --rebuild-search-index
+```
+
+### Clients in containers on the same box
+
+A container cannot reach the host's loopback, and a default-deny host firewall drops bridge traffic to any port it does not name. Reaching the server from a container therefore takes an explicit rule for port 8765 on the bridge interface (needs root) — and the server's bind address is a convenience for reachability, never an access control: Linux accepts packets for any local address on any interface, so the firewall is the control.
 
 ## 6. Post-cutover probe (scripts/mcp_probe.py)
 
@@ -262,6 +286,8 @@ Re-copy any unit file that changed (`mcp_server/systemd/*`) to `~/.config/system
 | `systemctl --user start brain-mcp` fails with "BRAIN_MCP_VAULT_ROOT must be set" | `.env` wasn't read; check the `EnvironmentFile=` path resolves — `%h` expands to your home directory, so it must be `~/services/brain/.env` exactly |
 | `auth: rejected request from <ip>` in `journalctl --user -u brain-mcp` | client and server tokens differ; rotate one to match the other, then re-run the probe |
 | A request over the tailnet gets no response / a rebind rejection | `BRAIN_MCP_ALLOWED_HOSTS` doesn't list the tailnet hostname the client actually connected with — `tailscale status` shows the exact one |
+| `git push ... Bad owner or permissions on /etc/ssh/ssh_config.d/...` | `GIT_SSH_COMMAND` lost its `-F /dev/null` — see step 3 |
+| `brain-mcp` dies with `status=31/SYS` on the first search | the installed unit predates `SystemCallErrorNumber=EPERM` — re-copy `mcp_server/systemd/brain-mcp.service` and `daemon-reload` |
 | Writes commit but never reach GitHub | the async push worker is failing; check `journalctl --user -u brain-mcp` for `push worker:` lines and `logs/mcp-audit.jsonl` for the write outcomes |
 | `git push exited 128: Permission denied` in logs after a write | the step-2 deploy key is missing "Allow write access" on GitHub |
 | Boot log doesn't mention extractor availability | you're looking at an old build — the line was added under AUD-124; `git pull` and restart |
@@ -275,43 +301,6 @@ journalctl --user -u brain-mcp -f
 journalctl --user -u brain-maintenance -f
 journalctl --user -u brain-dream -f
 ```
-
-## Optional: a public hostname, for claude.ai only
-
-Skip this section entirely if only your own devices (over Tailscale) need to reach the server — that's the complete, done state as of step 8.
-
-claude.ai runs in Anthropic's cloud, not on a device of yours, so it cannot reach the tailnet; reaching it needs a public hostname on a domain you control, via [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
-
-```bash
-cloudflared tunnel login
-cloudflared tunnel create brain-mcp
-```
-
-This prints a tunnel UUID and writes credentials to `~/.cloudflared/<UUID>.json`. Write the config (`~/.cloudflared/config.yml`):
-
-```yaml
-tunnel: <UUID>
-credentials-file: /home/<you>/.cloudflared/<UUID>.json
-ingress:
-  - hostname: brain.yourdomain.example
-    service: http://127.0.0.1:8765
-  - service: http_status:404
-```
-
-```bash
-cloudflared tunnel route dns brain-mcp brain.yourdomain.example
-cloudflared service install   # needs sudo: installs a SYSTEM unit for cloudflared itself
-                              # (unlike brain-mcp, which stays a user unit)
-```
-
-Add the public hostname to `BRAIN_MCP_ALLOWED_HOSTS` in `.env` (alongside the tailnet one, not instead of it) and restart `brain-mcp`. Verify: `curl -s https://brain.yourdomain.example/health`.
-
-**Two independent auth layers, deliberately not Access service tokens:**
-
-1. A Cloudflare Access policy (**Zero Trust → Access → Applications**) restricting the hostname's `/mcp*` path to Anthropic's published egress range, `160.79.104.0/21` ([anthropic's IP list](https://platform.claude.com/docs/en/api/ip-addresses)) — leave `/health` outside the policy so it stays a plain liveness check.
-2. This server's own `claude-ai` bearer token (step 3's `BRAIN_MCP_TOKENS`), in the `Authorization` header claude.ai sends via its `static_headers` connector config.
-
-Access **service tokens** are the wrong tool here: claude.ai's `static_headers` support accepts the `authorization`/`x-api-key` header names without review but needs Anthropic's approval for any other header, so `CF-Access-Client-Id`/`CF-Access-Client-Secret` are out — and Cloudflare's single-header fallback (`read_service_tokens_from_header: Authorization`) would then consume the very header this server's own bearer token needs. The IP-range policy avoids the collision entirely and keeps both layers independent. (`static_headers` is in beta on claude.ai as of this writing — confirm it's available on your account before relying on this path.)
 
 ## What this deploy does NOT do
 

@@ -46,6 +46,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from ingest_lib.atomic import atomic_write_bytes  # noqa: E402
+from ingest_lib.secrets import redact_secrets  # noqa: E402
 from ingest_lib.dream import (  # noqa: E402 — one definition of the fence
     COMPILED_TRUTH_END,
     COMPILED_TRUTH_START,
@@ -865,7 +866,26 @@ def _sanitize_for_commit_message(text: str) -> str:
 
 
 def _atomic_write_text(target: Path, text: str) -> None:
-    _atomic_write_bytes(target, text.encode("utf-8"))
+    """Every text write a tool makes lands here, and is redacted on the way.
+
+    `mcp_server` does not import `ingest_lib.pipeline`, so the redaction on
+    the ingestion side covers none of this: a note written through a tool call
+    went to disk, was committed and was pushed in clear text. Since a tool
+    call is how the server's clients write, this is the boundary that matters
+    most (security review 2026-09-18, finding F3).
+
+    The `note` profile is deliberate. Frontmatter carries `source_hash`, 64
+    hex, and notes routinely cite git SHAs — the generic fallbacks would
+    rewrite both, so they are off here and the vendor-prefixed, assignment,
+    header, URL and denylist checks do the work.
+
+    `_atomic_write_bytes` is NOT redacted: it takes an uploaded file verbatim,
+    and rewriting bytes inside an upload would corrupt it. Those land in
+    `inbox/`, and what ingestion derives from them is redacted when the note
+    is written.
+    """
+    redacted, _ = redact_secrets(text, profile="note")
+    _atomic_write_bytes(target, redacted.encode("utf-8"))
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: pull the connectors whose sources live on this Mac, nightly.
+  Install:  cp this to ~/Library/LaunchAgents/ (edit the paths first),
+            then: launchctl load ~/Library/LaunchAgents/com.brain.pull.plist
+  Edit REPO_ROOT to your vault path. Runs at 03:30 local, and launchd fires a missed run on wake; RunAtLoad off so it
+  won't fire the moment you load it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brain.pull</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_ROOT/scripts/nightly_pull.sh</string>
+        <string>claude_code</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/nightly-pull.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/nightly-pull.err.log</string>
+</dict>
+</plist>
