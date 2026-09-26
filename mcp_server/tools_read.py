@@ -37,6 +37,8 @@ from ingest_lib.knowledge import (  # noqa: E402
     KNOWLEDGE_EXTRACTOR as _KNOWLEDGE_EXTRACTOR,
     knowledge_records as _knowledge_records,
 )
+from ingest_lib.outline import build_outline as _build_outline  # noqa: E402
+from ingest_lib.semantic_meta import MetaRow  # noqa: E402
 from ingest_lib.notes import (  # noqa: E402
     derived_note_relpath as _derived_note_relpath,
 )
@@ -298,6 +300,21 @@ class ChunkContextOut(BaseModel):
     chunks: list[ChunkOut]
 
 
+class SectionOut(BaseModel):
+    heading_path: str
+    first_chunk: int
+    last_chunk: int
+    chars: int
+    preview: str
+
+
+class OutlineOut(BaseModel):
+    source_relative_path: str
+    title: str
+    total_chunks: int
+    sections: list[SectionOut]
+
+
 class ReadOut(BaseModel):
     path: str
     content: str
@@ -503,6 +520,19 @@ def _hit_gate_path(source_relative_path: str, origin: str) -> str:
     return "archive/processed/" + _derived_note_relpath(source_relative_path)
 
 
+def _gated_chunks(cfg: ServerConfig, source_relative_path: str) -> list[MetaRow]:
+    """A source's indexed chunks, refused unless its backing artifact passes
+    the read policy — keyed by the source's own origin, as search does."""
+    rows = _chunks_for_source(_paths_for_root(cfg.vault_root), source_relative_path)
+    if not rows:
+        raise ToolError("no indexed chunks for that source (rebuild the index?)")
+    try:
+        resolve_read(cfg.vault_root, _hit_gate_path(source_relative_path, rows[0]["origin"]))
+    except SafetyError:
+        raise ToolError("not found or not readable") from None
+    return rows
+
+
 def tool_chunk_context(
     cfg: ServerConfig,
     runtime: Runtime,
@@ -523,16 +553,7 @@ def tool_chunk_context(
         raise ToolError("before/after must be in [0, 20]")
     _rate_check_read()
 
-    paths = _paths_for_root(cfg.vault_root)
-    rows = _chunks_for_source(paths, source_relative_path)
-    if not rows:
-        raise ToolError("no indexed chunks for that source (rebuild the index?)")
-    # Gate on the read policy, keyed by the source's own origin (as search does).
-    origin = rows[0]["origin"]
-    try:
-        resolve_read(cfg.vault_root, _hit_gate_path(source_relative_path, origin))
-    except SafetyError:
-        raise ToolError("not found or not readable") from None
+    rows = _gated_chunks(cfg, source_relative_path)
 
     lo, hi = chunk_idx - before, chunk_idx + after
     # chunk_idx is always an int on a MetaRow (narrowed once, on load, by
@@ -553,6 +574,31 @@ def tool_chunk_context(
         source_relative_path=source_relative_path,
         total_chunks=len(rows),
         chunks=window,
+    )
+
+
+def tool_outline(cfg: ServerConfig, runtime: Runtime, source_relative_path: str) -> OutlineOut:
+    """Return a source's table of contents: its indexed chunks grouped into
+    consecutive runs sharing a heading path, each with its chunk range and
+    size, and a short preview of its opening text. Lets an agent navigate a long document by section and then read one
+    section with ``vault_chunk_context`` instead of the whole file."""
+    if not source_relative_path or not source_relative_path.strip():
+        raise ToolError("source_relative_path must be non-empty")
+    _rate_check_read()
+    rows = _gated_chunks(cfg, source_relative_path)
+    sections = [
+        SectionOut(
+            heading_path=sec.heading_path, first_chunk=sec.first_chunk,
+            last_chunk=sec.last_chunk, chars=sec.chars, preview=sec.preview,
+        )
+        for sec in _build_outline(rows)
+    ]
+    runtime.audit.access_event(
+        agent=current_agent(), tool="vault_outline", paths=[source_relative_path],
+    )
+    return OutlineOut(
+        source_relative_path=source_relative_path, title=rows[0]["title"],
+        total_chunks=len(rows), sections=sections,
     )
 
 

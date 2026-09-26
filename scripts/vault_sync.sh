@@ -2,7 +2,8 @@
 # Keep this clone level with the remote. Unattended, every 15 minutes.
 #
 #   scripts/vault_sync.sh              # a laptop: commit hand edits, rebase, push
-#   scripts/vault_sync.sh --pull-only  # the MCP server: fast-forward only
+#   scripts/vault_sync.sh --pull-only  # the MCP server: fast-forward only,
+#                                      # then restart brain-mcp on code changes
 #
 # The MCP server commits and pushes its own writes, so there this only
 # fast-forwards to pick up what other machines pushed. It never commits (an
@@ -55,6 +56,28 @@ if [ -n "$PULL_ONLY" ]; then
     fi
     git merge -q --ff-only "$REMOTE/$EXPECTED" || fail "cannot fast-forward to $REMOTE/$EXPECTED"
     echo "[vault-sync $(ts)] up to date at $(git rev-parse --short HEAD)"
+
+    # A pull updates files, not the running server's loaded code. Compare HEAD
+    # with the revision brain-mcp was last restarted at (stamped here; code
+    # also arrives through the server's own pull-before-write, so diffing only
+    # this merge would miss it) and restart when server code changed. A
+    # dependency change needs `uv sync` first, which is not safe unattended.
+    STAMP="$GIT_DIR/brain-mcp-code-rev"
+    HEAD_REV=$(git rev-parse HEAD)
+    if ! systemctl --user is-active --quiet brain-mcp 2>/dev/null; then
+        exit 0
+    fi
+    if [ ! -f "$STAMP" ] || ! CHANGED=$(git diff --name-only "$(cat "$STAMP")" "$HEAD_REV" 2>/dev/null); then
+        echo "$HEAD_REV" > "$STAMP"; exit 0   # no usable baseline: start from here
+    fi
+    if printf '%s\n' "$CHANGED" | grep -qE '^(pyproject\.toml|uv\.lock)$'; then
+        fail "dependencies changed since $(cut -c1-9 "$STAMP") — run uv sync --locked, restart brain-mcp, then delete $STAMP"
+    fi
+    if printf '%s\n' "$CHANGED" | grep -qE '^(mcp_server|scripts/ingest_lib)/'; then
+        systemctl --user restart brain-mcp || fail "brain-mcp restart failed"
+        echo "[vault-sync $(ts)] restarted brain-mcp for code changes"
+    fi
+    echo "$HEAD_REV" > "$STAMP"
     exit 0
 fi
 

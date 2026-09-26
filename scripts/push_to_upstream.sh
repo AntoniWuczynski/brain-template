@@ -155,6 +155,13 @@ if [ -f "$GOLDEN_DEST" ]; then
 {"query": "another example retrieval query", "expected": ["research/example-paper.md"], "note": "placeholder — each expected path is a source_relative_path in metadata/index.jsonl"}
 EOF
 fi
+SECTION_GOLDEN_DEST="$WORKTREE/scripts/eval/section_golden.jsonl"
+if [ -f "$SECTION_GOLDEN_DEST" ]; then
+    echo "sanitising section golden set (placeholder for the public branch)..."
+    cat > "$SECTION_GOLDEN_DEST" <<'EOF'
+{"query": "example question answered by one section of a long document", "source": "research/example-paper.pdf", "expected_heading": "3.2 Method"}
+EOF
+fi
 
 # Mined eval candidates hold the owner's real search queries — never publish
 # them (gitignored locally, but the framework copy is a working-tree cp -R).

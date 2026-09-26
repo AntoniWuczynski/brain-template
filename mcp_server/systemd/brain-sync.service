@@ -1,7 +1,8 @@
 # Fast-forward the server's clone to the remote, so what other machines push
 # (Obsidian edits, a laptop ingest) is readable here without waiting for the
 # next MCP write's pull-before-write. Pull-only: the MCP server's push worker
-# owns this clone's commits; see scripts/vault_sync.sh.
+# owns this clone's commits; see scripts/vault_sync.sh. Also restarts
+# brain-mcp when server code changed, since a pull does not reload it.
 #
 # .env supplies BRAIN_MCP_GIT_REMOTE/BRANCH and GIT_SSH_COMMAND (deploy key).
 [Unit]

@@ -96,7 +96,7 @@ def _runtime(root: Path) -> Runtime:
 
 
 _EXPECTED_TOOL_NAMES = frozenset({
-    "vault_search", "vault_read", "vault_chunk_context", "vault_list",
+    "vault_search", "vault_read", "vault_chunk_context", "vault_outline", "vault_list",
     "vault_metadata_query", "vault_related", "vault_create_note",
     "vault_replace_note", "vault_append_to_note",
     "vault_update_concept_user_section", "vault_update_compiled_truth",
@@ -115,7 +115,7 @@ def test_register_tools_lists_every_tool_with_an_output_schema(tmp_path: Path) -
     by_name = {t.name: t for t in tools}
 
     assert set(by_name) == _EXPECTED_TOOL_NAMES
-    assert len(by_name) == 18
+    assert len(by_name) == 19
     for name, tool in by_name.items():
         assert tool.outputSchema, f"{name} has no outputSchema"
 
