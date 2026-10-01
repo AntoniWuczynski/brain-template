@@ -199,6 +199,20 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         )
 
     @mcp.tool()
+    async def vault_outline(source_relative_path: str) -> _tools_read.OutlineOut:
+        """Table of contents for one indexed source: its sections in order,
+        each with a heading path, chunk range, character count and a short
+        preview of its opening text. Use it on
+        long documents (textbooks, lecture notes) to find the right section by
+        its heading, then read that range with ``vault_chunk_context``
+        (``chunk_idx=first_chunk, before=0, after=last_chunk-first_chunk``,
+        at most 20 per call) instead of ``vault_read`` on the whole file.
+        Gated by the same read policy as search."""
+        return await _offload(
+            _tools_read.tool_outline, cfg, runtime, source_relative_path=source_relative_path,
+        )
+
+    @mcp.tool()
     async def vault_list(path: str = "") -> _tools_read.ListOut:
         """List entries under a vault directory. Empty path lists the root.
         Hidden files (those starting with .) are omitted."""

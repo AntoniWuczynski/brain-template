@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import secrets
 import signal
@@ -225,14 +226,14 @@ async def main() -> int:
             names = sorted(t.name for t in tools.tools)
             expected = {
                 "vault_search", "vault_read", "vault_list", "vault_metadata_query",
-                "vault_related",
+                "vault_related", "vault_outline",
                 "vault_create_note", "vault_replace_note", "vault_append_to_note",
                 "vault_update_concept_user_section", "vault_drop_inbox_file",
                 "entity_upsert_relation", "entity_append_fact", "meeting_create",
                 "memory_search", "profile_update",
             }
             runner.expect(
-                "tools: all 15 registered",
+                "tools: all 16 registered",
                 expected.issubset(set(names)),
                 f"missing {expected - set(names)}",
             )
@@ -291,6 +292,21 @@ async def main() -> int:
             await runner.expect_error(
                 "vault_metadata_query: rejects unknown 'by'",
                 _call(s, "vault_metadata_query", by="garbage"),
+            )
+
+            # outline: a real indexed source (first row of the chunk index)
+            # returns sections; a gated path is refused like vault_read.
+            meta_path = _REPO_ROOT / "metadata" / "embeddings_meta.jsonl"
+            if meta_path.is_file():
+                with meta_path.open(encoding="utf-8") as fh:
+                    first_src = json.loads(fh.readline())["source_relative_path"]
+                r = await _call(s, "vault_outline", source_relative_path=first_src)
+                sections = (r.structuredContent or {}).get("sections")
+                runner.expect("vault_outline: indexed source has sections",
+                              _ok(r) and isinstance(sections, list) and bool(sections))
+            await runner.expect_error(
+                "vault_outline: rejects .env",
+                _call(s, "vault_outline", source_relative_path=".env"),
             )
 
             # --- WRITES ---

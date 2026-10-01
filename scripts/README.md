@@ -84,6 +84,22 @@ syncs to the public template, so queries and notes may name course codes and
 topics but never private individuals or contact details
 (``tests/test_eval_retrieval.py`` enforces the shape and that floor).
 
+**Section-level eval.** ``scripts/eval_sections.py`` asks a narrower question
+for long documents: once the right document is known, does a strategy land
+in the right *section*? ``scripts/eval/section_golden.jsonl`` holds
+``{"query", "source", "expected_heading"}`` lines, where ``expected_heading``
+is a substring of the answering section's heading path (every section that
+matches counts). It scores global search, search filtered to the source, and,
+with ``--llm``, the configured LLM provider picking up to three sections from
+the source's outline (``ingest_lib/outline.py``, the same outline the
+``vault_outline`` MCP tool returns). ``--llm`` costs a few cents and is not
+deterministic. Nothing is written to disk. Measured 2026-09-26 (20 queries,
+``claude-haiku-4-5``): hit@1 / hit@3 were 0.10 / 0.55 for global search,
+0.30 / 0.75 for in-document search and 0.90 / 1.00 for outline navigation. A
+search candidate is one chunk while an outline candidate is a whole section,
+and the queries were written with the outlines in view, so read the gap as
+direction rather than size.
+
 - First run downloads ~100 MB of model weights to ``~/.cache/huggingface/``.
 - **Query instruction.** ``bge-small-en-v1.5`` is trained to prepend
   ``"Represent this sentence for searching relevant passages: "`` to the
@@ -879,7 +895,14 @@ When the MCP server runs on one machine and you read the vault in Obsidian on
 another, `scripts/vault_sync.sh` keeps both clones level with the remote every
 15 minutes. The server already pushes each MCP write, so there it runs
 `--pull-only` and only fast-forwards
-(`mcp_server/systemd/brain-sync.{service,timer}`). On the laptop it commits
+(`mcp_server/systemd/brain-sync.{service,timer}`). A pull does not reload the
+running server's code, so on the server the sync also restarts `brain-mcp`
+when `mcp_server/` or `scripts/ingest_lib/` changed since the revision it was
+last restarted at (stamped in `.git/brain-mcp-code-rev`, which also catches
+code the server's own pull-before-write brought in). A restart drops any MCP
+session open at that moment. A `pyproject.toml` or `uv.lock` change is
+not handled unattended: the run fails, and you run `uv sync --locked`,
+restart `brain-mcp` and delete the stamp. On the laptop it commits
 local edits (Obsidian, a hand-run ingest) on the ingest surface, except
 `knowledge/assistant/`, which agents write through the MCP server. Then it
 rebases onto the remote and pushes (`mcp_server/launchd/com.brain.sync.plist`,
@@ -1048,6 +1071,7 @@ scripts/
 ├── rotate_logs.py                  # MCP telemetry log rotation CLI
 ├── dream_gate.py                   # deterministic dream-pass gate CLI
 ├── eval_retrieval.py               # retrieval eval CLI (recall@k / MRR)
+├── eval_sections.py                # section-level eval: search vs outline navigation
 ├── pull.py                         # connector CLI: pull an external source into inbox/
 ├── maintain.sh                     # consolidate + sweep + rotate_logs, one entry point
 ├── dream.sh                        # dream-pass scheduler entry point
@@ -1055,7 +1079,8 @@ scripts/
 ├── pull_from_upstream.sh           # pull framework updates from brain-template
 ├── check-action-pins.sh            # verify workflow `uses:` lines are pinned to a commit SHA
 ├── eval/
-│   └── retrieval_golden.jsonl      # golden query set for eval_retrieval.py
+│   ├── retrieval_golden.jsonl      # golden query set for eval_retrieval.py
+│   └── section_golden.jsonl        # golden section queries for eval_sections.py
 ├── README.md                       # this file (you are here)
 └── ingest_lib/
     ├── __init__.py                 # public re-exports
@@ -1076,12 +1101,14 @@ scripts/
     ├── consolidate.py              # consolidation pass (CLI: scripts/consolidate.py)
     ├── semantic.py                 # embeddings index: build, search, upsert_notes
     ├── lexical.py                  # BM25 lexical retrieval over chunk text
+    ├── outline.py                  # per-source table of contents from the chunk index
     ├── describe.py                 # AI concept descriptions (RAG)
     ├── caption.py                  # figure/table captioning (vision)
     ├── chat.py                     # RAG plumbing for ask.py
     ├── dream.py                    # dream-pass gate: deterministic prep for the LLM session
     ├── evalmine.py                 # mine real queries from the MCP access log
     ├── evalret.py                  # recall@k / MRR scoring over the golden set
+    ├── evalsec.py                  # section-level hit@k scoring for eval_sections.py
     ├── status.py                   # Processing Dashboard + Manual Review notes
     ├── connectors/
     │   ├── base.py                  # connector contract: source-native pull()

@@ -205,12 +205,14 @@ default ingest path so it only spends tokens when you ask.
 
 A FastAPI and FastMCP server exposes the vault over the Model Context Protocol
 (MCP), so Claude, Codex and other agents can use it without knowing where it
-lives on disk. Seventeen typed tools:
+lives on disk. Nineteen typed tools:
 
-- **Read (8)** — search, read, chunk-context, list, metadata query, related
-  concepts, relation query, recency-weighted memory search.
-- **Write (6)** — create, replace and append notes, update a concept's user
-  section, drop an inbox file, byte-budgeted profile update.
+- **Read (9)** — search, read, chunk-context, outline (a source's table of
+  contents, for navigating long documents by section), list, metadata query,
+  related concepts, relation query, recency-weighted memory search.
+- **Write (7)** — create, replace and append notes, update a concept's user
+  section, update an entity's compiled truth, drop an inbox file,
+  byte-budgeted profile update.
 - **Entity (3)** — upsert a typed relation, append a dated fact, create a
   meeting.
 
@@ -235,9 +237,9 @@ Around those tools:
   with Cloudflare Access as the intended outer ring for remote use.
 - **Runs anywhere** — a one-command local launcher that mints its own token, a
   hardened systemd unit behind a Cloudflare Tunnel, and a live-checked smoke
-  test that drives fifteen of the seventeen tools (`vault_chunk_context` and
-  `relations_query` are covered by pytest instead, not yet by the live smoke
-  test).
+  test that drives sixteen of the nineteen tools (`vault_chunk_context`,
+  `relations_query` and `vault_update_compiled_truth` are covered by pytest
+  instead, not yet by the live smoke test).
 
 ### Health and maintenance
 
@@ -305,9 +307,10 @@ environment stanza.
 
 - **A local MCP launcher** (`run-local.sh`) that binds localhost, mints a
   persistent token and prints the registration command.
-- **An end-to-end smoke test** that drives fifteen of the seventeen tools and
-  every security boundary through the official MCP client; the remaining two
-  (`vault_chunk_context`, `relations_query`) are covered by pytest.
+- **An end-to-end smoke test** that drives sixteen of the nineteen tools and
+  every security boundary through the official MCP client; the remaining three
+  (`vault_chunk_context`, `relations_query`, `vault_update_compiled_truth`)
+  are covered by pytest.
 - **Lean continuous integration** — ruff, mypy and pytest on one runner, path-
   filtered so the constant vault-note commits never burn Actions minutes.
 - **A test suite** that doubles as the executable spec, from extractors and
