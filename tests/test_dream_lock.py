@@ -127,8 +127,13 @@ def test_dream_sh_and_the_skill_share_the_lock() -> None:
     assert '"$ROOT/scripts/dream_lock.sh" acquire scheduled' in script
     assert "release scheduled" in script and "trap " in script
     assert 'run_capped claude -p "/dream-pass --scheduled"' in script
-    for rel in (".claude", "_template/.claude", ".agents"):
-        text = (_REPO_ROOT / rel / "skills/dream-pass/SKILL.md").read_text(encoding="utf-8")
+    # The public template ships only the .claude copy.
+    copies = [_REPO_ROOT / rel / "skills/dream-pass/SKILL.md"
+              for rel in (".claude", "_template/.claude", ".agents")]
+    assert copies[0].is_file()
+    for skill in (c for c in copies if c.is_file()):
+        rel = skill.relative_to(_REPO_ROOT)
+        text = skill.read_text(encoding="utf-8")
         assert "scripts/dream_lock.sh acquire manual" in text, rel
         assert "scripts/dream_lock.sh release manual" in text, rel
         assert "--scheduled" in text, rel
