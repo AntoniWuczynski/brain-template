@@ -90,6 +90,14 @@ treat a red run as a real failure, not noise.
   1M-context model (`BRAIN_LLM_FALLBACK_MODEL`, default
   `claude-sonnet-5`) and records the retry in the note's processing
   notes.
+- **Concept descriptions** (`ingest.py --describe-concepts`): use the
+  summarizer's provider and model unless `BRAIN_DESCRIBE_PROVIDER` /
+  `BRAIN_DESCRIBE_MODEL` override them. A provider that differs from the
+  summarizer's needs its model named too, or describe is disabled with a
+  warning (no silent default model). `BRAIN_SKIP_SUMMARY` does not disable
+  describe. On a served vault only `scripts/maintain.sh` on the server
+  describes, with these keys in `.env.ingest`, so `BRAIN_AUTO_DESCRIBE`
+  stays unset everywhere else.
 - **Vision model**: `scripts/ingest_lib/extractors/vlm.py` defaults to
   `claude-sonnet-5` for anthropic; override with `BRAIN_VLM_MODEL`.
 - **PDF extractor**: MinerU (package `mineru`, CLI invoked as a

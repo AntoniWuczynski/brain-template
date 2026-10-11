@@ -435,6 +435,23 @@ def test_gate_ignores_script_written_inbox_proposals(tmp_path: Path) -> None:
     assert not verdict.should_dream
 
 
+def test_gate_ignores_saved_ask_answers(tmp_path: Path) -> None:
+    """``ask.py --save`` answers are LLM output over existing vault content,
+    not new information, so they never count toward the threshold."""
+    paths = _vault(tmp_path)
+    base = _commit(paths, "base", when="2026-06-10T12:00:00+00:00")
+    (paths.metadata / "dream.json").write_text(json.dumps(
+        {"last_commit": base, "last_run": "2026-06-10T12:00:00Z"}), encoding="utf-8")
+    for i in range(6):    # over the default threshold
+        _write(paths, f"knowledge/notes/answers/2026-06-11-q{i}.md",
+               f"---\ntitle: q{i}\ntype: answer\ngenerated_by: ask\n---\n## Question\n")
+    _commit(paths, "answers", when="2026-06-11T12:00:00+00:00")
+
+    verdict = evaluate_gate(paths, logger=_LOG, as_of=AS_OF, threshold=5)
+    assert verdict.changed_notes == ()
+    assert not verdict.should_dream
+
+
 def test_gate_still_counts_a_human_written_inbox_fact(tmp_path: Path) -> None:
     """Only the script-written half is excluded: a fact an agent or a human
     put in the inbox is real new information."""

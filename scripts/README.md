@@ -26,13 +26,15 @@ uv run python scripts/ingest.py --rebuild-concepts        # refresh concept inde
 uv run python scripts/ingest.py --rebuild-connections     # rebuild concept graph (free)
 uv run python scripts/ingest.py --rebuild-dashboards      # refresh entity dashboards (free)
 uv run python scripts/ingest.py --rebuild-status          # refresh status dashboards (free; auto after each ingest)
-uv run python scripts/ingest.py --describe-concepts --limit 20  # AI concept descriptions (LLM)
+uv run python scripts/ingest.py --describe-concepts --min-sources 3 --limit 20  # AI concept syntheses (LLM)
 uv run python scripts/ingest.py --caption-figures --limit 20    # caption figures (vision LLM)
 uv run python scripts/ingest.py --rebuild-search-index    # rebuild semantic index (free)
 uv run python scripts/ingest.py --search "query" --top-k 5  # semantic search the vault
 uv run python scripts/ask.py "question"                      # chat with the vault (RAG)
+uv run python scripts/ask.py --save "question"               # ... and keep the answer as a note
 uv run python scripts/sweep.py --write-report                # lint the vault (free)
 uv run python scripts/consolidate.py --dry-run               # consolidate assistant memory (free)
+uv run python -m ingest_lib.open_loops --dry-run             # print Open Loops instead of writing it (free)
 ```
 
 ## Semantic search
@@ -339,11 +341,33 @@ Two paths, both offline-capable when paired with the `local` provider:
 uv run python scripts/ask.py "what does my vault say about X?"
 uv run python scripts/ask.py --top-k 12 --provider local --model gemma4:31b "..."
 uv run python scripts/ask.py -q "..."   # -q/--quiet: omit the trailing model/provider line
+uv run python scripts/ask.py --save "..."   # also write the answer to knowledge/notes/answers/
 ```
 
 Pipeline: question → embed query against the existing `metadata/embeddings.npy`
 index → top-k chunks → LLM via the configured provider → citation-backed
-answer in the terminal. Nothing new is written to disk.
+answer in the terminal. Nothing new is written to disk unless `--save` is
+given.
+
+`--save` writes `knowledge/notes/answers/<YYYY-MM-DD>-<slug>.md` (slug from
+the question, at most 60 characters) and prints its path. It never
+overwrites: the file is created exclusively, taking a `-2`, `-3`, … suffix on
+a collision. Frontmatter: `title` (the question), `type: answer`,
+`generated_by: ask`, `author: script:ask`, `written_via: script`, `created`,
+`provider`, `model` and `sources` (the cited `archive/raw/...` or
+`knowledge/...` paths, deduplicated). The body is `## Question`, `## Answer`
+(verbatim, `[n]` citations kept) and a numbered `## Sources` with one wikilink
+per hit in `[n]` order: an archive source links to its `knowledge/index/`
+note, a knowledge note to itself. Question and answer are redacted for
+secrets first. With no sources it prints the answer, writes nothing and exits
+1. A saved answer becomes searchable after the next full
+`--rebuild-search-index` (there is no live upsert). `vault_search` finds it,
+but `ask` never retrieves a saved answer, so an answer never cites an
+earlier one. A saved answer is a hit whose origin is a knowledge note under
+`knowledge/notes/answers/` (not the path prefix alone, so an archived source
+filed there is still retrieved), and retrieval keeps widening its fetch until
+`--top-k` other passages remain or the index runs out. The dream gate does
+not count saved answers as human changes.
 
 **Obsidian (Copilot for Obsidian, or Smart Connections)** — chat panel
 inside Obsidian:
@@ -453,6 +477,15 @@ archive — off by default because it reads the whole archive (GBs). Read-only
 unless `--write-report` is given; always exits 0 (the per-category counts are
 the signal, and a linter that fails the shell breaks cron pipelines). Checks
 live in `ingest_lib/sweep.py`.
+
+The `decision-integrity` check covers decision records
+(`knowledge/{projects,chats}/<slug>/decisions/<NNNN>-<title-slug>.md`, parsed
+by `ingest_lib/decisions.py`, selected by path, never by `type:`): status
+outside `proposed | accepted | rejected | superseded`, a `number:` that
+differs from the filename, two records with one number in a project, a
+superseded record with no `superseded_by` (or `superseded_by` on one that is
+not superseded), `supersedes` / `superseded_by` naming a non-record or not
+pointing back, and a `project:` that is not the folder's overview.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -589,12 +622,24 @@ concurrent MCP write could race the same note or the git index.
 ### Scheduling
 
 `scripts/maintain.sh` is the single entry point that runs the wikilink,
-duplicate-entity and meeting-promotion passes, then `consolidate`,
-`sweep --write-report` and `rotate_logs` — deterministic, exit 0, safe to
-run by hand or on a schedule (`scripts/maintain.sh --dry-run` to plan only).
+duplicate-entity and meeting-promotion passes, then `consolidate`, the full
+search-index rebuild, `--describe-concepts --min-sources 3 --limit 50`,
+Open Loops, `sweep --write-report` and `rotate_logs` — exit 0, safe to run
+by hand or on a schedule (`scripts/maintain.sh --dry-run` to plan only).
+Everything but describe is deterministic. Describe runs only when
+`.env.ingest` (where the server keeps LLM keys, see
+`mcp_server/systemd/brain-pull.service`) sets a non-empty
+`BRAIN_DESCRIBE_PROVIDER`, and is skipped with a log line otherwise, even if
+`.env` sets it. That file is a systemd `EnvironmentFile`, so it is never
+sourced as shell: `ingest.py --env-file .env.ingest` loads it literally (no
+`$` expansion, multi-word values kept whole) over `.env` for that one step. It is the
+vault's single describe writer, so leave `BRAIN_AUTO_DESCRIBE` unset on every
+other machine. The describe and Open Loops output is committed with the
+rest of the run's `knowledge/` changes.
 It prefers the repo `.venv` interpreter so a scheduler needs no `uv` on PATH.
 Schedule it for a quiet hour (no cross-process lock vs a running MCP
-server):
+server, whose background reindex can rebuild and commit the same concept
+notes describe writes):
 
 - **macOS** — `mcp_server/launchd/com.brain.maintenance.plist` (edit
   `REPO_ROOT`, `cp` to `~/Library/LaunchAgents/`, `launchctl load` it).
@@ -609,6 +654,38 @@ uncompressed copy is dropped; the writer recreates the active path on its
 next append. Rotated `.gz` segments are kept forever — this step never
 touches an existing one — and are already excluded from git via
 `logs/*.gz`.
+
+## Open Loops
+
+`python -m ingest_lib.open_loops` (`scripts/ingest_lib/open_loops.py`, zero-LLM,
+deterministic) rebuilds `knowledge/index/Open Loops.md`, the one list of what
+is still waiting on someone. `Home.md` links it. It is written through
+`status.write_managed` like the status dashboards: skipped when unchanged,
+and text below the managed block is kept. Sections, each item with its
+source wikilink and date:
+
+1. **Proposed decisions** — decision records with `status: proposed`.
+2. **Project next steps** — per project or chat, the newest `log/` note (by
+   filename date) whose last `## Next` / `### Next` / `## Open…` heading has
+   items (`## Open Loops —` write-ups excluded).
+3. **Meeting next steps** — `knowledge/meetings/` notes dated within 45 days
+   of today: items under a heading inside `## Notes` that is exactly "Next
+   steps" or "Następne kroki" (any case, optional trailing colon), plus
+   `## Actions` items that are not `_(empty)_`. Combined headings such as
+   "Role Fit, Salary, and Next Steps" are background and do not match.
+4. **Awaiting your approval** — the count of `approved: false` memory-inbox
+   facts, linking `Memory inbox.base` for the list.
+5. **For a human** — the newest dream report's `## For a human`, verbatim.
+6. **Open questions** — the `## New — …` / `## Carried — …` headings of the
+   dream's `questions.md`.
+
+Blockquotes, fenced code, HTML comments (multi-line ones too) and checked
+`[x]` items are skipped, and `archive/` is never read. A `…:` lead-in item
+keeps its nested items as indented sub-lines, and other nested items are
+dropped. The body never prints today's date, so a rebuild over unchanged files
+is a byte-for-byte no-op. `--today YYYY-MM-DD` pins the meeting window and
+`--dry-run` prints the note instead of writing it. The single writer is
+`maintain.sh` (plus a manual run), and ingest never writes it.
 
 ## Dream pass
 
@@ -653,6 +730,8 @@ for one invocation — handy for tests and replays. `dream_gate.py` also takes
 | `BRAIN_DREAM_PAIRS` | 10 | Candidate connection pairs included in the packet |
 | `BRAIN_DREAM_MAX_TURNS` | 50 | Turn cap passed to the headless session |
 | `BRAIN_DREAM_RUNNER` | `claude` | `claude` \| `codex` \| `noop` — which runner `dream.sh` launches |
+| `BRAIN_DREAM_LOCK_HOST` | unset | ssh name of the machine the scheduled pass runs on, set only in a working clone whose vault is served elsewhere (read from the environment or `.env`) |
+| `BRAIN_DREAM_LOCK_STALE` | 7200 | Seconds after which a held run lock counts as left by a dead run |
 
 ### Scheduling
 
@@ -661,6 +740,15 @@ headless session, capturing everything to `logs/dream-<UTC>.log`. It prefers
 the repo `.venv` interpreter, same as `maintain.sh`. Always exits 0: a
 skipped or failed dream must not look like a scheduler failure to
 cron/launchd; the log and the `dream-stalled` sweep check are the signal.
+
+One pass runs at a time. `dream.sh` takes `scripts/dream_lock.sh acquire
+scheduled` before the gate and releases it on exit, and a manual `/dream-pass`
+takes `acquire manual` in its step 0 (skipped for `--dry-run`, and for the
+`--scheduled` session `dream.sh` launches). The lock is a directory under
+`~/.cache/brain-dream/` on the machine that runs the scheduled pass. A clone
+whose vault is served from another machine sets `BRAIN_DREAM_LOCK_HOST`, and
+the script runs there over ssh. A pass that finds the lock held stops and names
+the holder.
 
 - **macOS** — `mcp_server/launchd/com.brain.dream.plist` (edit `REPO_ROOT`,
   `cp` to `~/Library/LaunchAgents/`, `launchctl load` it).
@@ -918,18 +1006,57 @@ and shows a macOS notification. Logs: `logs/vault-sync.*.log` on the laptop,
 definitions — generated by the configured LLM from the *retrieved* text of the
 concept's own sources (RAG over the search index). It never writes from
 nothing: a concept with no retrievable context is skipped, not hallucinated.
+Each run builds on the last one rather than starting over.
 
 - The AI zone (`<!-- AI-GENERATED-START/END -->`) sits **below**
   `AUTO-GENERATED-END`, so `--rebuild-concepts` preserves it like your
   hand-written notes — layout is: auto index → AI description → your `# Notes`.
-- **Cached + idempotent + unattended.** Each zone carries an `ai-hash` keyed on
-  the concept's source set + model + prompt version. A re-run regenerates only
-  concepts whose sources changed; unchanged ones cost nothing. No approval step.
-- **Cost control.** `--limit N` bounds how many are (re)generated per run;
-  `--force` ignores the cache. Generation is *not* auto-run on ingest by default
-  (it costs LLM calls) — run it explicitly, or set `BRAIN_AUTO_DESCRIBE=1`.
-- Uses the same four-backend provider router as the summarizer
-  (`BRAIN_LLM_PROVIDER` / auto-detected key; `claude-haiku-4-5` by default).
+- **Zone layout** (prompt version 3): two hidden comments, `ai-hash` and
+  `ai-sources` (one `<sha(path)[:8]>:<sha(path@source_hash)[:8]>` pair per
+  source the synthesis covers), then the summary, the explanation with inline
+  `[k]` citations and an optional `**Tensions:**` line where sources disagree,
+  the definitions, and a `### Sources` list numbering each cited source as a
+  wikilink to its `knowledge/index/` note. Adjacent `[a][b]`, ranged `[a-b]`
+  and semicolon `[a; b]` citations are normalised to `[x, y]` and renumbered
+  by first appearance, including citations inside key-definition terms.
+- **First build vs revise.** With no usable prior zone, a removed source, or
+  only a model / prompt-version change, the zone is built from scratch: the
+  best-matching chunk from each of the concept's top 12 sources. When sources
+  were only added or changed, the prior synthesis (fenced like an excerpt) is
+  REVISED with the best two chunks from each of up to 8 such sources: keep
+  what is still supported, integrate the new material, flag disagreements.
+  Sources past either cap are logged as deferred and left unrecorded, so the
+  concept stays stale and the next run takes them. A new source with no
+  searchable chunks is just recorded, with no LLM call.
+- **Injection hardening.** The LLM cites by excerpt number only, and the
+  wikilinks are built in code from the concept's own source list. It may cite
+  only the sources shown to it this run, plus, on a revise, those the prior
+  synthesis cites. Any other number is dropped. Comments, zone markers and
+  wikilinks are stripped from every LLM field, repeated until the text is
+  stable, and stray `[[` / `]]` are dropped. Excerpt fences neutralise both
+  opening `<excerpt` and closing `</excerpt` tags inside untrusted text. The
+  zone is redacted for secrets before it is written.
+  `vault_update_concept_user_section` keeps the zone and refuses user content
+  carrying `AI-GENERATED-START/END`, `ai-hash:` or `ai-sources:`.
+- **Cached + idempotent + unattended.** The `ai-hash` is keyed on the
+  concept's source set + model + prompt version. A re-run touches only stale
+  concepts, so unchanged ones cost nothing. No approval step.
+- **Cost control.** `--min-sources N` (default 3) skips concepts with fewer
+  sources. `--limit N` bounds how many are (re)generated per run, taking the
+  stale concepts with the most sources first, then by slug, and the CLI prints
+  how many were `left stale` for a later run. `--force` ignores the cache.
+  Generation is *not* auto-run on ingest by default (it costs LLM calls): run
+  it explicitly, let `maintain.sh` run it nightly, or set
+  `BRAIN_AUTO_DESCRIBE=1` (never on a machine whose vault the server
+  describes, or two models keep rewriting the same zones).
+- **Model.** The summarizer's four-backend router (`BRAIN_LLM_PROVIDER` /
+  auto-detected key) unless `BRAIN_DESCRIBE_PROVIDER` / `BRAIN_DESCRIBE_MODEL`
+  override it. A provider that differs from the summarizer's needs
+  `BRAIN_DESCRIBE_MODEL` too, or describe is disabled with a warning.
+  `BRAIN_SKIP_SUMMARY` does not disable describe. `--env-file PATH` loads
+  further `KEY=VALUE` settings over the environment and `.env`, read
+  literally with no shell evaluation (how `maintain.sh` passes
+  `.env.ingest`).
 
 ## Figure & table captioning
 
@@ -1073,8 +1200,9 @@ scripts/
 ├── eval_retrieval.py               # retrieval eval CLI (recall@k / MRR)
 ├── eval_sections.py                # section-level eval: search vs outline navigation
 ├── pull.py                         # connector CLI: pull an external source into inbox/
-├── maintain.sh                     # consolidate + sweep + rotate_logs, one entry point
+├── maintain.sh                     # nightly maintenance (consolidate, describe, open loops, sweep, ...), one entry point
 ├── dream.sh                        # dream-pass scheduler entry point
+├── dream_lock.sh                   # one dream pass at a time (scheduled or manual)
 ├── push_to_upstream.sh             # sync framework files to the public brain-template repo
 ├── pull_from_upstream.sh           # pull framework updates from brain-template
 ├── check-action-pins.sh            # verify workflow `uses:` lines are pinned to a commit SHA
@@ -1102,7 +1230,7 @@ scripts/
     ├── semantic.py                 # embeddings index: build, search, upsert_notes
     ├── lexical.py                  # BM25 lexical retrieval over chunk text
     ├── outline.py                  # per-source table of contents from the chunk index
-    ├── describe.py                 # AI concept descriptions (RAG)
+    ├── describe.py                 # compounding AI concept syntheses (RAG)
     ├── caption.py                  # figure/table captioning (vision)
     ├── chat.py                     # RAG plumbing for ask.py
     ├── dream.py                    # dream-pass gate: deterministic prep for the LLM session
@@ -1110,6 +1238,8 @@ scripts/
     ├── evalret.py                  # recall@k / MRR scoring over the golden set
     ├── evalsec.py                  # section-level hit@k scoring for eval_sections.py
     ├── status.py                   # Processing Dashboard + Manual Review notes
+    ├── open_loops.py               # knowledge/index/Open Loops.md (CLI: python -m ingest_lib.open_loops)
+    ├── decisions.py                # decision records: path regex, parse, render, numbering
     ├── connectors/
     │   ├── base.py                  # connector contract: source-native pull()
     │   ├── granola.py               # Granola meeting connector

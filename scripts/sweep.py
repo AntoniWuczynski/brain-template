@@ -69,8 +69,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Lint the vault for consistency drift: orphaned archive files, "
             "dangling wikilinks, malformed/overlapping relations, fragmented "
-            "concepts, stale search-index rows, and old unconsolidated "
-            "assistant memory. Read-only unless --write-report is given."
+            "concepts, stale search-index rows, old unconsolidated "
+            "assistant memory, and inconsistent decision records. "
+            "Read-only unless --write-report is given."
         ),
     )
     parser.add_argument(

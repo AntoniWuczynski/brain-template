@@ -99,6 +99,16 @@ def rebase_in_progress(vault_root: Path) -> bool:
     return False
 
 
+def _vault_rel_paths(vault_root: Path, paths: list[Path]) -> list[str]:
+    rel_paths = []
+    for p in paths:
+        try:
+            rel_paths.append(str(p.resolve().relative_to(vault_root)))
+        except ValueError:
+            raise GitError(f"path is not inside the vault: {p}") from None
+    return rel_paths
+
+
 def commit_paths(
     vault_root: Path,
     *,
@@ -129,13 +139,7 @@ def commit_paths(
                 )
 
         # Stage only the explicit paths we touched.
-        rel_paths = []
-        for p in paths:
-            try:
-                rel_paths.append(str(p.resolve().relative_to(vault_root)))
-            except ValueError:
-                raise GitError(f"path is not inside the vault: {p}") from None
-
+        rel_paths = _vault_rel_paths(vault_root, paths)
         _git(vault_root, "add", "--", *rel_paths)
 
         # No-op (e.g. appending identical content): git commit returns 1.
@@ -147,6 +151,19 @@ def commit_paths(
         _git(vault_root, "commit", "-m", message, "--", *rel_paths)
         sha = _git(vault_root, "rev-parse", "HEAD").strip()
         return CommitOutcome(sha, True, False, None)
+
+
+def reset_paths(vault_root: Path, *, paths: list[Path]) -> None:
+    """Unstage ``paths`` (``git reset -q -- <paths>``): the index entries go
+    back to HEAD's, the working tree is untouched. A multi-file write's
+    rollback calls it after a failed commit — ``commit_paths`` has already
+    run ``git add``, and a staged leftover makes maintain.sh and vault_sync
+    skip every later run. Paths absent from both HEAD and the index are
+    fine. Raises ``GitError`` if git refuses."""
+    if not paths:
+        return
+    with _GIT_LOCK:
+        _git(vault_root, "reset", "-q", "--", *_vault_rel_paths(vault_root, paths))
 
 
 # ------------------------------------------------------- pull before write

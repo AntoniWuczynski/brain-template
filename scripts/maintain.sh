@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Deterministic vault maintenance: propose wikilink-derived relations,
-# promote meeting snapshots, consolidate assistant memory, rebuild the search
-# index, lint the vault, rotate telemetry, then commit whatever the run wrote.
-# Every step is
-# cron/launchd-safe (deterministic, exit 0, no interactive git), so this is
+# Vault maintenance: propose wikilink-derived relations, promote meeting
+# snapshots, consolidate assistant memory, rebuild the search index, describe
+# stale concepts, rebuild Open Loops, lint the vault, rotate telemetry, then
+# commit whatever the run wrote. Every step but describe is deterministic.
+# Describe is the one LLM step, so its concept syntheses vary run to run.
+# Every step is cron/launchd-safe (exit 0, no interactive git), so this is
 # the single entry point for a scheduler AND for running by hand.
 #
 #   scripts/maintain.sh              # real run
@@ -14,9 +15,11 @@
 #   - macOS  : mcp_server/launchd/com.brain.maintenance.plist
 #   - Linux  : mcp_server/systemd/brain-maintenance.{service,timer}
 #
-# Caveat: consolidate/sweep take no cross-process lock against a running MCP
-# server (only the server's in-process write lock exists), so schedule this
-# for a quiet hour when the server is idle (see scripts/README.md).
+# Caveat: consolidate/sweep/describe take no cross-process lock against a
+# running MCP server (only the server's in-process write lock exists), and
+# describe writes concept notes the server's background reindex can rebuild
+# and commit at the same time, so schedule this for a quiet hour when the
+# server is idle (see scripts/README.md).
 set -uo pipefail
 
 # Guard both steps: without `set -e`, a failed subshell would leave ROOT
@@ -114,6 +117,32 @@ else
     echo "[maintain] would rebuild the search index (skipped: --dry-run)"
 fi
 
+echo "[maintain $(ts)] describe concepts (compounding syntheses)"
+# The one describe writer (BRAIN_AUTO_DESCRIBE stays unset elsewhere), after
+# the full rebuild because it retrieves from that index. Its LLM key lives in
+# .env.ingest, not .env (see mcp_server/systemd/brain-pull.service), and only
+# this step loads it. The step runs only when .env.ingest sets a non-empty
+# BRAIN_DESCRIBE_PROVIDER. That file is a systemd EnvironmentFile (unquoted
+# multi-word values, secrets that may hold `$`), so it is never sourced as
+# shell: ingest.py --env-file reads it literally. ingest.py rejects --dry-run
+# here, so the plan-only run just says what it would do.
+if [ -n "$DRY" ]; then
+    echo "[maintain] would describe stale concepts (skipped: --dry-run)"
+elif [ ! -f "$ROOT/.env.ingest" ]; then
+    echo "[maintain] no .env.ingest — describe skipped"
+elif ! grep -Eq "^[[:space:]]*BRAIN_DESCRIBE_PROVIDER=[\"']?[^\"'[:space:]]" "$ROOT/.env.ingest"; then
+    echo "[maintain] no BRAIN_DESCRIBE_PROVIDER in .env.ingest — describe skipped"
+else
+    run_py scripts/ingest.py --env-file "$ROOT/.env.ingest" \
+        --describe-concepts --min-sources 3 --limit 50 \
+        || echo "[maintain] describe-concepts failed (non-fatal)"
+fi
+
+echo "[maintain $(ts)] rebuild open loops"
+# Zero-LLM, deterministic (scripts/ingest_lib/open_loops.py): rewrites
+# knowledge/index/Open Loops.md (hand tail kept); --dry-run prints it instead.
+run_py -m ingest_lib.open_loops $DRY || echo "[maintain] open-loops pass failed (non-fatal)"
+
 echo "[maintain $(ts)] sweep (vault lint)"
 # --dry-run has no meaning for sweep; it's read-only unless --write-report.
 if [ -z "$DRY" ]; then
@@ -169,7 +198,7 @@ commit_output() {
         return 0
     fi
     # Commits exactly what was staged above: the index was verified empty first.
-    git -C "$ROOT" commit -q -m "maintenance: consolidate + sweep output" \
+    git -C "$ROOT" commit -q -m "maintenance: nightly output (describe, open loops, consolidate, sweep)" \
         || echo "[maintain] git commit failed (non-fatal)"
 }
 

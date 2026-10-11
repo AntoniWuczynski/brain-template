@@ -102,7 +102,8 @@ _EXPECTED_TOOL_NAMES = frozenset({
     "vault_update_concept_user_section", "vault_update_compiled_truth",
     "vault_drop_inbox_file",
     "entity_upsert_relation", "entity_append_fact", "relations_query",
-    "meeting_create", "memory_search", "profile_update",
+    "meeting_create", "decision_record", "decision_resolve",
+    "memory_search", "profile_update",
 })
 
 
@@ -115,7 +116,7 @@ def test_register_tools_lists_every_tool_with_an_output_schema(tmp_path: Path) -
     by_name = {t.name: t for t in tools}
 
     assert set(by_name) == _EXPECTED_TOOL_NAMES
-    assert len(by_name) == 19
+    assert len(by_name) == 21
     for name, tool in by_name.items():
         assert tool.outputSchema, f"{name} has no outputSchema"
 

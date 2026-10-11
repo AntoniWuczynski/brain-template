@@ -47,6 +47,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from ingest_lib.atomic import atomic_write_bytes  # noqa: E402
 from ingest_lib.secrets import redact_secrets  # noqa: E402
+from ingest_lib.describe import ai_zone_end, forged_ai_marker  # noqa: E402
 from ingest_lib.dream import (  # noqa: E402 — one definition of the fence
     COMPILED_TRUTH_END,
     COMPILED_TRUTH_START,
@@ -68,7 +69,6 @@ from .errors import ToolError
 from .config import (
     MAX_INBOX_BYTES,
     MAX_NOTE_BYTES,
-    PROFILE_NOTE_PATH,
     ServerConfig,
     WRITE_RATE_PER_MINUTE,
 )
@@ -89,6 +89,8 @@ from .sync import (
 )
 from .safety import (
     SafetyError,
+    is_profile_path,
+    refuse_protected_path,
     resolve_inbox,
     resolve_write_concept,
     resolve_write_under_allowlist,
@@ -197,7 +199,7 @@ def tool_create_note(cfg: ServerConfig, runtime: Runtime, path: str, content: st
         agent = current_agent()
         resolved = resolve_write_under_allowlist(cfg.vault_root, path)
         rel = resolved.relative_to(cfg.vault_root).as_posix()
-        _refuse_if_profile(rel)
+        refuse_protected_path(rel)
         body = content
         graph_changed = False
         if _is_knowledge_md(rel):
@@ -244,7 +246,7 @@ def tool_replace_note(cfg: ServerConfig, runtime: Runtime, path: str, content: s
         agent = current_agent()
         resolved = resolve_write_under_allowlist(cfg.vault_root, path)
         rel = resolved.relative_to(cfg.vault_root).as_posix()
-        _refuse_if_profile(rel)
+        refuse_protected_path(rel)
         body = content
         with _write_lock:
             if not resolved.is_file():
@@ -295,7 +297,7 @@ def tool_append_to_note(cfg: ServerConfig, runtime: Runtime, path: str, content:
         agent = current_agent()
         resolved = resolve_write_under_allowlist(cfg.vault_root, path)
         rel = resolved.relative_to(cfg.vault_root).as_posix()
-        _refuse_if_profile(rel)
+        refuse_protected_path(rel)
         with _write_lock:
             if not resolved.is_file():
                 raise ToolError(f"file does not exist: {path!r} (use create_note first)")
@@ -345,12 +347,19 @@ def tool_update_concept_user_section(
     content: str,
 ) -> WriteResult:
     """Replace the user-editable section of a concept note (everything
-    below the AUTO-GENERATED-END marker). Auto-generated content above
-    the marker is preserved. No provenance stamping: the edit is scoped
-    below the marker, and attribution lives in the commit + audit log."""
+    below the AUTO-GENERATED-END marker, or below the AI zone when the note
+    has one). Auto-generated content and the AI zone are preserved. No
+    provenance stamping: the edit is scoped below the marker, and
+    attribution lives in the commit + audit log."""
     def _do() -> WriteResult:
         _rate_check_write()
         _check_note_size(content)
+        forged = forged_ai_marker(content)
+        if forged is not None:
+            raise ToolError(
+                f"the user section must not contain AI-zone markup ({forged!r}); "
+                "the describe pass owns the AI zone"
+            )
         agent = current_agent()
         resolved = resolve_write_concept(cfg.vault_root, slug)
         rel = resolved.relative_to(cfg.vault_root).as_posix()
@@ -370,7 +379,9 @@ def tool_update_concept_user_section(
                     f"concept note {slug!r} has no AUTO-GENERATED-END marker; "
                     "refusing to write (would clobber the whole file)"
                 )
-            auto_part = full[: marker_pos + len(_USER_SECTION_MARKER)]
+            zone_end = ai_zone_end(full)
+            auto_part = full[: zone_end if zone_end is not None
+                             else marker_pos + len(_USER_SECTION_MARKER)]
             new_full = auto_part + "\n\n" + content.lstrip() + ("\n" if not content.endswith("\n") else "")
             # _check_note_size only bounded the client content; the composed
             # note (auto-generated header + content) can still exceed the cap.
@@ -473,7 +484,7 @@ def tool_update_compiled_truth(
         agent = current_agent()
         resolved = resolve_write_under_allowlist(cfg.vault_root, path)
         rel = resolved.relative_to(cfg.vault_root).as_posix()
-        _refuse_if_profile(rel)
+        refuse_protected_path(rel)
         if not _is_knowledge_md(rel):
             raise ToolError(
                 f"{path!r} is not a knowledge/ Markdown note; compiled truth "
@@ -610,30 +621,7 @@ def _is_memory_area(rel: str) -> bool:
     """knowledge/assistant/ notes carry the consolidation lifecycle
     (memory_status) — except PROFILE.md, whose dedicated profile tool
     manages its own provenance."""
-    return rel.startswith("knowledge/assistant/") and not _is_profile_path(rel)
-
-
-def _is_profile_path(rel: str) -> bool:
-    """Casefolded PROFILE.md test. On a case-insensitive FS (macOS APFS —
-    the live deployment) ``Path.resolve()`` preserves the requested casing,
-    so ``knowledge/assistant/profile.md`` opens the real PROFILE.md while an
-    exact-case compare misses it — the same bypass safety.resolve_read
-    already casefolds its DENY checks against."""
-    return rel.casefold() == PROFILE_NOTE_PATH.casefold()
-
-
-def _refuse_if_profile(rel: str) -> None:
-    """The assistant PROFILE lives under knowledge/assistant/ — inside the
-    write allowlist — so the general note verbs would otherwise accept it
-    and silently dodge the byte budget + forced memory_status that
-    tool_profile_update enforces. Refuse it here so profile_update stays
-    the only door (it writes PROFILE.md on its own atomic-write/commit
-    path, never through these three tools, so it isn't caught by this)."""
-    if _is_profile_path(rel):
-        raise ToolError(
-            f"{PROFILE_NOTE_PATH} is byte-budgeted; use profile_update "
-            "(the general note verbs would bypass the budget)"
-        )
+    return rel.startswith("knowledge/assistant/") and not is_profile_path(rel)
 
 
 def _refuse_bad_relations(content: str) -> None:

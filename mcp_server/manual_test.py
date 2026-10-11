@@ -225,15 +225,17 @@ async def main() -> int:
             tools = await s.list_tools()
             names = sorted(t.name for t in tools.tools)
             expected = {
-                "vault_search", "vault_read", "vault_list", "vault_metadata_query",
-                "vault_related", "vault_outline",
+                "vault_search", "vault_read", "vault_chunk_context", "vault_list",
+                "vault_metadata_query", "vault_related", "vault_outline",
                 "vault_create_note", "vault_replace_note", "vault_append_to_note",
-                "vault_update_concept_user_section", "vault_drop_inbox_file",
-                "entity_upsert_relation", "entity_append_fact", "meeting_create",
+                "vault_update_concept_user_section", "vault_update_compiled_truth",
+                "vault_drop_inbox_file",
+                "entity_upsert_relation", "entity_append_fact", "relations_query",
+                "meeting_create", "decision_record", "decision_resolve",
                 "memory_search", "profile_update",
             }
             runner.expect(
-                "tools: all 16 registered",
+                f"tools: all {len(expected)} registered",
                 expected.issubset(set(names)),
                 f"missing {expected - set(names)}",
             )

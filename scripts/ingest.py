@@ -12,6 +12,7 @@ The heavy lifting lives in ``scripts/ingest_lib/``.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from ingest_lib import (  # noqa: E402
     semantic_search,
 )
 from ingest_lib.dashboards import rebuild_dashboards  # noqa: E402
+from ingest_lib.describe import DEFAULT_MIN_SOURCES  # noqa: E402
 from ingest_lib.status import rebuild_status, retry_partial  # noqa: E402
 from ingest_lib.logging_setup import configure_run_logger  # noqa: E402
 from ingest_lib.extractors.pdf import mineru_available  # noqa: E402
@@ -146,9 +148,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Generate/refresh source-grounded AI descriptions in each concept "
             "note's AI zone (RAG over the search index + the configured LLM). "
-            "Only regenerates concepts whose source set changed; unattended, "
-            "no approval. Costs LLM calls — use --limit to bound a run. "
-            "Requires a configured provider (e.g. ANTHROPIC_API_KEY)."
+            "Only refreshes concepts whose sources changed, revising the prior "
+            "synthesis with just the new or changed sources; unattended, "
+            "no approval. Costs LLM calls — use --limit and --min-sources to "
+            "bound a run. Requires a configured provider (e.g. "
+            "ANTHROPIC_API_KEY); BRAIN_DESCRIBE_PROVIDER / BRAIN_DESCRIBE_MODEL "
+            "override the summarizer's."
         ),
     )
     target.add_argument(
@@ -202,7 +207,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="With --describe-concepts / --caption-figures: max items to "
-        "(re)generate this run.",
+        "(re)generate this run (concepts with the most sources first).",
+    )
+    parser.add_argument(
+        "--min-sources",
+        type=int,
+        default=DEFAULT_MIN_SOURCES,
+        help="With --describe-concepts: only describe concepts with at least "
+        f"this many sources (default: {DEFAULT_MIN_SOURCES}).",
     )
     parser.add_argument(
         "--force",
@@ -215,11 +227,24 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Plan but do not write anything. Still creates a log file.",
     )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        metavar="PATH",
+        help="Load KEY=VALUE settings from PATH over the environment and .env "
+        "before running. Values are taken literally (no shell evaluation or "
+        "$-expansion), so a systemd EnvironmentFile such as .env.ingest is "
+        "safe to pass.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.env_file is not None:
+        from dotenv import dotenv_values
+        loaded = dotenv_values(args.env_file, interpolate=False)
+        os.environ.update({k: v for k, v in loaded.items() if v is not None})
     paths = default_paths()
     paths.ensure()
 
@@ -341,13 +366,16 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("--dry-run is not supported with --describe-concepts")
             return 2
         ds = rebuild_descriptions(
-            paths, logger=logger, limit=args.limit, force=args.force
+            paths, logger=logger, limit=args.limit, force=args.force,
+            min_sources=args.min_sources,
         )
         print()
         print("Concept descriptions:")
         print(f"  generated          : {ds.generated}")
         print(f"  up-to-date (skipped): {ds.skipped_uptodate}")
         print(f"  no context (skipped): {ds.skipped_no_context}")
+        if ds.left_stale:
+            print(f"  left stale (limit) : {ds.left_stale}")
         if ds.failed:
             print(f"  LLM call failed    : {ds.failed}")
         if ds.no_llm:

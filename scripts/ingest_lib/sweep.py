@@ -21,7 +21,9 @@ then calling :func:`run_sweep`, which only works if the constant a
 sibling's function would read and the constant the test patches are the
 same module-global binding; a sibling cannot import this module back
 (that would be a cycle), so the check and its constant have to live
-wherever :func:`run_sweep` calls it from.
+wherever :func:`run_sweep` calls it from. ``_check_decision_integrity``
+also lives here: it is a thin pass over ``ingest_lib.decisions``, which
+owns the record shape.
 
 Finding categories (exact strings):
 
@@ -63,6 +65,11 @@ Finding categories (exact strings):
 - ``stale-unconsolidated``       old unconsolidated assistant memory
 - ``memory-unconsolidatable``    assistant memory neither consolidate nor
                                  the staleness check can ever act on
+- ``decision-integrity``         a decision record (by path) with a bad
+                                 status, a number that disagrees with its
+                                 filename or repeats in its project, an
+                                 asymmetric supersedes/superseded_by pair,
+                                 or a ``project:`` that is not its folder
 """
 from __future__ import annotations
 
@@ -72,6 +79,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from .config import VaultPaths
+from .decisions import DECISION_STATUSES, DecisionNote, iter_decisions
 from .knowledge import scan_knowledge
 from .metadata import latest_records_by_path
 from .sweep_checks_archive import _check_archive
@@ -154,6 +162,55 @@ def _check_archive_processed_size(
     )]
 
 
+def _decision_problems(
+    note: DecisionNote, by_ref: dict[str, DecisionNote], twins: list[DecisionNote]
+) -> list[str]:
+    problems: list[str] = []
+    if note.status is None:
+        problems.append(f"status is not one of {', '.join(DECISION_STATUSES)}")
+    if note.number != note.file_number:
+        problems.append(
+            f"number {note.number} does not match filename number {note.file_number}"
+        )
+    problems += [
+        f"number {note.file_number} also used by {t.rel_path}" for t in twins if t is not note
+    ]
+    if note.project != note.folder_project:
+        problems.append(f"project {note.project!r} is not its folder {note.folder_project!r}")
+    if note.status == "superseded" and not note.superseded_by:
+        problems.append("status superseded but no superseded_by")
+    if note.superseded_by and note.status != "superseded":
+        problems.append(f"superseded_by set but status is {note.status}")
+    if note.supersedes:
+        older = by_ref.get(note.supersedes)
+        if older is None:
+            problems.append(f"supersedes {note.supersedes}, which is not a decision record")
+        elif older.superseded_by != note.ref:
+            problems.append(f"supersedes {note.supersedes}, whose superseded_by does not point back")
+    if note.superseded_by:
+        newer = by_ref.get(note.superseded_by)
+        if newer is None:
+            problems.append(f"superseded_by {note.superseded_by}, which is not a decision record")
+        elif newer.supersedes != note.ref:
+            problems.append(f"superseded_by {note.superseded_by}, which does not supersede it")
+    return problems
+
+
+def _check_decision_integrity(paths: VaultPaths) -> list[Finding]:
+    """decision-integrity: read-only consistency of the decision records
+    (identified by path, ``ingest_lib.decisions``)."""
+    notes = iter_decisions(paths)
+    by_ref = {n.ref: n for n in notes}
+    by_number: dict[tuple[str, int], list[DecisionNote]] = defaultdict(list)
+    for n in notes:
+        by_number[(n.folder_project, n.file_number)].append(n)
+    return [
+        Finding("decision-integrity", n.rel_path, detail)
+        for n in notes
+        for detail in _decision_problems(n, by_ref, by_number[(n.folder_project, n.file_number)])
+    ]
+
+
 @dataclass(frozen=True)
 class SweepReport:
     findings: tuple[Finding, ...]
@@ -203,6 +260,7 @@ def run_sweep(
     findings += _check_inbox_unprocessable(paths)
     findings += _check_secret_leak(paths.root)
     findings += _check_dream_stalled(paths, as_of=as_of)
+    findings += _check_decision_integrity(paths)
 
     findings.sort(key=lambda f: (f.category, f.path, f.detail))
     report = SweepReport(findings=tuple(findings))

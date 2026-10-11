@@ -7,18 +7,27 @@ questions and get citation-backed answers. The provider router from
 (``BRAIN_LLM_PROVIDER``, ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``,
 ``GOOGLE_API_KEY``/``GEMINI_API_KEY``, ``BRAIN_LOCAL_URL``).
 
-This module does NOT write anything to disk and does NOT re-embed the
-corpus. It only embeds the question at query time using the same model
-that built the index.
+It does NOT re-embed the corpus: it only embeds the question at query
+time using the same model that built the index. The only disk write is
+:func:`save_answer` (``ask.py --save``), which stores an answer as a note
+under ``knowledge/notes/answers/``.
 """
 from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 from typing import Final
 
+from .concepts import index_note_wikilink, note_wikilink, slugify
 from .config import VaultPaths
+from .knowledge import KNOWLEDGE_EXTRACTOR
+from .metadata import latest_records_by_path
+from .notes import fm_list, fm_scalar
+from .secrets import redact_secrets
 from .semantic import SearchHit, search as semantic_search
 from .summarize import _select_model, _select_provider
 
@@ -28,6 +37,13 @@ _DEFAULT_TOP_K: Final[int] = 8
 # output cap on gemini-2.5-flash / gpt-5-mini), plus the provider-specific
 # thinking caps in the call helpers below.
 _MAX_TOKENS: Final[int] = 2500
+
+# Saved answers (``save_answer``). Excluded from retrieval so no answer ever
+# cites an earlier LLM answer; vault_search still finds them. Over-fetch, and
+# keep widening while answers crowd out sources, so ``top_k`` passages remain.
+ANSWERS_DIR: Final[str] = "knowledge/notes/answers/"
+_ANSWER_FETCH_MULTIPLIER: Final[int] = 3
+_SLUG_MAX: Final[int] = 60
 
 
 _CHAT_SYSTEM: Final[str] = (
@@ -76,7 +92,16 @@ def ask(
     """
     log = logger or logging.getLogger(__name__)
 
-    hits = semantic_search(paths, question, top_k=top_k, mode=mode, logger=log)
+    fetch = top_k * _ANSWER_FETCH_MULTIPLIER
+    while True:
+        pool = semantic_search(paths, question, top_k=fetch, mode=mode, logger=log)
+        hits = [
+            h for h in pool
+            if not (_is_vault_note(h) and h.source_relative_path.startswith(ANSWERS_DIR))
+        ][:top_k]
+        if len(hits) == top_k or len(pool) < fetch:
+            break
+        fetch *= 2
     if not hits:
         log.warning(
             "ask: no search results — has the index been built? "
@@ -115,9 +140,92 @@ def ask(
     )
 
 
+def save_answer(paths: VaultPaths, question: str, result: AnswerResult, *, today: date) -> Path:
+    """Write ``result`` to ``knowledge/notes/answers/<today>-<slug>.md``
+    (``-2``, ``-3``… on collision) and return the path.
+
+    ``## Sources`` keeps one entry per hit in ``[n]`` order, so the answer's
+    citations resolve; frontmatter ``sources`` is the deduped path list.
+    Question and answer are redacted before anything reaches disk."""
+    question = redact_secrets(question, profile="note")[0].strip()
+    answer = redact_secrets(result.answer, profile="note")[0].strip()
+    records = latest_records_by_path(paths.metadata_index_jsonl)
+
+    source_paths: list[str] = []
+    entries: list[str] = []
+    for i, hit in enumerate(result.sources, start=1):
+        rel = hit.source_relative_path
+        if _is_vault_note(hit):
+            path, link = rel, note_wikilink(rel)
+        else:
+            rec = records.get(rel)
+            path = f"archive/raw/{rel}"
+            link = index_note_wikilink(rec) if rec else f"`{path}`"
+        if path not in source_paths:
+            source_paths.append(path)
+        entries.append(f"{i}. {link}")
+
+    frontmatter = [
+        f"title: {fm_scalar(question)}",
+        "type: answer",
+        "generated_by: ask",
+        "author: script:ask",
+        "written_via: script",
+        f"created: {today.isoformat()}",
+        f"provider: {fm_scalar(result.provider)}",
+        f"model: {fm_scalar(result.model)}",
+        f"sources: {fm_list(source_paths)}",
+    ]
+    text = (
+        "---\n" + "\n".join(frontmatter) + "\n---\n\n"
+        f"## Question\n\n{question}\n\n"
+        f"## Answer\n\n{answer}\n\n"
+        "## Sources\n\n" + "\n".join(entries) + "\n"
+    )
+
+    stem = f"{today.isoformat()}-{slugify(question)[:_SLUG_MAX].rstrip('-') or 'answer'}"
+    return _create_new(paths.root / ANSWERS_DIR, stem, text)
+
+
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------
+
+def _is_vault_note(hit: SearchHit) -> bool:
+    """Classify by ``origin``, not by path prefix: a file dropped at
+    ``inbox/knowledge/x.pdf`` is labelled ``knowledge/x.pdf`` but is an
+    archived source. Rows indexed before ``origin`` existed carry an empty
+    one and fall back to the prefix (as mcp_server/tools_read.py does)."""
+    return hit.origin == KNOWLEDGE_EXTRACTOR or (
+        not hit.origin and hit.source_relative_path.startswith("knowledge/")
+    )
+
+
+def _create_new(directory: Path, stem: str, text: str) -> Path:
+    """Write ``text`` to ``<stem>.md`` (``-2``, ``-3``… when taken) without
+    ever replacing an existing file. The content is staged and fsynced in a
+    temp file, then hard-linked into place: ``os.link`` fails if the name
+    exists, so a racing save moves on to the next suffix instead of
+    overwriting, and the note never appears half-written."""
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".note-", suffix=".md", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        n = 1
+        target = directory / f"{stem}.md"
+        while True:
+            try:
+                os.link(tmp, target)
+                return target
+            except FileExistsError:
+                n += 1
+                target = directory / f"{stem}-{n}.md"
+    finally:
+        os.unlink(tmp)
+
 
 def _format_context(hits: list[SearchHit]) -> str:
     blocks = []

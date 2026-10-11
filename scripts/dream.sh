@@ -87,6 +87,14 @@ report_runner_exit() {
     fi
 }
 
+# One pass at a time: a manual /dream-pass takes the same lock (skill step 0).
+if ! "$ROOT/scripts/dream_lock.sh" acquire scheduled >>"$LOG" 2>&1; then
+    echo "[dream] skip: another dream pass holds the lock" >>"$LOG"
+    echo "[dream] done" >>"$LOG"
+    exit 0
+fi
+trap '"$ROOT/scripts/dream_lock.sh" release scheduled >>"$LOG" 2>&1' EXIT
+
 echo "[dream $TS] gate check" >>"$LOG"
 if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
     echo "[dream] gate passed — launching runner: $RUNNER (timeout: ${TIMEOUT_BIN:-none} ${TIMEOUT_SECS}s)" >>"$LOG"
@@ -130,7 +138,7 @@ if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
                 "Read(//etc/shadow)" "Read(//etc/ssh/**)"
             )
 
-            run_capped claude -p "/dream-pass" \
+            run_capped claude -p "/dream-pass --scheduled" \
                 --allowedTools \
                     "mcp__brain__vault_read" \
                     "mcp__brain__vault_search" \
@@ -148,7 +156,7 @@ if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
             report_runner_exit claude $?
             ;;
         codex)
-            run_capped codex exec "Read .claude/skills/dream-pass/SKILL.md in this repo and execute the dream pass exactly as written." \
+            run_capped codex exec "Read .claude/skills/dream-pass/SKILL.md in this repo and execute the dream pass exactly as written, with the argument --scheduled." \
                 >>"$LOG" 2>&1
             report_runner_exit codex $?
             ;;

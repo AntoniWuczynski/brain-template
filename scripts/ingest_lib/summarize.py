@@ -354,20 +354,25 @@ def generate_structured(
     schema: type[BaseModel],
     max_tokens: int = _MAX_TOKENS,
     logger: logging.Logger | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> BaseModel | None:
     """Provider-agnostic structured generation for any Pydantic ``schema``.
 
     Reuses the same provider selection + dispatch as the summarizer, so any
     feature (e.g. concept descriptions) gets the four-backend support for
     free. Returns ``None`` when no provider is configured or the call fails.
+    An explicit ``provider`` (and ``model``) bypasses the summarizer's own
+    selection and its ``BRAIN_SKIP_SUMMARY`` gate: the caller resolved them.
     """
     log = logger or logging.getLogger(__name__)
-    if not is_enabled():
-        return None
-    provider = _select_provider()
     if provider is None:
-        return None
-    model = _select_model(provider)
+        if not is_enabled():
+            return None
+        provider = _select_provider()
+        if provider is None:
+            return None
+    model = model or _select_model(provider)
     try:
         parsed, _notes = _call_provider(
             provider=provider, model=model, system=system, user=user,

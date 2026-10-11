@@ -4,7 +4,7 @@ This is the recipe for running `mcp_server/` on a Linux box you control, as **us
 
 Three decisions this doc assumes:
 
-- **Ingestion stays on the Mac (or wherever your working clone lives) — always, not just at first.** MinerU, faster-whisper, the vision extractors and their multi-GB weights never run on the server. `pull.py`/`ingest.py` keep running there against the Obsidian working clone; the server only ever *serves* the vault (the 18 MCP tools) and runs the maintenance/dream passes over what's already there. That is the whole reason the install below needs no ML stack.
+- **Ingestion stays on the Mac (or wherever your working clone lives) — always, not just at first.** MinerU, faster-whisper, the vision extractors and their multi-GB weights never run on the server. `pull.py`/`ingest.py` keep running there against the Obsidian working clone; the server only ever *serves* the vault (the 21 MCP tools) and runs the maintenance/dream passes over what's already there. That is the whole reason the install below needs no ML stack.
 - **One unit set, user-scoped.** All three scheduled units (`brain-mcp`, `brain-maintenance`, `brain-dream`) are `systemd --user` units under `~/services/brain` — a plain user account, no `sudo`, no `/srv`, no `/etc/brain-mcp`, no dedicated system user.
 - **No extraction stack on the server, but embeddings YES.** MinerU, whisper and the vision extractors stay on the Mac with ingestion. The embedding model does run here, because `memory_search` and the dense half of `vault_search` are the server's whole job. The lockfile's Linux `torch` is the CUDA build (several GB of `nvidia-*` libraries for a box with no GPU), so the default install below excludes those and adds a CPU-only torch; the fully locked alternative and the lexical-only fallback are spelled out beside it (AUD-125 tracks locking the CPU build).
 
@@ -142,6 +142,15 @@ systemctl --user status brain-mcp
 
 `brain-dream.service` runs the `claude` CLI itself (subscription auth — see `scripts/dream.sh`), which needs your normal `~/.claude` config and credentials, so — unlike `brain-mcp.service` — neither it nor `brain-maintenance.service` is filesystem-sandboxed with `ProtectHome`/`ProtectSystem`; see the comments in those two unit files for why that line was drawn where it was. `brain-mcp.service` doesn't need that latitude (its I/O surface is just the vault, the git push, and — with the optional ML stack — a model load), so it keeps the tighter hardening.
 
+`brain-maintenance` also writes the concept syntheses (`ingest.py --describe-concepts --min-sources 3 --limit 50`), and it is the only machine that does, so leave `BRAIN_AUTO_DESCRIBE` unset on the Mac. The LLM key stays out of the server's `.env`: `scripts/maintain.sh` loads `.env.ingest` for that one step through `ingest.py --env-file`, which reads it literally rather than as shell, and skips the step when the file is missing or sets no `BRAIN_DESCRIBE_PROVIDER`. Name both the provider and the model there, plus that provider's key:
+
+```bash
+# ~/services/brain/.env.ingest
+BRAIN_DESCRIBE_PROVIDER=anthropic
+BRAIN_DESCRIBE_MODEL=<model id>
+ANTHROPIC_API_KEY=...
+```
+
 `active (running)` means you're past the local part:
 
 ```bash
@@ -212,11 +221,11 @@ uv run --no-sync python scripts/mcp_probe.py \
 ```
 mcp-probe: [ok] health: 200
 mcp-probe: [ok] mcp_initialize: 200
-mcp-probe: [ok] tools_list: 18 tools
+mcp-probe: [ok] tools_list: 21 tools
 mcp-probe: [ok] token:claude-code: 200
 mcp-probe: [ok] token:codex: 200
 mcp-probe: [ok] token:claude-ai: 200
-mcp-probe: server exposes 18 tool(s)
+mcp-probe: server exposes 21 tool(s)
 ```
 
 A `[FAIL]` line names exactly which check broke rather than hiding it behind an overall failure — a single bad token doesn't hide a genuinely down server, and vice versa.
@@ -261,6 +270,14 @@ launchctl bootout gui/$(id -u)/com.brain.maintenance
 ```
 
 **`~/brain` on the Mac stays** as the Obsidian working clone — you edit notes there by hand, `git pull` picks up the server's commits, and anything you push is absorbed by the server's pull-before-write on its next tool call (AUD-122). Ingestion (`scripts/ingest.py`, `scripts/pull.py`) also keeps running from this same Mac clone — that's the whole point of IMP-028: the Mac is the only machine with the sources (Granola/justREC exports, `~/.claude/projects` transcripts, the MinerU weights), so it stays the only machine that ingests, indefinitely, not just until the server is stable.
+
+A manual `/dream-pass` run from this clone must not overlap the server's scheduled pass. Both take one lock on the server (`scripts/dream_lock.sh`), so set the server's ssh name in the Mac clone's `.env`:
+
+```bash
+echo 'BRAIN_DREAM_LOCK_HOST=homeserver' >> ~/brain/.env   # your ssh alias for the server
+```
+
+The server's own `.env` leaves it unset, so `dream.sh` locks locally. A pass that finds the lock held stops and says which run holds it. A lock older than two hours belongs to a run that died and is broken by the next pass.
 
 ## 9. Updating the server later
 

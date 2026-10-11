@@ -13,7 +13,7 @@ import functools
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import ParamSpec, TypeVar
+from typing import Literal, ParamSpec, TypeVar
 
 import anyio
 
@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
+from . import decision_tools as _decision_tools
 from . import entity_tools as _entity_tools
 from . import memory_tools as _memory_tools
 from . import tools as _tools
@@ -250,7 +251,8 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         university,meetings,assistant}. Refuses to overwrite an existing note
         — vault_append_to_note extends one, vault_replace_note rewrites one
         in full. knowledge/assistant/PROFILE.md is excluded — it is
-        byte-budgeted, write it through profile_update.
+        byte-budgeted, write it through profile_update — and so is every
+        <slug>/decisions/ folder: decision_record and decision_resolve own it.
 
         Choose the area by what the note is about, not by which client wrote
         it (AGENTS.md, "Where a note lives"): knowledge/projects/<slug>/ for a
@@ -262,9 +264,11 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
         name derived from the title, never a directory or chat-project id.
 
         A project (or chat) is not limited to its <slug>/<slug>.md overview
-        and log/<date>.md entries: when a durable decision, design, artefact
-        or sub-topic deserves its own home, create a focused curated note flat
-        beside the overview (<slug>/<descriptive-kebab-name>.md). Put notes
+        and log/<date>.md entries: when a design, artefact or sub-topic
+        deserves its own home, create a focused curated note flat beside the
+        overview (<slug>/<descriptive-kebab-name>.md). A durable decision goes
+        through decision_record instead (status 'proposed' while it is not
+        final), never a curated note. Put notes
         that span several projects under knowledge/projects/shared/ and link
         each project with a related_to relation. Give such notes topics: and
         relations: frontmatter so they join the concept and relation graph. Do
@@ -401,6 +405,62 @@ def _register_tools(mcp: FastMCP, cfg: ServerConfig, runtime: Runtime) -> None:
             _entity_tools.tool_meeting_create, cfg, runtime,
             date=date, title=title, attendees=attendees,
             project=project, body=body,
+        )
+
+    @mcp.tool()
+    async def decision_record(
+        project: str,
+        title: str,
+        context: str,
+        decision: str,
+        consequences: str = "",
+        alternatives: str = "",
+        status: Literal["accepted", "proposed"] = "accepted",
+        supersedes: int | None = None,
+        date: str | None = None,
+    ) -> _tools.WriteResult:
+        """Record a durable project decision as a numbered decision record at
+        knowledge/{projects,chats}/<slug>/decisions/<NNNN>-<title-slug>.md
+        (NNNN = the project's next number). ``project`` is the project node
+        id ('projects/<slug>/<slug>' or 'chats/<slug>/<slug>'; the short
+        'projects/<slug>' works too) whose overview must exist. ``title`` is
+        one line, at most 120 characters. ``context`` (why it came up) and
+        ``decision`` (what was decided) are required Markdown;
+        ``consequences`` and ``alternatives`` are optional. ``status`` is
+        'accepted' (default) or 'proposed' when it is not final yet — settle
+        a proposal later with decision_resolve. ``supersedes`` is the number
+        of an ACCEPTED decision in the same project that this one replaces:
+        it is marked superseded and both records are committed together.
+        ``date`` (YYYY-MM-DD, default today UTC) is when the record is
+        made, and also its ``decided`` date when status is 'accepted' (a
+        proposal's decided date is stamped later by decision_resolve).
+        Accepted records are immutable: the general note verbs refuse
+        decisions/, so a change of mind is a new superseding record."""
+        return await _offload(
+            _decision_tools.tool_decision_record, cfg, runtime,
+            project=project, title=title, context=context, decision=decision,
+            consequences=consequences, alternatives=alternatives,
+            status=status, supersedes=supersedes, date=date,
+        )
+
+    @mcp.tool()
+    async def decision_resolve(
+        path: str,
+        status: Literal["accepted", "rejected"],
+        decision: str | None = None,
+        consequences: str | None = None,
+        date: str | None = None,
+    ) -> _tools.WriteResult:
+        """Settle a 'proposed' decision record (``path``, e.g.
+        'knowledge/projects/brain/decisions/0007-use-bases.md') as
+        'accepted' or 'rejected', stamping ``date`` (YYYY-MM-DD, default
+        today UTC) as when it was decided. ``decision`` / ``consequences``
+        optionally replace those sections with the final text. Refuses a
+        record that is not proposed."""
+        return await _offload(
+            _decision_tools.tool_decision_resolve, cfg, runtime,
+            path=path, status=status, decision=decision,
+            consequences=consequences, date=date,
         )
 
     @mcp.tool()

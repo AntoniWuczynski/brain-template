@@ -14,16 +14,19 @@ to a user-visible MCP error. Stack traces never reach the agent.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .config import (
     CONCEPT_WRITE_PREFIX,
     DENY_READ_NAMES,
     DENY_READ_PREFIXES,
+    PROFILE_NOTE_PATH,
     READ_ALLOW_PREFIXES,
     READ_ALLOW_ROOT_FILES,
     WRITE_ALLOW_PREFIXES,
 )
+from .errors import ToolError
 
 
 class SafetyError(Exception):
@@ -126,6 +129,47 @@ def resolve_write_under_allowlist(vault_root: Path, rel: str) -> Path:
         f"write denied: path must live under one of {list(WRITE_ALLOW_PREFIXES)}, "
         f"got {posix!r}"
     )
+
+
+# A project's or chat's decisions/ folder itself or any file under it,
+# casefolded. Wider than ingest_lib.decisions.DECISION_PATH_RE on purpose: a
+# misnamed file in that folder is still not the general verbs' to write, and
+# a file named ``decisions`` would block every later decision_record.
+_DECISIONS_DIR_RE = re.compile(r"^knowledge/(?:projects|chats)/[^/]+/decisions(?:/|$)")
+
+
+def is_profile_path(rel: str) -> bool:
+    """Casefolded PROFILE.md test. On a case-insensitive FS (macOS APFS —
+    the live deployment) ``Path.resolve()`` preserves the requested casing,
+    so ``knowledge/assistant/profile.md`` opens the real PROFILE.md while an
+    exact-case compare misses it — the same bypass resolve_read already
+    casefolds its DENY checks against."""
+    return rel.casefold() == PROFILE_NOTE_PATH.casefold()
+
+
+def refuse_protected_path(rel: str) -> None:
+    """The one gate every general write verb (create/replace/append,
+    compiled truth, entity_append_fact, entity_upsert_relation) runs on its
+    resolved vault-relative path. Two notes sit inside the write allowlist
+    but have a dedicated door the general verbs would bypass:
+
+    - the assistant PROFILE, byte-budgeted and forced to
+      ``memory_status: consolidated`` by profile_update;
+    - decision records under ``<project>/decisions/``, numbered and
+      immutable once accepted — they change only through decision_record
+      (which supersedes) and decision_resolve (which settles a proposal).
+    """
+    if is_profile_path(rel):
+        raise ToolError(
+            f"{PROFILE_NOTE_PATH} is byte-budgeted; use profile_update "
+            "(the general note verbs would bypass the budget)"
+        )
+    if _DECISIONS_DIR_RE.match(rel.casefold()):
+        raise ToolError(
+            f"{rel!r} is a decision record; write decisions only through "
+            "decision_record (a new or superseding decision) or "
+            "decision_resolve (settle a proposed one)"
+        )
 
 
 def resolve_write_concept(vault_root: Path, slug: str) -> Path:
