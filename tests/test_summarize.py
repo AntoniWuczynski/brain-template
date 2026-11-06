@@ -10,7 +10,7 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2
 import pytest
 from pydantic import BaseModel
 
@@ -167,7 +167,7 @@ def _api_error(message: str) -> Exception:
     import anthropic
 
     return anthropic.APIError(
-        message, httpx.Request("POST", "https://api.anthropic.test/v1/messages"),
+        message, httpx2.Request("POST", "https://api.anthropic.test/v1/messages"),
         body=None,
     )
 
