@@ -1,21 +1,18 @@
 filters:
   and:
-    - 'file.inFolder("knowledge/index")'
-    - 'type == "source_note"'
+    - file.inFolder("knowledge/index")
+    - type == "source_note"
     - not:
-        - 'file.inFolder("knowledge/index/templates")'
-        - 'file.basename == "Note Template"'
-
+        - file.inFolder("knowledge/index/templates")
+        - file.basename == "Note Template"
 formulas:
-  created_month: 'if(created, created.toString().slice(0, 7), "")'
-
+  created_month: if(created, created.toString().slice(0, 7), "")
 properties:
   formula.created_month:
     displayName: Month
-
 views:
   - type: table
-    name: "Recent sources"
+    name: Recent sources
     groupBy:
       property: formula.created_month
       direction: DESC

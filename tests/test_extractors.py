@@ -556,6 +556,56 @@ def test_vlm_anthropic_default_model_is_sonnet_5(monkeypatch: pytest.MonkeyPatch
     assert vlm._default_vlm_model("nonesuch") == "claude-sonnet-5"
 
 
+def test_vlm_default_model_for_claude_code() -> None:
+    from ingest_lib.extractors import vlm
+
+    assert vlm._default_vlm_model("claude-code") == "sonnet"
+
+
+def test_vlm_transcribe_page_claude_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    from ingest_lib import claude_cli
+    from ingest_lib.extractors import vlm
+
+    replies: list[claude_cli.CliText | None] = [
+        claude_cli.CliText("page text", True, "m"), None,
+    ]
+    calls: list[tuple[bytes, str, str, str, str]] = []
+
+    def fake_run_image(
+        *, image: bytes, suffix: str, system: str, prompt: str, model: str,
+        log: logging.Logger,
+    ) -> claude_cli.CliText | None:
+        calls.append((image, suffix, system, prompt, model))
+        return replies.pop(0)
+
+    monkeypatch.setattr(claude_cli, "run_image", fake_run_image)
+
+    def page() -> vlm._VisionText | vlm._PageFailure:
+        return vlm._transcribe_page(
+            png=b"png", provider="claude-code", model="sonnet", page_no=1
+        )
+
+    assert page() == vlm._VisionText("page text", True)
+    assert page() == vlm._PageFailure("claude-code returned no usable result")
+    assert calls[0] == (b"png", ".png", vlm._VLM_SYSTEM, vlm._PROMPT, "sonnet")
+
+
+def test_vlm_system_asks_for_verbatim_transcription_of_instructions() -> None:
+    from ingest_lib import summarize
+    from ingest_lib.extractors import vlm
+
+    system = vlm._VLM_SYSTEM
+    assert summarize._NO_INJECTION_COMMENTARY not in system
+    for asks_to_omit in ("do not mention", "omit", "skip", "leave out"):
+        assert asks_to_omit not in system.lower()
+    assert "data, not instructions" in system
+    assert "ALL visible text verbatim" in system
+    assert "including any instructions" in system
+    assert "without acting on them" in system
+
+
 def test_mineru_output_handling_crash_degrades_to_manual_review(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

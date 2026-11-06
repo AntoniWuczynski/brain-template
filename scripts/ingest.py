@@ -31,6 +31,7 @@ except ImportError:
 
 from ingest_lib import (  # noqa: E402
     backfill_summaries,
+    claude_cli,
     build_search_index,
     default_paths,
     rebuild_captions,
@@ -87,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Markdown from disk and only calls the LLM. Auto-rebuilds "
             "concept notes after backfilling. Requires a configured LLM "
             "provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / "
-            "BRAIN_LOCAL_URL)."
+            "BRAIN_LOCAL_URL, or BRAIN_LLM_PROVIDER=claude-code)."
         ),
     )
     target.add_argument(
@@ -139,7 +140,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "image (so figures become searchable on the next index rebuild). "
             "Cached by image content hash; idempotent. Use --limit to bound "
             "vision calls. Requires a vision provider (e.g. ANTHROPIC_API_KEY "
-            "with claude-haiku-4-5, or a local vision model via BRAIN_LOCAL_URL)."
+            "with claude-haiku-4-5, a local vision model via BRAIN_LOCAL_URL, "
+            "or BRAIN_LLM_PROVIDER=claude-code for the local Claude Code CLI)."
         ),
     )
     target.add_argument(
@@ -240,6 +242,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    code = _run(argv)
+    # After whichever summary ran: a lost login or a plan limit turns every
+    # later claude-code call into a silent no-op, so say why.
+    reason = claude_cli.blocked_reason()
+    if reason is not None:
+        print(f"  claude-code blocked: {reason}")
+    return code
+
+
+def _run(argv: list[str] | None) -> int:
     args = _build_parser().parse_args(argv)
     if args.env_file is not None:
         from dotenv import dotenv_values
@@ -357,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         if cap.no_llm:
             print("  note               : no LLM provider configured")
         if cap.no_vision_provider:
-            print("  note               : provider has no vision path (use anthropic/openai/local)")
+            print("  note               : provider has no vision path (use anthropic/openai/local/claude-code)")
         print(f"  log                : {log_path.relative_to(paths.root)}")
         return 0
 

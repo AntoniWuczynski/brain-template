@@ -290,9 +290,9 @@ concept centroids read the embeddings).
 
 ## LLM provider for the summarizer
 
-The summarizer dispatches to one of four providers, selected by
+The summarizer dispatches to one of five providers, selected by
 ``BRAIN_LLM_PROVIDER`` env var (or auto-detected from whichever API
-key is set):
+key is set; `claude-code` is never auto-detected):
 
 | Provider | Env var | Default model |
 |---|---|---|
@@ -300,12 +300,52 @@ key is set):
 | `openai` | `OPENAI_API_KEY` | `gpt-5-mini` |
 | `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `gemini-2.5-flash` |
 | `local` | `BRAIN_LOCAL_URL` + `BRAIN_LOCAL_MODEL` | `llama3.1:8b` (via `BRAIN_LOCAL_MODEL`) |
+| `claude-code` | `BRAIN_LLM_PROVIDER=claude-code` (no key) | `sonnet` (the CLI's alias for the latest Sonnet) |
 
 The model name can be overridden with `BRAIN_LLM_MODEL`. The `local`
 provider uses the OpenAI SDK with a custom `base_url`, so anything
 that speaks the OpenAI Chat Completions API works: Ollama (≥0.5 for
 structured outputs), LM Studio, llama.cpp's server, vLLM. Same Pydantic
-schema across all four providers, so behaviour is consistent.
+schema across all five providers, so behaviour is consistent.
+
+### claude-code (the local Claude Code CLI)
+
+`BRAIN_LLM_PROVIDER=claude-code` runs the LLM features on a Claude
+subscription through the local Claude Code CLI (`claude -p`), with no API
+key: log in once with `claude`, and every call uses that login.
+`scripts/ingest_lib/claude_cli.py` runs each call locked down:
+
+- no tools for summaries, ask and concept descriptions (structured output
+  goes through `--json-schema`), and only `Read`, confined to one image
+  copied into an empty temporary folder, for vision;
+- no settings files, hooks, MCP servers, slash commands, CLAUDE.md files,
+  auto memory or saved session, and `dontAsk` permissions;
+- a child environment built from an allowlist (`HOME`, `PATH`, locale,
+  proxy and CA variables, `CLAUDE_CODE_OAUTH_TOKEN`), so an
+  `ANTHROPIC_API_KEY` in `.env` never reaches it and usage stays on the
+  subscription;
+- the document on stdin only, never in the command line or system prompt.
+
+The CLI's `stream-json` transcript is checked before the answer is used:
+an unexpected tool in its init event, a tool call outside the profile, an
+MCP server, an API key in use, an error result or a malformed line fails
+the call closed with one `claude-code:` warning. A lost login or a plan
+limit ("You've hit your session limit") stops every later call in the
+run without starting another process, and `ingest.py` names the reason
+in its summary (`claude-code blocked: ...`). A transient throttle does
+not.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `BRAIN_CLAUDE_CLI_BIN` | `claude` on `PATH` | Path to the `claude` binary (launchd and systemd PATHs often miss it). A path that is not an executable file logs one warning and falls back to `PATH`. |
+| `BRAIN_CLAUDE_CLI_TIMEOUT` | `600` | Seconds before a call is killed and counted as failed. |
+
+`BRAIN_LLM_MODEL` overrides the `sonnet` alias. There is no output-token
+cap and no fallback model: the alias already runs on a 1M window, so a
+document that still does not fit (or exceeds the CLI's 10 MB stdin cap) is
+a plain failure with the honest placeholder, never truncated. Query
+expansion (`BRAIN_QUERY_EXPANSION`) is not supported under `claude-code`:
+it runs on every MCP search and would start a CLI process each time.
 
 ### Oversized documents (anthropic)
 
@@ -321,7 +361,7 @@ as a `400 prompt is too long`. On exactly that error the call is retried
 
 The retry is triggered by the API's own error, not by a character-count
 guess (a character estimate is wrong by a factor of several for slides,
-code and CJK text), and it is **anthropic-only** — the other three
+code and CJK text), and it is **anthropic-only** — the other four
 providers have their own model lineups, limits and error wording, so they
 keep reporting the failure honestly instead. When it fires, the note
 records which model actually did the work:
@@ -730,6 +770,7 @@ for one invocation — handy for tests and replays. `dream_gate.py` also takes
 | `BRAIN_DREAM_PAIRS` | 10 | Candidate connection pairs included in the packet |
 | `BRAIN_DREAM_MAX_TURNS` | 50 | Turn cap passed to the headless session |
 | `BRAIN_DREAM_RUNNER` | `claude` | `claude` \| `codex` \| `noop` — which runner `dream.sh` launches |
+| `BRAIN_DREAM_LOCKDOWN` | `1` | `1` launches the `claude` runner through `scripts/dream_launch.py`, the locked-down profile below; `0` runs it unlocked |
 | `BRAIN_DREAM_LOCK_HOST` | unset | ssh name of the machine the scheduled pass runs on, set only in a working clone whose vault is served elsewhere (read from the environment or `.env`) |
 | `BRAIN_DREAM_LOCK_STALE` | 7200 | Seconds after which a held run lock counts as left by a dead run |
 
@@ -755,6 +796,61 @@ the holder.
   `StartCalendarInterval` 05:00 — a full hour after `com.brain.maintenance`'s
   04:00, so consolidate and sweep have finished before the LLM dreams over
   their output.
+
+#### Locked-down launch (`BRAIN_DREAM_LOCKDOWN=1`, the default)
+
+Unlocked (`BRAIN_DREAM_LOCKDOWN=0`), the `claude` runner inherits the user's whole Claude Code setup:
+their permission mode (so `--allowedTools` is not the boundary), every user
+MCP server and claude.ai connector, plugins, hooks, auto memory and, under
+systemd, the full `.env` as its environment. The default runs it
+through `scripts/dream_launch.py --max-turns N` instead, which starts
+`claude -p "/dream-pass --scheduled"` in the vault with:
+
+- only project settings (`--setting-sources project`, so the `/dream-pass`
+  skill and the vault's CLAUDE.md load), hooks off, and no saved session;
+- only the `brain` MCP server, copied from `~/.claude.json` (user scope, else
+  the vault's local scope) into a 0600 temporary config that is removed on
+  exit. Without a `brain` entry it exits 2 and refuses to run unlocked;
+- the built-in tools `Read`, `Grep`, `Glob`, `Write` and `Bash`, `dontAsk`
+  permissions, and allow rules for the six vault tools the skill uses, edits
+  under `~/.cache/brain-dream/` (created or tightened to 0700) and the two
+  `dream_gate.py` command forms. The same credential-path deny list as the
+  unlocked runner applies (it covers `~/.claude.json` and `~/.brain-mcp-token`
+  too), and the file tools cannot read outside the vault and the scratch folder;
+- Bash inside Claude Code's sandbox: `.env` and `.env.*` at the vault root
+  and the temporary MCP config folder are unreadable (plus a best-effort
+  `/proc/*/environ` deny, see below), no network domain is
+  allowed, there is no unsandboxed retry, and the session refuses to start if
+  the sandbox is unavailable. On Linux the sandbox needs `bubblewrap` and
+  `socat` installed;
+- an allowlisted environment with no API keys (so usage stays on the
+  subscription login), plus `BRAIN_DREAM_THRESHOLD`, `BRAIN_DREAM_STALE_DAYS`
+  and `BRAIN_DREAM_PAIRS` when set, which the session's own gate calls read.
+  The allowlist keeps `CLAUDE_CODE_OAUTH_TOKEN` for `claude` itself, and
+  Bash inherits the session's environment, so a `sandbox.credentials.envVars`
+  `deny` entry naming the variable removes it from every sandboxed command.
+  That entry strips the value from the Bash environment only.
+  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is deliberately not set: on Claude Code
+  2.1.318 it forces the permission mode to `default`, which the init check
+  below rejects. So Bash on Linux also misses the scrub's isolated PID
+  namespace, which keeps commands from reading `claude`'s own environment
+  through `/proc`. The control relied on there is the permission layer:
+  under `dontAsk` with `blockReadsOutsideWorkingDirectories`, a command
+  reading `/proc/<pid>/environ` reads outside the working folders and is
+  denied. The sandbox's `/proc/*/environ` read deny is an extra layer only.
+  A live macOS launch (no `/proc`) confirmed the sandbox still starts with
+  it, but nothing has checked on Linux that bubblewrap applies it.
+
+The launcher copies the stream-json output into the dream log and checks the
+session's `system/init` event first: any other tool set, a second MCP server
+or a non-brain MCP tool, a `brain` server whose status is not `connected`, a
+permission mode other than `dontAsk`, an API key in use or loaded auto memory
+stops the session with exit 3. `claude` is found as
+for the `claude-code` provider (`BRAIN_CLAUDE_CLI_BIN`, else `PATH`; exit 127
+without one). It stays in `dream.sh`'s process group, so the wall-clock
+timeout reaches it, and it forwards SIGTERM and SIGINT to the session,
+ignoring any further one while it waits for the session to exit.
+`DREAM_LOCKDOWN_DEFAULT` at the top of `dream.sh` sets the default.
 
 Codex is a first-class alternate runner (`codex exec` reading the same skill
 document, no Claude-only constructs in the procedure):
@@ -1049,7 +1145,7 @@ Each run builds on the last one rather than starting over.
   it explicitly, let `maintain.sh` run it nightly, or set
   `BRAIN_AUTO_DESCRIBE=1` (never on a machine whose vault the server
   describes, or two models keep rewriting the same zones).
-- **Model.** The summarizer's four-backend router (`BRAIN_LLM_PROVIDER` /
+- **Model.** The summarizer's five-backend router (`BRAIN_LLM_PROVIDER` /
   auto-detected key) unless `BRAIN_DESCRIBE_PROVIDER` / `BRAIN_DESCRIBE_MODEL`
   override it. A provider that differs from the summarizer's needs
   `BRAIN_DESCRIBE_MODEL` too, or describe is disabled with a warning.
@@ -1067,8 +1163,10 @@ beneath the image, so figures show up in Obsidian and — crucially — get
 embedded on the next `--rebuild-search-index`, becoming searchable.
 
 - **Vision provider.** `anthropic` (`claude-haiku-4-5`, vision-capable),
-  `openai`, or a local OpenAI-compatible vision model via `BRAIN_LOCAL_URL`.
-  Same provider selection as the summarizer.
+  `openai`, a local OpenAI-compatible vision model via `BRAIN_LOCAL_URL`, or
+  `claude-code` (`sonnet`, through the local Claude Code CLI with only `Read`,
+  confined to a copy of the one image). Same provider selection as the
+  summarizer.
 - **Cached + idempotent.** Each caption carries a `<!-- caption: <hash> -->`
   marker keyed on the image's content hash; re-runs don't re-caption. A durable
   cache (`metadata/captions.jsonl`, gitignored) means a caption is paid for once
@@ -1150,8 +1248,9 @@ unreadable bits — it is prompted to **never invent** content). The
 rendered page image is kept as an asset so the original stays viewable.
 
 - Provider/model reuse the summarizer's config (`BRAIN_LLM_PROVIDER`,
-  keys). Vision model defaults to `claude-sonnet-5`; override with
-  `BRAIN_VLM_MODEL`. Render resolution via `BRAIN_VLM_SCALE` (default 2.0).
+  keys). Vision model defaults to `claude-sonnet-5` (`sonnet` under
+  `claude-code`); override with `BRAIN_VLM_MODEL`. Render resolution via
+  `BRAIN_VLM_SCALE` (default 2.0).
 - Cost is ~one vision call per page (~cents). Set the env var only for
   handwritten modules — leave it unset so printed material keeps using
   MinerU.
@@ -1307,9 +1406,9 @@ purpose: raw is immutable.
 ## What this script will not do
 
 - It will not caption or transcribe a standalone image or handwritten PDF
-  without a vision LLM configured (an API key, or `BRAIN_LOCAL_URL` for a
-  local model) — with none configured it's marked `manual_review`, never
-  described from nothing.
+  without a vision LLM configured (an API key, `BRAIN_LOCAL_URL` for a
+  local model, or `BRAIN_LLM_PROVIDER=claude-code`) — with none configured
+  it's marked `manual_review`, never described from nothing.
 - It will not generate "summaries" for content it could not extract.
 - It will not modify files in `archive/raw/` or `inbox/`.
 - It will not delete or rename the user's hand-written notes.

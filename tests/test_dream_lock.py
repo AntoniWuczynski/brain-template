@@ -95,11 +95,11 @@ def test_lock_host_runs_the_script_over_ssh(tmp_path: Path) -> None:
     fake = bin_dir / "ssh"
     fake.write_text(f'#!/bin/sh\necho "$1" >> "{calls}"\nshift\nexec sh -c "$*"\n')
     fake.chmod(0o755)
-    env = _env(tmp_path, BRAIN_DREAM_LOCK_HOST="homeserver", PATH=f"{bin_dir}:{os.environ['PATH']}")
+    env = _env(tmp_path, BRAIN_DREAM_LOCK_HOST="vault-server", PATH=f"{bin_dir}:{os.environ['PATH']}")
     assert _run(["acquire", "manual"], env).returncode == 0
     assert (tmp_path / "run.lock" / "owner").read_text().split()[0] == "manual"
     assert _run(["release", "manual"], env).returncode == 0
-    assert calls.read_text().split() == ["homeserver", "homeserver"]
+    assert calls.read_text().split() == ["vault-server", "vault-server"]
 
 
 def test_lock_host_is_read_from_the_repo_env_file(tmp_path: Path) -> None:
@@ -109,7 +109,7 @@ def test_lock_host_is_read_from_the_repo_env_file(tmp_path: Path) -> None:
     (repo / "scripts").mkdir(parents=True)
     script = repo / "scripts/dream_lock.sh"
     script.write_text(_SCRIPT.read_text())
-    (repo / ".env").write_text('OTHER=1\nBRAIN_DREAM_LOCK_HOST="homeserver"\n')
+    (repo / ".env").write_text('OTHER=1\nBRAIN_DREAM_LOCK_HOST="vault-server"\n')
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     calls = tmp_path / "ssh-calls"
@@ -119,7 +119,7 @@ def test_lock_host_is_read_from_the_repo_env_file(tmp_path: Path) -> None:
     env = _env(tmp_path, PATH=f"{bin_dir}:{os.environ['PATH']}")
     del env["BRAIN_DREAM_LOCK_HOST"]
     assert _run(["acquire", "manual"], env, script=script).returncode == 0
-    assert calls.read_text().split() == ["homeserver"]
+    assert calls.read_text().split() == ["vault-server"]
 
 
 def test_dream_sh_and_the_skill_share_the_lock() -> None:

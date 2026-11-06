@@ -7,7 +7,7 @@ If you want to improve the framework itself, PRs are welcome.
 ## Good fits for a PR
 
 - **New extractors** in `scripts/ingest_lib/extractors/`. The pattern is in `README.md` → "Extending". Roughly: write a function with signature `extract(src: Path, assets_dir: Path) -> ExtractionResult`, register it against the file extensions it handles, done.
-- **New LLM providers** in `scripts/ingest_lib/summarize.py` (and `chat.py`). Add another `_call_<provider>` and update `_select_provider()` / `_DEFAULT_MODELS`.
+- **New LLM providers**: add a branch at each dispatch point — `_call_provider` in `scripts/ingest_lib/summarize.py`, `_call_chat` in `chat.py`, `caption_image` in `caption.py` and `_transcribe_page` in `extractors/vlm.py` — and update `_select_provider()` / `_DEFAULT_MODELS`.
 - **Bug fixes** in any of the ingest, concept, semantic, or chat modules.
 - **Performance improvements** — faster chunking, smaller embedding model with comparable quality, parallelism in the ingest loop, etc.
 - **Documentation fixes.** If something tripped you up, fix it.

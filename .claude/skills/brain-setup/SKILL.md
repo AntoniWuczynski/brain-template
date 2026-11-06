@@ -62,7 +62,8 @@ accurate plan:
 - `.venv/` present and `uv run python --version` → 3.12.x?
 - `.env` present? Does it name a provider or a key (grep for a non-empty
   `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` /
-  `BRAIN_LOCAL_URL`)? **Never print key values** — check presence only.
+  `BRAIN_LOCAL_URL` / `BRAIN_LLM_PROVIDER`)? **Never print key values** — check
+  presence only.
 - `command -v mineru` — is full PDF extraction available?
 - `~/.brain-mcp-token` present and `claude mcp list` showing `brain`? — is the
   MCP server already set up?
@@ -97,6 +98,11 @@ the person which they want:
 - **gemini** (`GOOGLE_API_KEY` or `GEMINI_API_KEY`, `gemini-2.5-flash`)
 - **local** — any OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM)
   via `BRAIN_LOCAL_URL` + `BRAIN_LOCAL_MODEL`. Free and offline.
+- **claude-code** — the local Claude Code CLI on their Claude subscription, no
+  API key (`BRAIN_LLM_PROVIDER=claude-code`, model `sonnet`). Needs `claude`
+  installed (`command -v claude`) and logged in once interactively. Never
+  auto-detected, so set it explicitly. Calls run locked down and count against
+  the subscription's usage limits; query expansion is not supported.
 - **none for now** — set `BRAIN_SKIP_SUMMARY=1`; they can add a key later.
 
 Then:

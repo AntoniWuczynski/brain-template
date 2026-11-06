@@ -2,7 +2,7 @@
 """Ask the vault a question and get a citation-backed answer.
 
 Combines the semantic-search index with whatever LLM provider is
-configured (anthropic / openai / gemini / local) and returns a
+configured (anthropic / openai / gemini / local / claude-code) and returns a
 concise answer with bracketed citations.
 
 Examples:
@@ -38,6 +38,7 @@ except ImportError:
 
 from ingest_lib import ask, default_paths  # noqa: E402
 from ingest_lib.chat import save_answer  # noqa: E402
+from ingest_lib.summarize import _VALID_PROVIDERS  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -60,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "gemini", "local"],
+        choices=sorted(_VALID_PROVIDERS),
         default=None,
         help="Override BRAIN_LLM_PROVIDER for this call.",
     )

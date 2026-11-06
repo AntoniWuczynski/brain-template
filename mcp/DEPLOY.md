@@ -274,7 +274,7 @@ launchctl bootout gui/$(id -u)/com.brain.maintenance
 A manual `/dream-pass` run from this clone must not overlap the server's scheduled pass. Both take one lock on the server (`scripts/dream_lock.sh`), so set the server's ssh name in the Mac clone's `.env`:
 
 ```bash
-echo 'BRAIN_DREAM_LOCK_HOST=homeserver' >> ~/brain/.env   # your ssh alias for the server
+echo 'BRAIN_DREAM_LOCK_HOST=vault-server' >> ~/brain/.env   # your ssh alias for the server
 ```
 
 The server's own `.env` leaves it unset, so `dream.sh` locks locally. A pass that finds the lock held stops and says which run holds it. A lock older than two hours belongs to a run that died and is broken by the next pass.

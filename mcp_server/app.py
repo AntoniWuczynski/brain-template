@@ -34,6 +34,7 @@ from .runtime import Runtime, build_runtime
 # .tools_read above executes its sys.path shim as a side effect. Reused here
 # rather than duplicated so the two capability checks below (MinerU, vision)
 # can't drift from what the extractors themselves actually check.
+from ingest_lib import claude_cli as _claude_cli  # noqa: E402
 from ingest_lib import summarize as _summarize  # noqa: E402
 from ingest_lib.extractors.pdf import mineru_available as _mineru_available  # noqa: E402
 
@@ -53,8 +54,11 @@ def unavailable_extractor_families() -> tuple[str, ...]:
         import faster_whisper  # noqa: F401
     except ImportError:
         missing.append("whisper (audio transcription: faster-whisper not installed)")
-    if _summarize._select_provider() is None:
+    provider = _summarize._select_provider()
+    if provider is None:
         missing.append("vision (image/handwriting transcription: no LLM provider configured)")
+    elif provider == _claude_cli.PROVIDER and _claude_cli.cli_binary() is None:
+        missing.append("vision (image/handwriting transcription: claude CLI not found on PATH)")
     return tuple(missing)
 
 # Generic parameters for _offload (defined in _register_tools below): the

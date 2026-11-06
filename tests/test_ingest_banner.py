@@ -20,6 +20,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import ingest  # noqa: E402
+from ingest_lib import claude_cli  # noqa: E402
 from ingest_lib.config import VaultPaths, paths_for_root  # noqa: E402
 from ingest_lib.extractors import pdf as pdf_extractor  # noqa: E402
 
@@ -103,3 +104,16 @@ def test_main_logs_mineru_available_without_a_warning(
     assert "INFO    MinerU: available" in log
     assert "MinerU: unavailable" not in log
     assert "  MinerU        : available" in capsys.readouterr().out
+
+
+def test_ingest_summary_names_blocked_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A plan limit or lost login mid-batch makes every later claude-code call
+    a silent no-op, so the run summary has to say why summaries are missing."""
+    _tmp_vault(tmp_path, monkeypatch)
+    monkeypatch.setattr(claude_cli, "_blocked", "Claude plan limit reached (test)")
+
+    assert ingest.main(["--dry-run", "--inbox"]) == 0
+
+    assert "claude-code blocked: Claude plan limit reached (test)" in capsys.readouterr().out

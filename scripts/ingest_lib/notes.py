@@ -441,8 +441,8 @@ def _summary_block(content: NoteContent) -> str:
         return "_(extraction was incomplete; see Processing notes)_"
     return (
         "_(no auto-summary — configure an LLM provider (ANTHROPIC_API_KEY / "
-        "OPENAI_API_KEY / GOOGLE_API_KEY / BRAIN_LOCAL_URL) to enable, or "
-        "write one here.)_"
+        "OPENAI_API_KEY / GOOGLE_API_KEY / BRAIN_LOCAL_URL, or "
+        "BRAIN_LLM_PROVIDER=claude-code) to enable, or write one here.)_"
     )
 
 

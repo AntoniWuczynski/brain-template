@@ -651,7 +651,8 @@ def backfill_summaries(
         logger.error(
             "summarization is disabled — configure an LLM provider "
             "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / "
-            "BRAIN_LOCAL_URL; see scripts/README.md) and unset "
+            "BRAIN_LOCAL_URL, or BRAIN_LLM_PROVIDER=claude-code; see "
+            "scripts/README.md) and unset "
             "BRAIN_SKIP_SUMMARY — nothing to do"
         )
         return stats

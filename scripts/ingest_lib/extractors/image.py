@@ -97,7 +97,8 @@ def extract(src: Path, _assets_dir: Path) -> ExtractionResult:
             extractor="image-vlm",
             markdown="",
             error="image: no vision LLM provider configured (set ANTHROPIC_API_KEY "
-            "or BRAIN_LLM_PROVIDER)",
+            "or BRAIN_LLM_PROVIDER, e.g. BRAIN_LLM_PROVIDER=claude-code for the "
+            "local Claude Code CLI)",
         )
 
     import os

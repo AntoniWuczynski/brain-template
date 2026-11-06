@@ -23,6 +23,7 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ContentBlock
 
+from ingest_lib import claude_cli as _claude_cli
 from ingest_lib import summarize as _summarize
 from mcp_server import app as _app
 from mcp_server.app import _register_tools, build_app, unavailable_extractor_families
@@ -40,6 +41,7 @@ from mcp_server.runtime import Runtime, build_runtime
 _LLM_PROVIDER_ENV = (
     "BRAIN_LLM_PROVIDER", "BRAIN_SKIP_SUMMARY", "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "BRAIN_LOCAL_URL",
+    "BRAIN_CLAUDE_CLI_BIN", "BRAIN_CLAUDE_CLI_TIMEOUT",
 )
 
 
@@ -257,6 +259,21 @@ def test_unavailable_extractor_families_vision_available_even_with_skip_summary(
     fake_module = type(sys)("faster_whisper")
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_module)
 
+    assert unavailable_extractor_families() == ()
+
+
+def test_vision_diagnostic_without_claude_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_app, "_mineru_available", lambda: True)
+    monkeypatch.setattr(_summarize, "_select_provider", lambda: "claude-code")
+    fake_module = type(sys)("faster_whisper")
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_module)
+
+    monkeypatch.setattr(_claude_cli, "cli_binary", lambda: None)
+    missing = unavailable_extractor_families()
+    assert len(missing) == 1
+    assert "vision" in missing[0] and "claude CLI not found on PATH" in missing[0]
+
+    monkeypatch.setattr(_claude_cli, "cli_binary", lambda: "/stub/claude")
     assert unavailable_extractor_families() == ()
 
 
