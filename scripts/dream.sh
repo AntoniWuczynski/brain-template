@@ -8,6 +8,7 @@
 #   BRAIN_DREAM_RUNNER=noop scripts/dream.sh  # gate only (testing)
 #   BRAIN_DREAM_RUNNER=codex scripts/dream.sh # alternate runner
 #   BRAIN_DREAM_TIMEOUT=1800 scripts/dream.sh # wall-clock cap, seconds
+#   BRAIN_DREAM_LOCKDOWN=0 scripts/dream.sh   # claude without scripts/dream_launch.py
 #
 # Scheduling: mcp_server/launchd/com.brain.dream.plist (05:00 daily —
 # deliberately an hour after com.brain.maintenance so consolidate/sweep
@@ -38,15 +39,22 @@ mkdir -p "$ROOT/logs"
 # in a world-writable directory is somebody else's to plant. Created here
 # so the session never needs a shell to make it.
 SCRATCH="$HOME/.cache/brain-dream"
-mkdir -p "$SCRATCH"
+mkdir -p -m 700 "$SCRATCH"
+chmod 700 "$SCRATCH"  # mkdir -m leaves an existing folder's mode alone
 
-run_py() {
-    if [ -x "$ROOT/.venv/bin/python" ]; then
-        "$ROOT/.venv/bin/python" "$@"
-    else
-        uv run --no-sync python "$@"
-    fi
-}
+# An array, not just a function: run_capped execs through timeout, which
+# cannot run a bash function.
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    PY_CMD=("$ROOT/.venv/bin/python")
+else
+    PY_CMD=(uv run --no-sync python)
+fi
+run_py() { "${PY_CMD[@]}" "$@"; }
+
+# 1 runs the claude runner through scripts/dream_launch.py (locked down: only
+# the brain MCP server, dontAsk, sandboxed Bash, no API keys in the env).
+# BRAIN_DREAM_LOCKDOWN overrides this default either way.
+DREAM_LOCKDOWN_DEFAULT=1
 
 RUNNER="${BRAIN_DREAM_RUNNER:-claude}"
 MAX_TURNS="${BRAIN_DREAM_MAX_TURNS:-50}"
@@ -87,68 +95,88 @@ report_runner_exit() {
     fi
 }
 
+# One pass at a time: a manual /dream-pass takes the same lock (skill step 0).
+if ! "$ROOT/scripts/dream_lock.sh" acquire scheduled >>"$LOG" 2>&1; then
+    echo "[dream] skip: another dream pass holds the lock" >>"$LOG"
+    echo "[dream] done" >>"$LOG"
+    exit 0
+fi
+trap '"$ROOT/scripts/dream_lock.sh" release scheduled >>"$LOG" 2>&1' EXIT
+
 echo "[dream $TS] gate check" >>"$LOG"
 if run_py scripts/dream_gate.py >>"$LOG" 2>&1; then
     echo "[dream] gate passed — launching runner: $RUNNER (timeout: ${TIMEOUT_BIN:-none} ${TIMEOUT_SECS}s)" >>"$LOG"
     case "$RUNNER" in
         claude)
-            # Exactly the tools .claude/skills/dream-pass/SKILL.md uses, named
-            # one by one. The brain-wildcard this replaces also handed the
-            # session the relation-upsert, profile-update, fact-append and
-            # inbox-drop tools, none of which this pass may touch: it
-            # PROPOSES graph changes, it never applies them. Replacing whole
-            # notes IS needed — step 5 replaces a digest, step 8 merges an
-            # entity note, step 9 rewrites questions.md — but it is not how
-            # compiled truth is written; that tool splices between the
-            # markers and cannot eat a hand-written section.
-            # Both spellings of the scratch path — home-relative and
-            # absolute ("//" + the expanded $HOME) — because a Write rule
-            # that fails to match is a step 7 that silently cannot run, and
-            # a silent step 7 is exactly the defect this list is fixing.
-            # Credential paths the pass must never read (security review
-            # 2026-09-18, finding F1). Unrestricted Read/Grep/Glob let a
-            # planted note steer the session into reading a key or a token
-            # and republishing it through the allowed vault_create_note,
-            # which commits and pushes.
-            #
-            # This is a DENY list, not a scoped allow list, because scoping
-            # --allowedTools does not restrict Read at all: Read is already
-            # permitted, and --allowedTools only ADDS permissions. Verified
-            # empirically on 2026-09-18 — an enumerated allow list still
-            # read .env and ~/.ssh/known_hosts with zero denials, while
-            # these deny rules refuse both ("File is in a directory that is
-            # denied by your permission settings").
-            #
-            # .env is named FIRST because on the server it lives at the repo
-            # root (~/services/brain/.env), i.e. inside the vault the pass
-            # legitimately reads. ~/.claude holds the CLI's own OAuth
-            # credentials, so it is denied to the CLI itself.
-            DREAM_DENY_RULES=(
-                "Read(.env)" "Read(.env.*)"
-                "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
-                "Read(~/.claude/**)" "Read(~/.config/**)"
-                "Read(//etc/shadow)" "Read(//etc/ssh/**)"
-            )
+            if [ "${BRAIN_DREAM_LOCKDOWN:-$DREAM_LOCKDOWN_DEFAULT}" = "1" ]; then
+                run_capped "${PY_CMD[@]}" scripts/dream_launch.py --max-turns "$MAX_TURNS" >>"$LOG" 2>&1
+                report_runner_exit claude $?
+            else
+                # Unlocked opt-out: this inherits the user's permission mode, MCP
+                # servers, plugins, hooks and environment.
+                #
+                # Exactly the tools .claude/skills/dream-pass/SKILL.md uses, named
+                # one by one. The brain-wildcard this replaces also handed the
+                # session the relation-upsert, profile-update, fact-append and
+                # inbox-drop tools, none of which this pass may touch: it
+                # PROPOSES graph changes, it never applies them. Replacing whole
+                # notes IS needed — step 5 replaces a digest, step 8 merges an
+                # entity note, step 9 rewrites questions.md — but it is not how
+                # compiled truth is written; that tool splices between the
+                # markers and cannot eat a hand-written section.
+                # Both spellings of the scratch path — home-relative and
+                # absolute ("//" + the expanded $HOME) — because a rule that
+                # fails to match is a step 7 that silently cannot run, and a
+                # silent step 7 is exactly the defect this list is fixing. They
+                # are Edit rules: Edit covers writes, and a Write(...) rule
+                # never matches anything.
+                # Credential paths the pass must never read (security review
+                # 2026-09-18, finding F1). Unrestricted Read/Grep/Glob let a
+                # planted note steer the session into reading a key or a token
+                # and republishing it through the allowed vault_create_note,
+                # which commits and pushes.
+                #
+                # This is a DENY list, not a scoped allow list, because scoping
+                # --allowedTools does not restrict Read at all: Read is already
+                # permitted, and --allowedTools only ADDS permissions. Verified
+                # empirically on 2026-09-18 — an enumerated allow list still
+                # read .env and ~/.ssh/known_hosts with zero denials, while
+                # these deny rules refuse both ("File is in a directory that is
+                # denied by your permission settings").
+                #
+                # .env is named FIRST because on the server it lives at the repo
+                # root (~/services/brain/.env), i.e. inside the vault the pass
+                # legitimately reads. ~/.claude holds the CLI's own OAuth
+                # credentials, so it is denied to the CLI itself.
+                DREAM_DENY_RULES=(
+                    "Read(.env)" "Read(.env.*)"
+                    "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
+                    "Read(~/.claude/**)" "Read(~/.config/**)"
+                    "Read(//etc/shadow)" "Read(//etc/ssh/**)"
+                    "Read(~/.claude.json)" "Read(~/.brain-mcp-token)"
+                )
 
-            run_capped claude -p "/dream-pass" \
-                --allowedTools \
-                    "mcp__brain__vault_read" \
-                    "mcp__brain__vault_search" \
-                    "mcp__brain__vault_related" \
-                    "mcp__brain__vault_create_note" \
-                    "mcp__brain__vault_replace_note" \
-                    "mcp__brain__vault_update_compiled_truth" \
-                    "Read" "Grep" "Glob" \
-                    "Write(~/.cache/brain-dream/**)" \
-                    "Write(/$SCRATCH/**)" \
-                    "Bash(uv run --no-sync python scripts/dream_gate.py*)" \
-                    "Bash(.venv/bin/python scripts/dream_gate.py*)" \
-                --disallowedTools "${DREAM_DENY_RULES[@]}" \
-                --max-turns "$MAX_TURNS" >>"$LOG" 2>&1
-            report_runner_exit claude $?
+                run_capped claude -p "/dream-pass --scheduled" \
+                    --allowedTools \
+                        "mcp__brain__vault_read" \
+                        "mcp__brain__vault_search" \
+                        "mcp__brain__vault_related" \
+                        "mcp__brain__vault_create_note" \
+                        "mcp__brain__vault_replace_note" \
+                        "mcp__brain__vault_update_compiled_truth" \
+                        "Read" "Grep" "Glob" \
+                        "Edit(~/.cache/brain-dream/**)" \
+                        "Edit(/$SCRATCH/**)" \
+                        "Bash(uv run --no-sync python scripts/dream_gate.py*)" \
+                        "Bash(.venv/bin/python scripts/dream_gate.py*)" \
+                    --disallowedTools "${DREAM_DENY_RULES[@]}" \
+                    --no-session-persistence \
+                    --max-turns "$MAX_TURNS" >>"$LOG" 2>&1
+                report_runner_exit claude $?
+            fi
             ;;
         codex)
-            run_capped codex exec "Read .claude/skills/dream-pass/SKILL.md in this repo and execute the dream pass exactly as written." \
+            run_capped codex exec "Read .claude/skills/dream-pass/SKILL.md in this repo and execute the dream pass exactly as written, with the argument --scheduled." \
                 >>"$LOG" 2>&1
             report_runner_exit codex $?
             ;;

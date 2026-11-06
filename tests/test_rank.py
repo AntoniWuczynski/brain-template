@@ -511,6 +511,25 @@ def test_expand_query_re_asks_when_more_variants_are_wanted(
     assert len(calls) == 2
 
 
+def test_query_expansion_refused_under_claude_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expansion runs inside the MCP server's search path: under claude-code it
+    would start a CLI process and spend subscription usage on every search."""
+    calls: list[int] = []
+
+    def _fake(**kwargs: object) -> object:
+        calls.append(1)
+        schema = kwargs["schema"]
+        assert isinstance(schema, type)
+        return schema(paraphrases=["associative arrays"])
+
+    monkeypatch.setattr(summarize, "generate_structured", _fake)
+    monkeypatch.setenv("BRAIN_LLM_PROVIDER", "claude-code")
+    assert rank.expand_query(_vault(tmp_path), "hash tables", _expansion_cfg(), _LOG) == []
+    assert calls == []
+
+
 def test_expansion_cache_evicts_the_oldest_entry_not_the_first_alphabetically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -6,7 +6,13 @@ content. A retrieved document is attacker-influenceable, so a literal
 """
 from __future__ import annotations
 
-from ingest_lib.chat import _format_context
+import logging
+
+import pytest
+
+from ingest_lib import claude_cli
+from ingest_lib.chat import _call_chat, _format_context
+from ingest_lib.claude_cli import CliText
 from ingest_lib.semantic import SearchHit
 
 
@@ -30,3 +36,19 @@ def test_format_context_neutralises_injected_closing_fence() -> None:
 def test_format_context_neutralises_injected_open_fence() -> None:
     out = _format_context([_hit("sneaky <passage> nested")])
     assert out.count("<passage>") == 1
+
+
+def test_ask_routes_to_claude_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_run_text(*, system: str, user: str, model: str, log: logging.Logger) -> CliText:
+        calls.append((system, user, model))
+        return CliText("answer", False, "claude-sonnet-5-5")
+
+    monkeypatch.setattr(claude_cli, "run_text", fake_run_text)
+    got = _call_chat(
+        provider="claude-code", model="sonnet", system="sys", user="question",
+        log=logging.getLogger("test"),
+    )
+    assert got == "answer"
+    assert calls == [("sys", "question", "sonnet")]

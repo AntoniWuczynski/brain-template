@@ -17,6 +17,7 @@ write path in the server behaves identically.
 """
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import datetime, UTC
 from pathlib import Path
@@ -30,6 +31,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from ingest_lib import paths_for_root as _paths_for_root  # noqa: E402
+from ingest_lib.atomic import atomic_write_bytes  # noqa: E402
 from ingest_lib.concepts import slugify as _slugify  # noqa: E402
 from ingest_lib.relations import (  # noqa: E402
     RELATION_VOCAB,
@@ -47,7 +49,7 @@ from . import tools as _tools
 from . import tools_read as _tools_read
 from .config import MAX_NOTE_BYTES, ServerConfig
 from .errors import ToolError
-from .git_ops import CommitOutcome
+from .git_ops import CommitOutcome, GitError, reset_paths
 from .identity import current_agent
 from .provenance import stamp_provenance
 from .runtime import Runtime
@@ -56,8 +58,10 @@ from .runtime import Runtime
 # same way): existence checks on caller-supplied node ids MUST go through
 # the traversal/symlink/control-character gauntlet, or a target like
 # ``people/../../secret`` would probe paths outside the vault.
-from .safety import _resolve_inside_vault, resolve_write_under_allowlist
+from .safety import _resolve_inside_vault, refuse_protected_path, resolve_write_under_allowlist
 from .tools import WriteResult
+
+log = logging.getLogger(__name__)
 
 # Cap on one fact line. Facts are meant to be distilled single sentences;
 # anything longer belongs in a note body, not the log.
@@ -125,10 +129,9 @@ def _resolve_existing_entity(cfg: ServerConfig, entity_path: str) -> tuple[Path,
     rel_path = resolved.relative_to(cfg.vault_root).as_posix()
     if not rel_path.endswith(".md"):
         raise ToolError(f"entity_path must be a Markdown note (.md), got {entity_path!r}")
-    # PROFILE.md is byte-budgeted and written only through profile_update;
-    # the entity verbs (append_fact / upsert_relation) would otherwise grow
-    # or mutate it past the budget, so refuse it here too.
-    _tools._refuse_if_profile(rel_path)
+    # PROFILE.md (byte-budgeted) and decision records (immutable once
+    # accepted) have their own doors; the entity verbs would bypass them.
+    refuse_protected_path(rel_path)
     if not resolved.is_file():
         raise ToolError(
             f"entity note does not exist: {entity_path!r} — "
@@ -461,18 +464,70 @@ def _meeting_note_text(
 
 
 def _finish_multi_write(
-    runtime: Runtime, *, rels: list[str], outcome: CommitOutcome
+    runtime: Runtime, *, rels: list[str], outcome: CommitOutcome, graph_changed: bool
 ) -> tuple[str, str]:
     """``tools._finish_write`` for a multi-note commit: one push request,
-    one reindex enqueue per written note. Every touched note changed its
-    relations, so the whole batch is graph-relevant."""
+    one reindex enqueue per written note."""
     if not outcome.committed:
         return "skipped", "skipped"
     push_state = runtime.push_worker.request_push()
     index_refresh = "skipped"
     for rel in rels:
-        index_refresh = runtime.refresher.enqueue(rel, graph_changed=True)
+        index_refresh = runtime.refresher.enqueue(rel, graph_changed=graph_changed)
     return push_state, index_refresh
+
+
+def _write_all_or_nothing(
+    cfg: ServerConfig, writes: list[tuple[Path, str]], message: str
+) -> CommitOutcome:
+    """Write every ``(path, text)`` and land them in ONE commit, or leave
+    the vault exactly as it was.
+
+    Any failure — a write refused mid-way (``refuse_if_head_moved``), or a
+    commit that did not happen — restores each touched note's original
+    bytes, deletes the notes this call created, and unstages them all
+    (``commit_paths`` has already run ``git add``). Then it raises: a
+    half-written batch would be a lie no later write repairs, and a staged
+    leftover blocks maintain.sh and vault_sync. Call it under the write
+    lock, with every text already validated and computed."""
+    originals: list[tuple[Path, bytes | None]] = []
+    try:
+        for path, text in writes:
+            try:
+                originals.append((path, path.read_bytes() if path.exists() else None))
+            except OSError:
+                raise ToolError("note could not be read") from None
+            _tools._atomic_write_text(path, text)
+        outcome = _tools._commit(cfg, [path for path, _text in writes], message)
+    except BaseException:
+        _roll_back(cfg, originals)
+        raise
+    if outcome.committed is False:
+        _roll_back(cfg, originals)
+        raise ToolError(
+            f"commit failed ({outcome.detail}); every file was restored, "
+            "nothing was written — retry later"
+        )
+    return outcome
+
+
+def _roll_back(cfg: ServerConfig, originals: list[tuple[Path, bytes | None]]) -> None:
+    """Best effort: one failed restore must not stop the others. Restores
+    bypass ``_atomic_write_bytes`` on purpose — its HEAD guard may be the
+    very refusal being rolled back, and these bytes are the ones already
+    on disk, so they need no redaction."""
+    for path, data in originals:
+        try:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_bytes(path, data, prefix=f".{path.name}.", suffix=".tmp")
+        except OSError as exc:
+            log.warning("rollback could not restore %s: %s", path.name, exc)
+    try:
+        reset_paths(cfg.vault_root, paths=[path for path, _data in originals])
+    except GitError as exc:
+        log.warning("rollback could not unstage: %s", exc)
 
 
 def tool_meeting_create(
@@ -603,18 +658,16 @@ def tool_meeting_create(
                                      memory_area=False, prior=text),
                 ))
             # Pass 2 — all inputs validated and transformed; now write.
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            _tools._atomic_write_text(resolved, meeting_text)
-            for note_abs, stamped in pending:
-                _tools._atomic_write_text(note_abs, stamped)
             touched = [resolved, *(p for p, _text in pending)]
-            outcome = _tools._commit(
-                cfg, touched, _tools._commit_message(agent, f"meeting {date}-{slug}")
+            outcome = _write_all_or_nothing(
+                cfg, [(resolved, meeting_text), *pending],
+                _tools._commit_message(agent, f"meeting {date}-{slug}"),
             )
+        # Every touched note changed its relations: graph-relevant.
         push_state, index_refresh = _finish_multi_write(
             runtime,
             rels=[p.relative_to(cfg.vault_root).as_posix() for p in touched],
-            outcome=outcome,
+            outcome=outcome, graph_changed=True,
         )
         return _tools._write_result(
             rel_path, len(meeting_text.encode()), outcome,

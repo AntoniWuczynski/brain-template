@@ -78,20 +78,39 @@ treat a red run as a real failure, not noise.
   removed in 4.57), so every PDF silently falls back to pypdf and lands as
   `partial`. `transformers==4.53.3` is pinned in `pyproject.toml` for this.
   See `scripts/README.md` for the full explanation.
-- **LLM provider for summarizer**: four backends behind one router in
+- **LLM provider for summarizer**: five backends behind one router in
   `scripts/ingest_lib/summarize.py` — `anthropic` (default,
   `claude-haiku-4-5`), `openai` (`gpt-5-mini`), `gemini`
-  (`gemini-2.5-flash`), and `local` (any OpenAI-compatible server via
-  `BRAIN_LOCAL_URL`). Selected by `BRAIN_LLM_PROVIDER` or auto-detected
-  from whichever key is set. Same `DocSummary` Pydantic schema across
-  all four. Documents are sent in full and never truncated, so a source
-  larger than `claude-haiku-4-5`'s 200K window fails with a `400 prompt
-  is too long`; on that error alone the anthropic path retries once on a
-  1M-context model (`BRAIN_LLM_FALLBACK_MODEL`, default
-  `claude-sonnet-5`) and records the retry in the note's processing
-  notes.
+  (`gemini-2.5-flash`), `local` (any OpenAI-compatible server via
+  `BRAIN_LOCAL_URL`), and `claude-code` (`sonnet`, the local Claude Code
+  CLI on a Claude subscription login, no API key). Selected by
+  `BRAIN_LLM_PROVIDER` or auto-detected from whichever key is set;
+  `claude-code` is explicit only, never auto-detected. Same `DocSummary`
+  Pydantic schema across all five. Documents are sent in full and never
+  truncated, so a source larger than `claude-haiku-4-5`'s 200K window
+  fails with a `400 prompt is too long`; on that error alone the
+  anthropic path retries once on a 1M-context model
+  (`BRAIN_LLM_FALLBACK_MODEL`, default `claude-sonnet-5`) and records the
+  retry in the note's processing notes. `claude-code` has no fallback
+  model (its alias already runs on a 1M window), and
+  `scripts/ingest_lib/claude_cli.py` runs every call locked down: no
+  tools (the image profile gets only `Read`, confined to one copied
+  image), no settings, hooks, MCP servers or saved session, an
+  allowlisted environment with no API keys, the document on stdin only,
+  and any drift in the CLI's init event fails the call closed. Query
+  expansion (`BRAIN_QUERY_EXPANSION`) is not supported under
+  `claude-code`.
+- **Concept descriptions** (`ingest.py --describe-concepts`): use the
+  summarizer's provider and model unless `BRAIN_DESCRIBE_PROVIDER` /
+  `BRAIN_DESCRIBE_MODEL` override them. A provider that differs from the
+  summarizer's needs its model named too, or describe is disabled with a
+  warning (no silent default model). `BRAIN_SKIP_SUMMARY` does not disable
+  describe. On a served vault only `scripts/maintain.sh` on the server
+  describes, with these keys in `.env.ingest`, so `BRAIN_AUTO_DESCRIBE`
+  stays unset everywhere else.
 - **Vision model**: `scripts/ingest_lib/extractors/vlm.py` defaults to
-  `claude-sonnet-5` for anthropic; override with `BRAIN_VLM_MODEL`.
+  `claude-sonnet-5` for anthropic and `sonnet` for claude-code; override
+  with `BRAIN_VLM_MODEL`.
 - **PDF extractor**: MinerU (package `mineru`, CLI invoked as a
   subprocess) — wraps PaddleOCR's PP-Structure for layout, PaddleOCR
   for text OCR, UniMerNet for formulas; outputs Markdown + extracted

@@ -7,12 +7,17 @@ caption upsert.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
-from ingest_lib.caption import _append_caption, image_refs, image_sha256, upsert_caption
+from ingest_lib import claude_cli
+from ingest_lib.caption import (
+    _CAPTION_PROMPT, _CAPTION_SYSTEM, _VISION_PROVIDERS, _append_caption,
+    caption_image, image_refs, image_sha256, upsert_caption,
+)
 from ingest_lib.config import VaultPaths
 
 _MD = (
@@ -127,3 +132,60 @@ def test_append_caption_interrupted_create_leaves_no_temp_file(
         _append_caption(paths, "aaa", "first", "m")
 
     assert list((tmp_path / "metadata").iterdir()) == []
+
+
+def test_claude_code_is_a_vision_provider() -> None:
+    assert "claude-code" in _VISION_PROVIDERS
+
+
+def test_caption_image_routes_to_claude_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    img = tmp_path / "fig.png"
+    img.write_bytes(b"\x89PNG fake figure bytes")
+    monkeypatch.setenv("BRAIN_LLM_PROVIDER", "claude-code")
+    monkeypatch.delenv("BRAIN_LLM_MODEL", raising=False)
+    calls: list[tuple[bytes, str, str, str, str]] = []
+
+    def fake_run_image(
+        *, image: bytes, suffix: str, system: str, prompt: str, model: str,
+        log: logging.Logger,
+    ) -> claude_cli.CliText | None:
+        calls.append((image, suffix, system, prompt, model))
+        return claude_cli.CliText("A bar chart", False, "m")
+
+    monkeypatch.setattr(claude_cli, "run_image", fake_run_image)
+
+    assert caption_image(img) == "A bar chart"
+    assert calls == [
+        (img.read_bytes(), ".png", _CAPTION_SYSTEM, _CAPTION_PROMPT, "sonnet")
+    ]
+
+
+def test_rebuild_captions_skips_refs_outside_archive_processed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ingest_lib import caption as caption_mod
+
+    paths = _vault(tmp_path)
+    paths.archive_processed.mkdir(parents=True)
+    outside = tmp_path / "private_assets"
+    outside.mkdir()
+    (outside / "secret.png").write_bytes(b"\x89PNG" + b"x" * 5000)
+    (paths.archive_processed / "doc.md").write_text(
+        "![](../../private_assets/secret.png)\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("BRAIN_LLM_PROVIDER", "claude-code")
+    calls: list[Path] = []
+
+    def fake_caption_image(path: Path, *, logger: logging.Logger | None = None) -> str:
+        calls.append(path)
+        return "leaked"
+
+    monkeypatch.setattr(caption_mod, "caption_image", fake_caption_image)
+
+    stats = caption_mod.rebuild_captions(paths, logger=logging.getLogger("t"), min_bytes=1)
+
+    assert calls == []
+    assert stats.captioned == 0
+    assert stats.skipped_missing == 1

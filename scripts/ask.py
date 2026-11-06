@@ -2,7 +2,7 @@
 """Ask the vault a question and get a citation-backed answer.
 
 Combines the semantic-search index with whatever LLM provider is
-configured (anthropic / openai / gemini / local) and returns a
+configured (anthropic / openai / gemini / local / claude-code) and returns a
 concise answer with bracketed citations.
 
 Examples:
@@ -10,16 +10,19 @@ Examples:
     uv run python scripts/ask.py "what does my vault say about TCP congestion control?"
     uv run python scripts/ask.py --top-k 12 "how does my vault treat BDD?"
     uv run python scripts/ask.py --provider local --model gemma4:31b "..."
+    uv run python scripts/ask.py --save "..."
 
 The index must already exist (built by every ingest, or by
-``scripts/ingest.py --rebuild-search-index``). This script does not
-write anything to disk.
+``scripts/ingest.py --rebuild-search-index``). Nothing is written to disk
+unless ``--save`` is given: it stores the answer under
+``knowledge/notes/answers/`` (searchable after the next full index rebuild).
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 
 # Make ``ingest_lib`` importable when running this file directly.
@@ -34,6 +37,8 @@ except ImportError:
     pass
 
 from ingest_lib import ask, default_paths  # noqa: E402
+from ingest_lib.chat import save_answer  # noqa: E402
+from ingest_lib.summarize import _VALID_PROVIDERS  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -56,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "gemini", "local"],
+        choices=sorted(_VALID_PROVIDERS),
         default=None,
         help="Override BRAIN_LLM_PROVIDER for this call.",
     )
@@ -70,7 +75,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Don't print the model / provider line at the end.",
     )
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="Also save the answer as a note under knowledge/notes/answers/.",
+    )
     return p
+
+
+def _today() -> date:
+    return date.today()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -100,6 +114,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print()
         print(f"— {result.provider}/{result.model}")
+    if args.save:
+        if not result.sources:
+            print("brain-ask: not saving an answer with no sources", file=sys.stderr)
+            return 1
+        saved = save_answer(paths, args.question, result, today=_today())
+        print()
+        print(f"Saved: {saved.relative_to(paths.root).as_posix()}")
     return 0
 
 

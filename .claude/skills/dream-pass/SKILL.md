@@ -9,7 +9,8 @@ description: >-
   last dream. Requires the brain MCP server (mcp__brain__*
   tools) and must run with the vault repo as the working directory.
   Arguments: --dry-run (plan only), --force (dream even if the gate says
-  skip), --deep (fan out subagents per job).
+  skip), --deep (fan out subagents per job), --scheduled (set by
+  scripts/dream.sh, which already holds the run lock).
 ---
 
 # dream-pass
@@ -75,10 +76,22 @@ it cannot settle alone, and surface open questions. The design contract is
 
 ## Procedure
 
-1. **Gate.** Run `uv run --no-sync python scripts/dream_gate.py --dry-run`
-   (or `.venv/bin/python scripts/dream_gate.py --dry-run`). Exit 1 and no
-   `--force` argument → reply "dream gate: not enough new information" and
-   stop. Exit 2 → report the git error and stop.
+0. **Lock.** Skip this step for `--dry-run`, and for `--scheduled`
+   (`scripts/dream.sh` passes it and already holds the lock). Otherwise run
+   `scripts/dream_lock.sh acquire manual`. Exit 1 means another dream pass,
+   scheduled or manual, is running: reply with its output and stop. Any other
+   non-zero exit (the lock host unreachable over ssh, say) means the lock
+   state is unknown: report the output and stop too. Once you
+   hold the lock, every way this run ends, the early stops in steps 1 and 3
+   included, finishes with `scripts/dream_lock.sh release manual`.
+1. **Gate.** Run `.venv/bin/python scripts/dream_gate.py --dry-run` (or
+   `uv run --no-sync python scripts/dream_gate.py --dry-run` when the vault
+   has no `.venv`; the scheduled run's sandbox blocks uv's cache) and use the
+   same interpreter for every later `dream_gate.py` call. Run it bare, with nothing
+   appended (no `;`, `&&` or `echo $?`): the Bash tool result already reports
+   the exit status. Exit 1 and no `--force` argument → reply "dream gate:
+   not enough new information" and stop. Exit 2 → report the git error and
+   stop.
    Always `--dry-run` here: same verdict, same exit codes, but it records
    no `metadata/dream.pending` marker. Only `scripts/dream.sh` stamps that
    marker (it is the stall signal for scheduled runs) and only
@@ -128,6 +141,15 @@ it cannot settle alone, and surface open questions. The design contract is
    `relations_changed` means the open relations themselves differ from
    the last dream — a relation that was CLOSED adds no bullet anywhere,
    and a block still asserting it is exactly what this job exists to fix.
+
+   A project (`projects/<slug>/<slug>` or `chats/<slug>/<slug>`) also has
+   decision records under `knowledge/<area>/<slug>/decisions/` (Glob
+   `decisions/*.md` in that folder, then read them). Its compiled truth
+   states the project's current decisions: the records with
+   `status: accepted` only. Never state a `superseded` record as current
+   (its `superseded_by` names the one that replaced it), and never state a
+   `proposed` or `rejected` record as decided. Link each accepted record
+   by its wikilink. The records themselves are never yours to edit.
 
    The block goes between these two markers, and nowhere else:
 
@@ -255,10 +277,10 @@ it cannot settle alone, and surface open questions. The design contract is
    still be present in the text you send, or the write is refused
    (AGENTS.md "supersede, never delete"). So: carry the existing
    `relations:` block and the whole `## Log` section through unchanged,
-   and never close or retire a relation by deleting it — set
-   `valid_until` on it (that counts as superseding, not losing), or use
-   `mcp__brain__entity_upsert_relation`, which is the tool built for it.
-   Adding relations or Log lines is always allowed.
+   and never close or retire a relation yourself, by deleting it or
+   otherwise: a relation that looks stale or contradicted goes to step 7
+   as a contradiction proposal, because this pass proposes graph changes
+   and never applies them. Adding relations or Log lines is always allowed.
 9. **Questions.** Create or replace `knowledge/notes/dreams/questions.md`
    (create on the first ever run, replace after) with the current open
    questions the changeset raises (missing decisions,
@@ -275,7 +297,7 @@ it cannot settle alone, and surface open questions. The design contract is
 12. **Reply** with a one-paragraph summary: counts per job, anything
     skipped as unsure, and the report note's path.
 
-`--dry-run`: do steps 1–3, then reply with the plan (what each job WOULD
+`--dry-run`: do steps 1–3 (no lock), then reply with the plan (what each job WOULD
 do) and stop. No writes, no --mark-done: a dry-run leaves zero state
 behind.
 

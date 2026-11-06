@@ -25,10 +25,11 @@ ingestion without per-agent custom integrations.
 
 ## Tools
 
-Seventeen tools, registered in [`mcp_server/app.py`](../mcp_server/app.py) and
+Twenty-one tools, registered in [`mcp_server/app.py`](../mcp_server/app.py) and
 implemented in [`mcp_server/tools_read.py`](../mcp_server/tools_read.py) (read),
 [`mcp_server/tools.py`](../mcp_server/tools.py) (write + shared guards),
-[`mcp_server/entity_tools.py`](../mcp_server/entity_tools.py) (entity) and
+[`mcp_server/entity_tools.py`](../mcp_server/entity_tools.py) (entity),
+[`mcp_server/decision_tools.py`](../mcp_server/decision_tools.py) (decision records) and
 [`mcp_server/memory_tools.py`](../mcp_server/memory_tools.py) (memory).
 
 ### Read
@@ -38,6 +39,7 @@ implemented in [`mcp_server/tools_read.py`](../mcp_server/tools_read.py) (read),
 | `vault_search` | Hybrid (semantic + BM25 via reciprocal-rank fusion) search over processed sources **and curated knowledge notes**. `mode` selects `hybrid` (default — fuses dense embeddings with a BM25 lexical pass), `dense` (embeddings only), or `lexical` (BM25 only, needs no embedding model). Knowledge hits carry their vault path (`knowledge/...`) as `source_relative_path` and are read-gated on that path. | `query: string, top_k?: int=10, mode?: "dense"\|"lexical"\|"hybrid" = "hybrid"` → `{hits: [{score, source_relative_path, title, chunk_idx, snippet}]}` |
 | `vault_read` | Read a UTF-8 text file by vault-relative path. Refuses binary, secrets, `.git/`, `logs/`. | `path: string` → `{path, content, size_bytes}` |
 | `vault_chunk_context` | Expand one `vault_search` hit into its neighbouring chunks — cheaper than reading the whole file. Same read-gate as search; chunk indices are relative to the current index generation. | `source_relative_path: string, chunk_idx: int, before?: int=1, after?: int=1` → `{source_relative_path, total_chunks, chunks: [{chunk_idx, text, is_target}]}` |
+| `vault_outline` | Table of contents for one indexed source: its sections in order, each with a heading path, chunk range, character count and a short preview. Use it to find a section of a long document, then read that range with `vault_chunk_context` instead of reading the whole file. Same read-gate as search. | `source_relative_path: string` → `{source_relative_path, title, total_chunks, sections: [{heading_path, first_chunk, last_chunk, chars, preview}]}` |
 | `vault_list` | List a directory (hidden entries omitted). | `path?: string=""` → `{path, entries: [{name, is_dir, size_bytes?}]}` |
 | `vault_metadata_query` | Query `metadata/index.jsonl`. | `by: "status"\|"extension"\|"extractor"\|"path_prefix"\|"all", value?: string, limit?: int=50` → `{records: [...]}` |
 | `vault_related` | Concepts most related to a concept, by co-occurrence + semantic similarity. | `concept: string, limit?: int=8` → `{concept, related: [...]}` |
@@ -67,7 +69,8 @@ compatibility only.
 | `vault_create_note` | Create a **new** note. Refuses to overwrite. | `path, content` → `WriteResult` |
 | `vault_replace_note` | **Overwrite an existing** note in full. Refuses to create a missing file. Both `create` and `replace` also refuse frontmatter that doesn't parse as YAML and a `relations:` block with malformed entries (see "Refusals" below). | `path, content` → `WriteResult` |
 | `vault_append_to_note` | Append to an existing note. | `path, content` → `WriteResult` |
-| `vault_update_concept_user_section` | Replace the user-editable section of a concept note (below the `AUTO-GENERATED-END` marker). | `slug, content` → `WriteResult` |
+| `vault_update_concept_user_section` | Replace the user-editable section of a concept note (below the `AUTO-GENERATED-END` marker, or below the AI zone when the note has one). The generated part and the AI zone are kept. Refuses content carrying AI-zone markup (`AI-GENERATED-START`/`END`, `ai-hash:`, `ai-sources:`): the describe pass owns that zone. | `slug, content` → `WriteResult` |
+| `vault_update_compiled_truth` | Replace the compiled-truth block of an entity note (between `<!-- COMPILED-TRUTH-START -->` and `<!-- COMPILED-TRUTH-END -->`) and nothing else. A note with no fence gets its first one directly below the frontmatter. Refuses an ambiguous fence (one marker, out of order, duplicated), content carrying either marker, and `knowledge/assistant/` notes. | `path, content` → `WriteResult` |
 | `vault_drop_inbox_file` | Drop a (possibly binary) file under `inbox/` for later ingestion. | `path, content_base64` → `WriteResult` |
 | `profile_update` | Create-or-replace the assistant's standing profile (`knowledge/assistant/PROFILE.md`) in full. Refuses content over the byte budget (`BRAIN_PROFILE_MAX_BYTES`, default 4096) — the profile rides into every session, so its size is a token cost. The only tool that may create the file; always stamped `memory_status: consolidated`. | `content` → `WriteResult` |
 
@@ -86,7 +89,21 @@ that is `vault_create_note`'s job, so "who made this note" stays unambiguous.
 |---|---|---|
 | `entity_upsert_relation` | Add or close one typed relation in an existing entity note's frontmatter. A set `valid_until` closes the matching open entry; an identical entry is a no-op (no commit); anything else appends. Refuses: unknown `rel`, missing entity or target note, non-canonical dates (strict `YYYY-MM-DD`), a `source` that doesn't exist. | `entity_path, rel, target, valid_from?, valid_until?, source?` → `WriteResult + {action: "added"\|"closed"\|"noop"}` |
 | `entity_append_fact` | Append one dated, source-linked fact bullet to the entity note's `## Log` (newest last, never rewritten). Refuses: multi-line or empty text, facts over 500 chars, a missing/invalid `source` (required — vault-relative no-extension path), bad dates. `date` defaults to today UTC. | `entity_path, text, source, date?` → `WriteResult` |
-| `meeting_create` | Create `knowledge/meetings/<YYYY>/<date>-<slug>.md` and record an `attended` relation on every attendee — all-or-nothing in **one commit**. Attendees are `people/` node ids; all missing attendee notes are listed in one error so stubs can be created in one pass. Optional `project` (a `projects/` node id) lands as `related_to` in the meeting's frontmatter. Refuses to overwrite an existing meeting. | `date, title, attendees: [string], project?, body?` → `WriteResult` |
+| `meeting_create` | Create `knowledge/meetings/<YYYY>/<date>-<slug>.md` and record an `attended` relation on every attendee — all-or-nothing in **one commit**. If a write or the commit fails, every file is restored and unstaged and the tool raises. Attendees are `people/` node ids; all missing attendee notes are listed in one error so stubs can be created in one pass. Optional `project` (a `projects/` node id) lands as `related_to` in the meeting's frontmatter. Refuses to overwrite an existing meeting. | `date, title, attendees: [string], project?, body?` → `WriteResult` |
+
+### Decisions
+
+Numbered decision records at
+`knowledge/{projects,chats}/<slug>/decisions/<NNNN>-<title-slug>.md`
+(`type: decision`, `status: proposed | accepted | rejected | superseded`,
+contract in [`AGENTS.md`](../AGENTS.md), "Where a note lives"). These two
+tools are the only writers: every other write verb refuses the folder, so
+an accepted decision changes only by being superseded.
+
+| Name | Description | I/O |
+|---|---|---|
+| `decision_record` | Record the project's next decision (number = highest existing + 1, allocated under the write lock). `project` is the overview's node id (`projects/<slug>/<slug>`, `chats/<slug>/<slug>`, or the short `projects/<slug>`), and the overview must exist. `title` is one line of at most 120 characters (no control characters, and none of U+2028, U+2029 or U+0085, or any other character `str.splitlines()` breaks on). `status` is `accepted` (default, `decided` = `date`) or `proposed`. `supersedes` names an ACCEPTED record in the same project, and only an accepted record may supersede: the old record is flipped to `superseded` with `superseded_by`, and both files land in **one commit**. If a write or the commit fails, every file is restored and unstaged and the tool raises. On a supersede, hand-added frontmatter keys, text between the H1 and `## Context`, and extra `## Links` lines of the old record survive. | `project, title, context, decision, consequences?, alternatives?, status?: "accepted"\|"proposed", supersedes?: int, date?` → `WriteResult` |
+| `decision_resolve` | Settle a `proposed` record as `accepted` or `rejected`, stamping `decided`. Optionally replaces the Decision / Consequences sections. Refuses a record that is not proposed and a path that is not a decision record. If the commit fails, the record is restored and unstaged and the tool raises, so it can be retried (it never returns `committed: false` with the record rewritten). Hand-added frontmatter keys, text between the H1 and `## Context`, and extra `## Links` lines survive the re-render. | `path, status: "accepted"\|"rejected", decision?, consequences?, date?` → `WriteResult` |
 
 **Write allowlist** (`mcp_server/config.py`): `create`/`replace`/`append`
 notes may only touch
@@ -96,7 +113,12 @@ Concept notes use the dedicated `vault_update_concept_user_section` tool.
 `knowledge/assistant/PROFILE.md` lives inside the allowlist but the three
 general verbs **refuse** it — that is what makes `profile_update`'s byte
 budget (`BRAIN_PROFILE_MAX_BYTES`) real, since it would otherwise be
-trivially bypassable by a direct `vault_replace_note`. `inbox/` is writable
+trivially bypassable by a direct `vault_replace_note`. Decision records
+(`knowledge/{projects,chats}/<slug>/decisions/`, the bare `decisions` path
+itself as well as anything under it) are refused the same way,
+with a message naming `decision_record` / `decision_resolve`. Both
+refusals (case-insensitive) also apply to `vault_update_compiled_truth`,
+`entity_upsert_relation` and `entity_append_fact`. `inbox/` is writable
 only through `vault_drop_inbox_file`. Everything else — `archive/`,
 `metadata/`, `scripts/`, the server's own code — is refused.
 
@@ -123,7 +145,9 @@ before anything reaches disk:
   branch doesn't match (including detached HEAD), the commit step refuses.
   The note is still written to disk — the tool returns `committed: false`
   with a warning, not an error, so the caller knows the change didn't land
-  in git.
+  in git. The multi-file tools (`meeting_create`, `decision_record`) are
+  the exception: a failed commit restores every file, unstages it and
+  raises, so nothing is left half-written.
 - **A conflicting hand edit to this note.** The pull that precedes every
   write (below) can hit a genuine conflict. The rebase is aborted, the
   branch is left exactly where it was, and the tool raises naming the

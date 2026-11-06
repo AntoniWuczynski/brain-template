@@ -24,10 +24,14 @@ agents, or any human-driven script. If you cannot satisfy these rules,
    *or* `archive/raw/`). If you think one needs to move, ask the user.
 3. **Always link outputs to their source.** Every generated Markdown note
    carries `source_file:` in its frontmatter and a "Links → Source:"
-   wikilink in the body. No exceptions. The one carve-out: dream-pass notes
+   wikilink in the body. No exceptions. Two carve-outs: dream-pass notes
    (`knowledge/notes/dreams/`, `generated_by: dream-pass`) have no single
    source, so their provenance is the `generated_by` key plus a mandatory
    `## Links` section wikilinking every note they derive from instead.
+   Saved answers (`knowledge/notes/answers/`, `generated_by: ask`, written
+   by `scripts/ask.py --save`) cite several sources, so their provenance is
+   the `sources:` frontmatter list plus the numbered `## Sources` section
+   wikilinking each cited note.
 4. **Update `metadata/index.jsonl` for every processed file.** One JSON
    object per line; never rewrite the whole file.
 5. **Log every operation.** Append to `logs/ingest-YYYYMMDDTHHMMSS.log`
@@ -82,6 +86,13 @@ agents, or any human-driven script. If you cannot satisfy these rules,
 - Any agent (not just Claude) may execute the dream pass by following
   `.claude/skills/dream-pass/SKILL.md` literally — it is written to be
   runner-agnostic. Its hard limits are binding.
+- The vendored `obsidian-markdown` and `obsidian-bases` skills in
+  `.claude/skills/` (from kepano/obsidian-skills, MIT, commit 3ccff53)
+  describe Obsidian syntax. The private source checkout also keeps copies
+  under `.agents/skills/` and `_template/`. Where they differ from this
+  file, this file wins: their examples use short `[[Note]]` links, but
+  notes here link by full vault-relative path
+  (`[[knowledge/projects/brain/brain]]`).
 
 ---
 
@@ -92,7 +103,7 @@ Every generated index note must use this frontmatter:
 ```yaml
 ---
 title: "<human-readable title>"
-type: source_note            # source_note | concept | project | person | organisation | meeting | memory_fact | digest | dashboard
+type: source_note            # source_note | concept | project | person | organisation | meeting | memory_fact | digest | dashboard | decision | answer
 source_file: archive/raw/<rel/path>
 source_hash: <sha256>
 created: <ISO 8601 UTC>
@@ -126,8 +137,19 @@ note. The areas below are recommendations — pick the one that fits, and
 never force a note into `projects/` because a tool defaulted there:
 
 - `projects/<slug>/` — a bounded piece of work, repo or not: an overview
-  `<slug>.md`, curated `<topic>.md` notes beside it, and dated `log/`
-  entries. A folder-backed graph node (next section).
+  `<slug>.md`, curated `<topic>.md` notes beside it, dated `log/`
+  entries, and numbered decision records under `decisions/`. A
+  folder-backed graph node (next section).
+- `projects/<slug>/decisions/<NNNN>-<title-slug>.md` (and the same under
+  `chats/<slug>/`) — decision records, `type: decision`, with a
+  per-project four-digit number and `status: proposed | accepted |
+  rejected | superseded`. They are identified by this PATH, not by
+  `type:` (older curated notes carrying `type: decision` elsewhere are
+  not records), and are not graph nodes. Only the MCP tools
+  `decision_record` and `decision_resolve` write them: every other write
+  verb refuses the folder, so an accepted decision changes only by a new
+  record that supersedes it. `sweep.py`'s `decision-integrity` check
+  lints them.
 - `chats/<slug>/` — a chat-based project with no repository behind it (a
   claude.ai, ChatGPT or Codex "project" of conversations, e.g. a job search
   run from a chat). Same folder shape and node rules as `projects/`; there
@@ -136,6 +158,9 @@ never force a note into `projects/` because a tool defaulted there:
   travel. Free-form like `notes/`; nothing under it is a graph node.
 - `people/`, `organisations/`, `meetings/` — entity notes (next section).
 - `notes/`, `research/`, `university/` — free-form curated notes.
+  `notes/answers/` holds answers saved by `scripts/ask.py --save`
+  (`type: answer`, `generated_by: ask`). `ask` never retrieves them, so an
+  answer never cites an earlier answer.
   `assistant/` is the assistant's memory lifecycle ("Provenance and the
   memory lifecycle" below).
 
@@ -275,7 +300,8 @@ just prose. Blank starting points for people, organisations and meetings live in
   never passed through the server is a provenance lie. Hand-edited notes
   simply carry none of them. Deterministic scripts that write notes — the
   fact-note proposer in `scripts/ingest_lib/propose.py`, used by the wikilink
-  pass and the dream pass's contradiction detector — stamp
+  pass and the dream pass's contradiction detector, and `scripts/ask.py
+  --save` — stamp
   `written_via: script` and `author: script:<kind>`: an honest third value,
   neither an agent identity nor a claim to have passed through the server.
 - **Memory lifecycle.** Notes under `knowledge/assistant/` carry
@@ -302,7 +328,9 @@ just prose. Blank starting points for people, organisations and meetings live in
   `profile_update` tool, which enforces a hard byte budget and stamps
   `memory_status: consolidated`. The general note verbs
   (`vault_create_note` / `vault_replace_note` / `vault_append_to_note`)
-  refuse it so the budget can't be bypassed.
+  refuse it so the budget can't be bypassed. They refuse decision records
+  (`knowledge/{projects,chats}/<slug>/decisions/`) the same way, as do
+  `vault_update_compiled_truth` and the entity verbs.
 - **`status:` ≠ `memory_status:`.** These are deliberately separate
   vocabularies: `status` (`processed | partial | manual_review`) is the
   **ingest** lifecycle on source notes; `memory_status` is the **memory**

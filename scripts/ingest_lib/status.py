@@ -311,7 +311,16 @@ def _retry_command(r: IndexRecord) -> str:
 # managed-note write (skip-unchanged, preserves a user tail)
 # ---------------------------------------------------------------------------
 
-def _write_managed(target: Path, *, title: str, auto_body: str) -> bool:
+_STATUS_BANNER = (
+    "Auto-generated from `metadata/index.jsonl` + the filesystem. "
+    "`knowledge/index/` is outside the enrichment scan. Edit below the "
+    "**AUTO-GENERATED-END** marker — that survives regeneration."
+)
+
+
+def write_managed(
+    target: Path, *, title: str, auto_body: str, banner: str = _STATUS_BANNER
+) -> bool:
     """Write a managed note (auto zone + preserved user tail). Returns True
     if written, False if only the ``updated:`` stamp would have changed."""
     existing = ""
@@ -336,9 +345,7 @@ def _write_managed(target: Path, *, title: str, auto_body: str) -> bool:
             "---\n\n"
             f"{_AUTO_START}\n\n"
             f"# {title}\n\n"
-            "> _Auto-generated from `metadata/index.jsonl` + the filesystem. "
-            "`knowledge/index/` is outside the enrichment scan. Edit below the "
-            "**AUTO-GENERATED-END** marker — that survives regeneration._\n\n"
+            f"> _{banner}_\n\n"
             f"{auto_body}\n\n"
             f"{_AUTO_END}\n\n"
             f"{user_tail.rstrip()}\n"
@@ -379,13 +386,13 @@ def rebuild_status(paths: VaultPaths, *, logger: logging.Logger) -> StatusStats:
     now_target = paths.knowledge_index / _NOW_NAME
 
     written_paths: list[str] = []
-    dash_written = _write_managed(dash_target, title="Processing Dashboard", auto_body=dash_body)
+    dash_written = write_managed(dash_target, title="Processing Dashboard", auto_body=dash_body)
     if dash_written:
         written_paths.append(dash_target.relative_to(paths.root).as_posix())
-    review_written = _write_managed(review_target, title="Manual Review", auto_body=review_body)
+    review_written = write_managed(review_target, title="Manual Review", auto_body=review_body)
     if review_written:
         written_paths.append(review_target.relative_to(paths.root).as_posix())
-    now_written = _write_managed(now_target, title="Now", auto_body=now_body)
+    now_written = write_managed(now_target, title="Now", auto_body=now_body)
     if now_written:
         written_paths.append(now_target.relative_to(paths.root).as_posix())
 

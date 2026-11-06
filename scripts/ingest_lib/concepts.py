@@ -167,7 +167,6 @@ def rebuild_concepts(
                 target=target,
                 display_name=display,
                 records=records,
-                paths=paths,
                 logger=logger,
                 related_list=(related or {}).get(slug, []),
             )
@@ -277,7 +276,6 @@ def _write_concept_note(
     target: Path,
     display_name: str,
     records: list[IndexRecord],
-    paths: VaultPaths,
     logger: logging.Logger,
     related_list: list[Related] | None = None,
 ) -> bool:
@@ -338,7 +336,7 @@ def _write_concept_note(
 
     sources_lines: list[str] = []
     for r in records_sorted:
-        wikilink = _index_note_wikilink(r, paths)
+        wikilink = index_note_wikilink(r)
         snippet = _short_snippet(r)
         sources_lines.append(f"- {wikilink}{snippet}")
 
@@ -386,13 +384,15 @@ def _write_concept_note(
     return True
 
 
-def _index_note_wikilink(rec: IndexRecord, paths: VaultPaths) -> str:
+def note_wikilink(rel_path: str) -> str:
+    """``[[<vault-relative path without .md>]]``."""
+    return f"[[{rel_path.removesuffix('.md')}]]"
+
+
+def index_note_wikilink(rec: IndexRecord) -> str:
     """Return ``[[knowledge/index/<rel without .md>]]`` if available."""
     if rec.index_note_path:
-        path = rec.index_note_path
-        if path.endswith(".md"):
-            path = path[:-3]
-        return f"[[{path}]]"
+        return note_wikilink(rec.index_note_path)
     return f"`{rec.relative_path}`"
 
 

@@ -96,6 +96,8 @@ _KIND_TYPED = "typed"
 
 _EXPANSION_CACHE_DIR = ".cache"
 _EXPANSION_CACHE_FILE = "query-expansion.json"
+# Set once the "not supported under claude-code" warning has been logged.
+_warned_expansion_claude_code = False
 
 
 @dataclass(frozen=True)
@@ -670,12 +672,23 @@ def expand_query(
     prompt, the requested variant count and the provider/model — so a repeated
     eval run is free and deterministic, while a changed prompt or provider
     re-asks instead of serving an answer to a question no longer being posed.
-    Returns ``[]`` when no LLM provider is configured, the call fails, or the
-    model returns nothing usable — the caller then searches the original query
-    alone.
+    Returns ``[]`` when no LLM provider is configured, the provider is
+    claude-code, the call fails, or the model returns nothing usable — the
+    caller then searches the original query alone.
     """
+    global _warned_expansion_claude_code
     stripped = query.strip()
     if not stripped:
+        return []
+
+    from . import claude_cli, summarize
+
+    # Expansion runs in the MCP server's search path: under claude-code every
+    # search would start a CLI process and spend subscription usage.
+    if summarize._select_provider() == claude_cli.PROVIDER:
+        if not _warned_expansion_claude_code:
+            _warned_expansion_claude_code = True
+            logger.warning("query expansion is not supported under claude-code")
         return []
     cache = _read_expansion_cache(paths)
     key = _expansion_key(stripped, cfg)
@@ -693,8 +706,6 @@ def expand_query(
             description="2-3 short reformulations of the search query, "
             "each using different words from the original."
         )
-
-    from . import summarize
 
     parsed = summarize.generate_structured(
         system=_EXPANSION_SYSTEM,

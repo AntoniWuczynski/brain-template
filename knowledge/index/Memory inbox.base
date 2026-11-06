@@ -1,0 +1,17 @@
+filters:
+  and:
+    - file.inFolder("knowledge/assistant/inbox")
+    - approved == false
+formulas:
+  promote_target: promote.target
+properties:
+  formula.promote_target:
+    displayName: Promote to
+views:
+  - type: table
+    name: Awaiting approval
+    order:
+      - file.name
+      - title
+      - formula.promote_target
+      - created

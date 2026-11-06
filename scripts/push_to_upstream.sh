@@ -21,6 +21,7 @@
 #   - .env.example, .claude/CODEBASE.md, .claude/{hooks,memory,patterns}/.gitkeep
 #   - .obsidian/{app,appearance,core-plugins,graph}.json
 #   - knowledge/index/Note Template.md, knowledge/index/templates/
+#   - knowledge/index/{Decisions,Projects,Recent sources,Memory inbox}.base
 #
 # Files sourced from _template/ on main (overlay specific to the public branch):
 #   - README.md, LICENSE, TODO.md, WORK_LOG.md, CONTRIBUTING.md
@@ -30,7 +31,7 @@
 #
 # Files NEVER copied (your private content):
 #   - inbox/**, archive/**, logs/**, metadata/**
-#   - knowledge/index/<everything except Home.md and Note Template.md>
+#   - knowledge/index/<everything except Home.md, Note Template.md, templates/ and the .base views>
 #   - knowledge/concepts/**
 #   - hand-written notes anywhere else under knowledge/
 #   - .env, .obsidian/workspace.json
@@ -83,6 +84,11 @@ FRAMEWORK_PATHS=(
     # scripts/README.md, the consolidate/entity_tools contracts). Generic
     # blanks — no personal data.
     "knowledge/index/templates"
+    # Obsidian Bases views: generic queries over the vault layout.
+    "knowledge/index/Decisions.base"
+    "knowledge/index/Projects.base"
+    "knowledge/index/Recent sources.base"
+    "knowledge/index/Memory inbox.base"
 )
 
 # Refuse to publish uncommitted or untracked changes: this script copies the

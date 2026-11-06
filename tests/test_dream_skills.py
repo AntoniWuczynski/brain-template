@@ -4,7 +4,10 @@ type vocabulary, and describe the tools/scratch paths dream.sh actually
 grants."""
 from __future__ import annotations
 
+import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,11 @@ import pytest
 from ingest_lib.dream import COMPILED_TRUTH_END, COMPILED_TRUTH_START
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPTS_DIR = str(_REPO_ROOT / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+import dream_launch  # noqa: E402
 _SKILL_COPIES = (
     _REPO_ROOT / ".claude/skills/dream-pass/SKILL.md",
     _REPO_ROOT / "_template/.claude/skills/dream-pass/SKILL.md",
@@ -41,6 +49,15 @@ def test_skill_gate_step_records_no_pending_marker() -> None:
         assert "1. **Gate.** Run `uv run --no-sync python scripts/dream_gate.py`" not in text, path
 
 
+def test_skill_gate_step_runs_the_command_bare() -> None:
+    """An appended `; echo $?` turns the gate into a compound command that
+    the dream_gate.py allow rules no longer approve on their own."""
+    for path, text in _skill_texts():
+        flat = " ".join(text.split())
+        assert "already reports the exit status" in flat, path
+        assert "with nothing appended" in flat, path
+
+
 def test_skill_copies_agree_outside_the_sync_note() -> None:
     texts = _skill_texts()
     if len(texts) < 2:
@@ -67,6 +84,9 @@ def test_dream_sh_caps_the_runner_wall_clock() -> None:
     assert '"$TIMEOUT_BIN" --kill-after=60s "$TIMEOUT_SECS" "$@"' in script
     assert "run_capped claude -p" in script
     assert "run_capped codex exec" in script
+    # timeout execs a binary, so it can never run the run_py shell function.
+    assert 'run_capped "${PY_CMD[@]}" scripts/dream_launch.py' in script
+    assert "run_capped run_py" not in script
     subprocess.run(["bash", "-n", str(_REPO_ROOT / "scripts/dream.sh")], check=True)
 
 
@@ -103,12 +123,15 @@ def test_dream_sh_grants_only_the_tools_the_skill_uses() -> None:
 def test_dream_sh_grants_the_write_step_7_needs() -> None:
     """N3: the skill's step 7 writes survivors.json and feeds it to
     `dream_gate.py --propose`. With no Write in --allowedTools the scheduled
-    pass could never produce a contradiction proposal at all."""
+    pass could never produce a contradiction proposal at all. The rules are
+    `Edit(...)`: a `Write(...)` rule never matches, and Edit covers writes."""
     script = (_REPO_ROOT / "scripts/dream.sh").read_text(encoding="utf-8")
-    assert f'"Write({_SCRATCH_REL}/**)"' in script
-    assert '"Write(/$SCRATCH/**)"' in script
+    assert f'"Edit({_SCRATCH_REL}/**)"' in script
+    assert '"Edit(/$SCRATCH/**)"' in script
+    assert '"Write(' not in script
     assert f'SCRATCH="$HOME/{_SCRATCH_REL.removeprefix("~/")}"' in script
-    assert 'mkdir -p "$SCRATCH"' in script
+    assert 'mkdir -p -m 700 "$SCRATCH"' in script
+    assert 'chmod 700 "$SCRATCH"' in script
     for path, text in _skill_texts():
         assert _SURVIVORS in text, path
         assert "--propose survivors.json" not in text, path
@@ -199,3 +222,92 @@ def test_dream_sh_denies_credential_reads() -> None:
         '"Read(~/.claude/**)"',
     ):
         assert denied in script, f"{denied} no longer denied"
+
+
+def _dream_sh_code() -> str:
+    raw = (_REPO_ROOT / "scripts/dream.sh").read_text(encoding="utf-8")
+    return "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
+
+
+def test_dream_sh_legacy_branch_saves_no_session() -> None:
+    """A saved transcript would be pulled back into the vault by the
+    claude_code session connector."""
+    legacy = _dream_sh_code().split("run_capped claude -p", 1)[1].split(";;", 1)[0]
+    assert "--no-session-persistence" in legacy
+
+
+def test_dream_sh_deny_list_matches_the_launcher() -> None:
+    """bash cannot import the launcher's tuple, so the legacy branch keeps
+    its own copy; the two must not drift apart."""
+    block = re.search(r"DREAM_DENY_RULES=\((.*?)\)\n", _dream_sh_code(), re.S)
+    assert block is not None
+    assert tuple(re.findall(r'"([^"]+)"', block.group(1))) == dream_launch.DREAM_DENY_RULES
+
+
+def test_skill_never_applies_a_relation_change() -> None:
+    """Step 8 closes a relation through a contradiction proposal: the pass
+    proposes graph changes, it never applies them."""
+    for path, text in _skill_texts():
+        assert "entity_upsert_relation" not in text, path
+
+
+_STUB_PY = """#!/bin/bash
+echo "python $*" >> "{calls}"
+exit 0
+"""
+_STUB_TIMEOUT = """#!/bin/bash
+echo "timeout $*" >> "{calls}"
+shift 2
+exec "$@"
+"""
+
+
+_STUB_CLAUDE = """#!/bin/bash
+echo "claude $1 $2" >> "{calls}"
+exit 0
+"""
+
+
+def _run_dream_sh(tmp_path: Path, extra_env: dict[str, str]) -> list[str]:
+    """Runs the real dream.sh against stubs: the python stub records each
+    call and passes the gate, the timeout stub drops its two options and
+    execs the rest, as GNU timeout does, and the claude stub records its
+    first two arguments."""
+    (tmp_path / "scripts").mkdir()
+    shutil.copy(_REPO_ROOT / "scripts/dream.sh", tmp_path / "scripts/dream.sh")
+    calls = tmp_path / "calls.log"
+    stubs = {
+        tmp_path / ".venv/bin/python": _STUB_PY,
+        # $HOME/.local/bin is first on dream.sh's PATH, ahead of any real timeout.
+        tmp_path / ".local/bin/timeout": _STUB_TIMEOUT,
+        tmp_path / ".local/bin/claude": _STUB_CLAUDE,
+        tmp_path / "scripts/dream_lock.sh": "#!/bin/bash\nexit 0\n",
+    }
+    for stub, body in stubs.items():
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(body.format(calls=calls), encoding="utf-8")
+        stub.chmod(0o755)
+    subprocess.run(
+        ["bash", str(tmp_path / "scripts/dream.sh")], check=True, cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), **extra_env},
+    )
+    return calls.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize("extra_env", [{}, {"BRAIN_DREAM_LOCKDOWN": "1"}])
+def test_dream_sh_runs_the_locked_launcher_by_default(
+    tmp_path: Path, extra_env: dict[str, str],
+) -> None:
+    python = tmp_path / ".venv/bin/python"
+    assert _run_dream_sh(tmp_path, extra_env) == [
+        "python scripts/dream_gate.py",
+        f"timeout --kill-after=60s 5400 {python} scripts/dream_launch.py --max-turns 50",
+        "python scripts/dream_launch.py --max-turns 50",
+    ]
+
+
+def test_dream_sh_lockdown_zero_runs_claude_unlocked(tmp_path: Path) -> None:
+    calls = _run_dream_sh(tmp_path, {"BRAIN_DREAM_LOCKDOWN": "0"})
+    assert calls[0] == "python scripts/dream_gate.py"
+    assert calls[1].startswith("timeout --kill-after=60s 5400 claude -p /dream-pass --scheduled")
+    assert calls[2:] == ["claude -p /dream-pass --scheduled"]

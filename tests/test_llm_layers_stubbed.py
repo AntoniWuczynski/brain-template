@@ -30,6 +30,8 @@ _KEYS = [
     "BRAIN_LLM_PROVIDER", "BRAIN_LLM_MODEL", "BRAIN_SKIP_SUMMARY",
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
     "BRAIN_LOCAL_URL", "BRAIN_LOCAL_MODEL",
+    "BRAIN_DESCRIBE_PROVIDER", "BRAIN_DESCRIBE_MODEL",
+    "BRAIN_CLAUDE_CLI_BIN", "BRAIN_CLAUDE_CLI_TIMEOUT",
 ]
 
 
@@ -182,7 +184,9 @@ def test_describe_concept_anthropic_provider_returns_concept_description(
 
     result = describe_mod.describe_concept(
         "TCP Congestion Control",
-        ["Congestion control slows the sender when the network is loaded."],
+        [describe_mod.Excerpt(
+            1, "Congestion control slows the sender when the network is loaded."
+        )],
         logger=_LOG,
     )
 
@@ -196,7 +200,67 @@ def test_describe_concept_with_no_context_returns_none_without_calling_the_provi
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BRAIN_LLM_PROVIDER", "anthropic")
-    assert describe_mod.describe_concept("X", ["", "   "], logger=_LOG) is None
+    excerpts = [describe_mod.Excerpt(1, ""), describe_mod.Excerpt(2, "   ")]
+    assert describe_mod.describe_concept("X", excerpts, logger=_LOG) is None
+
+
+def test_describe_model_override_routes_to_its_own_provider_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The summarizer runs on openai; describe is pinned to an anthropic model.
+    # The override must reach the SDK call, bypass the summarizer's
+    # BRAIN_SKIP_SUMMARY gate, and feed the cache key via describe_model().
+    import anthropic
+
+    monkeypatch.setenv("BRAIN_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("BRAIN_LLM_MODEL", "gpt-5-mini")
+    monkeypatch.setenv("BRAIN_SKIP_SUMMARY", "1")
+    monkeypatch.setenv("BRAIN_DESCRIBE_PROVIDER", "anthropic")
+    monkeypatch.setenv("BRAIN_DESCRIBE_MODEL", "claude-sonnet-5-5")
+    parsed = describe_mod.ConceptDescription(short_summary="s", detailed_explanation="d")
+    seen: dict[str, str] = {}
+
+    class FakeMessages:
+        def parse(self, *, model: str, **_kw: object) -> SimpleNamespace:
+            seen["model"] = model
+            return SimpleNamespace(
+                parsed_output=parsed,
+                usage=SimpleNamespace(cache_read_input_tokens=0),
+                stop_reason="end_turn",
+            )
+
+    class FakeClient:
+        def __init__(self, **_kw: object) -> None:
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+
+    assert describe_mod.describe_model() == "anthropic/claude-sonnet-5-5"
+    result = describe_mod.describe_concept("X", [describe_mod.Excerpt(1, "text")], logger=_LOG)
+    assert result is not None
+    assert seen["model"] == "claude-sonnet-5-5"
+
+
+def test_describe_provider_override_without_model_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BRAIN_LLM_MODEL names the summarizer's (openai) model; describe must not
+    # send it to anthropic, nor silently pick a default model.
+    monkeypatch.setenv("BRAIN_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("BRAIN_LLM_MODEL", "gpt-5-mini")
+    monkeypatch.setenv("BRAIN_DESCRIBE_PROVIDER", "anthropic")
+    assert describe_mod.describe_model() == ""
+    monkeypatch.setenv("BRAIN_DESCRIBE_PROVIDER", "openai")
+    assert describe_mod.describe_model() == "openai/gpt-5-mini"
+
+
+def test_describe_without_override_follows_the_summarizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    assert describe_mod.describe_model() == "openai/gpt-5-mini"
+    monkeypatch.delenv("OPENAI_API_KEY")
+    assert describe_mod.describe_model() == ""
 
 
 # ------------------------------------------------------------------ caption

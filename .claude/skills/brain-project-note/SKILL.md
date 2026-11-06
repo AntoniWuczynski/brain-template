@@ -27,9 +27,11 @@ If the `mcp__brain__*` tools are NOT available this session, STOP. Do not write
 files anywhere as a fallback. Tell the user:
 
 > The brain MCP server isn't connected. Start it (`mcp_server/run-local.sh` in
-> the brain repo) and register it (`claude mcp add --transport http --scope
-> user brain http://127.0.0.1:8765/mcp --header "Authorization: Bearer
-> $(cat ~/.brain-mcp-token)"`), then reconnect (`/mcp`) and re-run me.
+> the brain repo, on whichever host serves it) and register it (`claude mcp add
+> --transport http --scope user brain <server-url>/mcp --header
+> "Authorization: Bearer $(cat ~/.brain-mcp-token)"`, where `<server-url>` is
+> `http://127.0.0.1:8765` for a local server), then reconnect (`/mcp`) and
+> re-run me.
 
 ## Where it goes — choose the area first
 
@@ -52,6 +54,7 @@ you are or where the files happen to sit:
 knowledge/<area>/<slug>/        # <area> = projects (default) or chats
 ├── <slug>.md          # overview — you own this, full-rewrite each run
 ├── <topic>.md         # focused curated notes — create these when warranted
+├── decisions/         # numbered decision records — decision_record only
 ├── notes/             # the human's own notes — NEVER write here
 └── log/<YYYY-MM-DD>.md # one session-update note per day — you create/append
 
@@ -61,8 +64,7 @@ knowledge/projects/shared/
 
 A project is more than its overview and log. Beyond `<slug>.md` and
 `log/<date>.md`, you MAY (and should, when it earns its place) create **focused
-curated notes** — a durable decision, a design, a transcribed artefact, a
-sub-topic — flat under `knowledge/projects/<slug>/` with a descriptive
+curated notes** — a design, a transcribed artefact, a sub-topic — flat under `knowledge/projects/<slug>/` with a descriptive
 kebab-case filename (e.g. `mnemosyne-capabilities.md`), distinct from the
 `<slug>.md` overview. A note that spans several projects goes under
 `knowledge/projects/shared/`, linked to each project with a `related_to`
@@ -85,11 +87,22 @@ relations:
 never a `.md` suffix. A project is a FOLDER, so the project entity's id is
 its **overview note's** path — `projects/server/server`, never the bare
 folder `projects/server`, which is no note and resolves to nothing. Use the
-same canonical form for a `promote.target` in a memory fact. The server now refuses writes whose `relations:` block
+same canonical form for a `promote.target` in a memory fact. The server refuses writes whose `relations:` block
 does not parse, so get the shape right first time. This is additive — the overview + log
 remain the session-snapshot baseline; curated notes are for knowledge that
 deserves its own home rather than a log line. The `notes/` subdir stays the
 human's area — never write there.
+
+**A durable decision is a decision record, not a curated note.** Record it
+with `decision_record` (`project` = `<area>/<slug>/<slug>`), with
+`status: "proposed"` while it is not final (settle it later with
+`decision_resolve`) and `supersedes` = the number of the accepted decision
+it replaces. The server numbers it and writes
+`knowledge/<area>/<slug>/decisions/<NNNN>-<title-slug>.md`. The general
+write tools refuse that folder, so never write or edit a record any other
+way: a change of mind is a new superseding record. Reference each record
+from the session log's `## Decisions` by its wikilink (the `path` in the
+`WriteResult`, without `.md`).
 
 - `<slug>` = the project's **git remote name**: take `git remote get-url origin`,
   drop a trailing `.git`, keep the last path segment, lowercase,
@@ -140,10 +153,13 @@ the absolute local path when there is no remote. No annotations or prose —
    - `vault_read` it. **Not found** → `vault_create_note` with a fresh
      `created:`. **Found** → parse its `created:`, keep it verbatim, regenerate
      the full body, bump `updated:`, then `vault_replace_note`.
-5. **Write the session log** `knowledge/<area>/<slug>/log/<YYYY-MM-DD>.md`:
+5. **Record decisions.** For each durable decision made this session, call
+   `decision_record` (proposed when not final) before writing the log, so
+   the log can link it. Skip this step when there is none.
+6. **Write the session log** `knowledge/<area>/<slug>/log/<YYYY-MM-DD>.md`:
    - `vault_read` it. **Not found** → `vault_create_note`. **Found**
      (same-day rerun) → `vault_append_to_note` a new `## <HH:MM>Z` subsection.
-6. **Report** the `commit_sha` from each `WriteResult`. If `committed` is
+7. **Report** the `commit_sha` from each `WriteResult`. If `committed` is
    false, surface the `warning` — don't claim success. No manual reindex:
    the MCP server re-embeds every write in the background (debounced a
    couple of seconds), so the notes are searchable within seconds; a write
@@ -229,7 +245,7 @@ topics: []
 <concrete changes and outcomes from this session.>
 
 ## Decisions
-<key choices and why.>
+<key choices and why, linking each decision record written this session.>
 
 ## Next
 <open items / next steps.>
@@ -248,7 +264,8 @@ topics: []
 | Forcing a chat-based project or life admin into `projects/` | `chats/<slug>/` for a chat project, `personal/<area>/` for life admin — pick by subject |
 | Creating a new folder without the identity check | Compare the remote against existing notes' `source_repo` first; ask on a match |
 | Flattening the whole project to `projects/<slug>.md` | The *overview* is `projects/<slug>/<slug>.md` inside the folder (curated `<topic>.md` notes beside it are fine) |
-| Cramming every artefact into the log | Give a durable decision / design / artefact its own curated `<topic>.md` under `projects/<slug>/` (or `projects/shared/`) |
+| Cramming every artefact into the log | Give a design / artefact its own curated `<topic>.md` under `projects/<slug>/` (or `projects/shared/`), and a durable decision a `decision_record` |
+| Writing a decision as a curated note, or editing `decisions/` | `decision_record` (proposed when not final), `decision_resolve` to settle it, a superseding record to change it |
 | Appending updates to the overview | Overview is a full rewrite via `vault_replace_note` |
 | Resetting `created:` on a rewrite | Read the old note first; preserve `created:` |
 | Hardcoding "today" | Real `date -u`; timestamps only in frontmatter + log filename |

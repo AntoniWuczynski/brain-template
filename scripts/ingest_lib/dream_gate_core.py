@@ -139,7 +139,9 @@ def _is_generated_note(root: Path, rel: str) -> bool:
     except OSError:
         return False  # deleted/renamed since HEAD: not path-generated, count it
     frontmatter, _body = _split_frontmatter(text)
-    if frontmatter.get("generated_by") == "dream-pass":
+    # dream-pass notes, and ``ask.py --save`` answers (LLM output over
+    # content already in the vault, not new information).
+    if frontmatter.get("generated_by") in ("dream-pass", "ask"):
         return True
     return (
         rel.startswith(_PROPOSAL_INBOX_PREFIX)

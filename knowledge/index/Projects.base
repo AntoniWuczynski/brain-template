@@ -1,0 +1,18 @@
+filters:
+  and:
+    - file.ext == "md"
+    - or:
+        - file.folder == ("knowledge/projects/" + file.basename)
+        - file.folder == ("knowledge/chats/" + file.basename)
+views:
+  - type: table
+    name: Projects
+    groupBy:
+      property: status
+      direction: ASC
+    order:
+      - file.name
+      - file.folder
+      - status
+      - topics
+      - updated
