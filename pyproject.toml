@@ -8,16 +8,16 @@ readme = "README.md"
 # Core dependencies that the ingestion CLI needs to *function* with the
 # pypdf fallback path. Install with `uv sync`.
 dependencies = [
-    "pypdf>=5.0",
+    "pypdf>=6.21.4",
     "python-docx>=1.1",
     "python-pptx>=1.0",
-    "nbformat>=5.10",
+    "nbformat>=5.11.1",
     "pyyaml>=6.0",
     "rich>=13.7",            # nicer dry-run / progress output
-    "platformdirs>=4.2",
-    "anthropic>=0.40",       # default LLM provider for the summarizer
+    "platformdirs>=4.14.0",
+    "anthropic>=2.3.0",       # default LLM provider for the summarizer
     "openai>=1.50",          # OpenAI provider + local OpenAI-compatible servers
-    "google-genai>=0.4",     # Gemini provider
+    "google-genai>=2.34.0",     # Gemini provider
     "python-dotenv>=1.0",    # auto-load .env at the repo root
     "sentence-transformers>=3.0",  # local embeddings for --search
     "numpy>=1.26",           # vector store (already a transitive of torch)
