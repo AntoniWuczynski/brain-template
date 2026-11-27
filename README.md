@@ -478,6 +478,7 @@ Everything is via environment variables in `.env`, except that the nightly
 | `BRAIN_SKIP_SUMMARY=1` | Skip summarization even with a provider configured. |
 | `MINERU_DEVICE_MODE` | `mps` / `cuda` / `cpu` for MinerU inference (defaults to `mps` on Apple Silicon, else `cuda`, else `cpu`). |
 | `BRAIN_EMBED_DEVICE` | Same options for the semantic-search embedder. |
+| `BRAIN_EMBED_IDLE_UNLOAD_S` | Run the embedder in a child process that exits after this many idle seconds, so a long-running server gives the memory back (default off; `mcp_server/run-local.sh` sets 600). |
 | `MINERU_MODEL_SOURCE` | `huggingface` (default) or `modelscope`. |
 | `BRAIN_MINERU_FORMULA` | `true` (default) / `false`. Disable MinerU's formula model (it hallucinates LaTeX on handwriting). |
 | `BRAIN_MINERU_LANG` | OCR language passed to MinerU (default `en`). Polish, Spanish and other Latin-script languages use `latin`; MinerU has no `pl`/`es` code, and an unknown value drops every PDF in the run to `partial`. |
