@@ -45,6 +45,9 @@ export BRAIN_MCP_BIND_HOST="${BRAIN_MCP_BIND_HOST:-127.0.0.1}"
 export BRAIN_MCP_BIND_PORT="${BRAIN_MCP_BIND_PORT:-8765}"
 export BRAIN_MCP_GIT_PUSH_ON_WRITE="${BRAIN_MCP_GIT_PUSH_ON_WRITE:-0}"
 export BRAIN_MCP_LOG_LEVEL="${BRAIN_MCP_LOG_LEVEL:-info}"
+# Run the embedding model in a child process that exits after 10 idle minutes,
+# so an idle server holds no torch/model memory (scripts/ingest_lib/embed_worker.py).
+export BRAIN_EMBED_IDLE_UNLOAD_S="${BRAIN_EMBED_IDLE_UNLOAD_S:-600}"
 
 echo "vault : $ROOT  (branch: $(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))"
 echo "url   : http://${BRAIN_MCP_BIND_HOST}:${BRAIN_MCP_BIND_PORT}/mcp"

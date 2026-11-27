@@ -177,3 +177,12 @@ def wait_for() -> WaitFor:
         return False
 
     return _wait_for
+
+
+@pytest.fixture(autouse=True)
+def _no_embedder_idle_unload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer shell exporting BRAIN_EMBED_IDLE_UNLOAD_S would send the
+    in-process loader tests down the child-process path, where their fake
+    ``sentence_transformers`` module does not exist. Tests that want the
+    child path set the variable themselves."""
+    monkeypatch.delenv("BRAIN_EMBED_IDLE_UNLOAD_S", raising=False)

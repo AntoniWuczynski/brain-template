@@ -56,6 +56,8 @@ if TYPE_CHECKING:
     # the import cost); this makes the "np.ndarray" annotations resolvable for
     # ruff and mypy without importing it at module load.
     import numpy as np
+
+    from .embed_worker import SubprocessEmbedder
     from .lexical import LexicalIndex
 
 from . import rank as rank_lib
@@ -191,6 +193,8 @@ def encode_query(model: Embedder, query: str) -> np.ndarray:
 import threading as _threading
 _CACHE_LOCK = _threading.Lock()
 _EMBEDDER_CACHE: tuple[Embedder, str] | None = None
+# Used instead of _EMBEDDER_CACHE when BRAIN_EMBED_IDLE_UNLOAD_S > 0.
+_SUBPROCESS_EMBEDDER: SubprocessEmbedder | None = None
 # key is (vectors_path, meta_path, vectors_mtime, meta_mtime): the mtimes
 # stop a search caching a vectors file from one rebuild against a meta file
 # from another, and the paths stop two vaults in one process (the pytest
@@ -239,7 +243,30 @@ def _index_lock(paths: VaultPaths) -> Iterator[None]:
 def _load_embedder() -> tuple[Embedder, str]:
     # Imported lazily because sentence-transformers pulls in torch and
     # transformers, and we don't want that cost on every CLI invocation.
-    global _EMBEDDER_CACHE
+    global _EMBEDDER_CACHE, _SUBPROCESS_EMBEDDER
+    from . import embed_worker
+    from .embed_worker import SubprocessEmbedder, idle_unload_seconds
+
+    idle_s = idle_unload_seconds()
+    if idle_s > 0:
+        # The model lives in a child process that exits after idle_s without
+        # a call. ensure_started() runs on EVERY call (a no-op while the child
+        # is up) so a reaped child respawns here, inside the callers' try
+        # blocks, and a failed (re)start degrades search to lexical. A child
+        # that dies after this point raises from the encode instead.
+        if not embed_worker.factory_available(embed_worker.DEFAULT_FACTORY):
+            # Same exception as the in-process import, so build_index's
+            # install hint and search's lexical fallback still apply.
+            raise ImportError("sentence-transformers is not installed")
+        with _CACHE_LOCK:
+            if _SUBPROCESS_EMBEDDER is None:
+                _SUBPROCESS_EMBEDDER = SubprocessEmbedder(
+                    _MODEL_NAME, os.environ.get("BRAIN_EMBED_DEVICE") or None, idle_s
+                )
+            proxy = _SUBPROCESS_EMBEDDER
+        proxy.ensure_started()
+        return proxy, proxy.device
+
     if _EMBEDDER_CACHE is not None:
         return _EMBEDDER_CACHE
     from sentence_transformers import SentenceTransformer

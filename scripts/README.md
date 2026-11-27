@@ -130,6 +130,10 @@ direction rather than size.
   sub-second queries, embed the same module in a long-running process
   (the MCP server does exactly this).
 - Override the inference device with ``BRAIN_EMBED_DEVICE=cpu|mps|cuda``.
+- ``BRAIN_EMBED_IDLE_UNLOAD_S=<seconds>`` (default off; ``run-local.sh`` sets
+  600) keeps the model in a child process that exits after that many idle
+  seconds, so a long-running server gives the memory back. The next search
+  pays the ~5 s cold load again.
 - ``semantic.upsert_notes`` patches just the index rows of a few
   knowledge notes in place (the MCP write path), so a note edit doesn't
   pay a full rebuild; the periodic full ``--rebuild-search-index`` is the
